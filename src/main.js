@@ -1,0 +1,77 @@
+// main.js — Entry point. Wires canvas, input, UI, and the simulation loop.
+//
+// Time stepping uses a fixed physics dt (SIM_DT) with an accumulator
+// scaled by `state.timeScale`. This decouples physics stability from frame
+// rate and lets the user slow/speed/pause time without affecting accuracy.
+
+import { state, SIM_DT } from './state.js';
+import { stepVerlet, handleCollisions, appendTrail } from './physics.js';
+import { drawScene } from './renderer.js';
+import { attachInput } from './input.js';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
+
+const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
+const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+
+setupCanvas();
+window.addEventListener('resize', setupCanvas);
+
+bindUI();
+attachInput(canvas, _newId => syncFromSelection());
+
+let lastTime = performance.now();
+let accumulator = 0;
+requestAnimationFrame(frame);
+
+// ─── Loop ──────────────────────────────────────────────────────────
+function frame(now) {
+  const realDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
+  lastTime = now;
+
+  // Advance the simulation by realDt × timeScale, in fixed SIM_DT chunks.
+  accumulator += realDt * state.timeScale;
+  let steps = 0;
+  while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
+    stepVerlet(state.entities, SIM_DT);
+    handleCollisions(state.entities);
+    accumulator -= SIM_DT;
+    steps++;
+  }
+  // Drop accumulated lag if we hit the substep cap (avoids permanent slowdown).
+  if (steps >= MAX_SUBSTEPS) accumulator = 0;
+
+  // Sample trails once per visual frame so trail-point density is independent
+  // of timeScale (the spec's "trail length" is in samples).
+  for (const e of state.entities) appendTrail(e, state.trailLength);
+
+  // Drop selection silently if the entity got consumed (e.g., by a black hole).
+  if (state.selectedId !== null && !state.entities.some(e => e.id === state.selectedId)) {
+    state.selectedId = null;
+    syncFromSelection();
+  }
+
+  drawScene(ctx);
+  updateEntityCount();
+  requestAnimationFrame(frame);
+}
+
+// ─── Canvas / DPR ──────────────────────────────────────────────────
+// We render in CSS-pixel units so input coordinates (from clientX/Y minus
+// bounding rect) match the physics coord space 1:1. The canvas backing
+// store is DPR-scaled, and the context transform compensates.
+function setupCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(1, Math.round(rect.width));
+  const h = Math.max(1, Math.round(rect.height));
+
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  state.viewport.width = w;
+  state.viewport.height = h;
+}

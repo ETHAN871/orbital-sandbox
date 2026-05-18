@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Orbital Sandbox</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="stage" aria-label="重力场沙盒画布"></canvas>
+
+    <aside id="panel" aria-label="控制面板">
+      <header class="panel-header">
+        <h1>Orbital Sandbox</h1>
+        <p class="hint" id="mode-hint">放置模式 · 按住拖拽放置星体</p>
+      </header>
+
+      <section class="group">
+        <h2>类型</h2>
+        <div class="seg" role="radiogroup" aria-label="实体类型">
+          <button class="seg-btn active" data-type="planet" role="radio" aria-checked="true">行星</button>
+          <button class="seg-btn" data-type="black_hole" role="radio" aria-checked="false">黑洞</button>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>电荷</h2>
+        <div class="seg" role="radiogroup" aria-label="电荷态">
+          <button class="seg-btn" data-charge="-1" role="radio" aria-checked="false">−1 斥</button>
+          <button class="seg-btn" data-charge="0" role="radio" aria-checked="false">0 中</button>
+          <button class="seg-btn active" data-charge="1" role="radio" aria-checked="true">+1 引</button>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>属性</h2>
+        <label>
+          <span class="row"><span>质量</span><span class="val" id="mass-val">100</span></span>
+          <input type="range" id="mass" min="1" max="1000" step="1" value="100" />
+        </label>
+        <label>
+          <span class="row"><span>半径</span><span class="val" id="radius-val">20</span></span>
+          <input type="range" id="radius" min="5" max="80" step="1" value="20" />
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>显示</h2>
+        <label>
+          <span class="row"><span>轨迹长度</span><span class="val" id="trail-val">100</span></span>
+          <input type="range" id="trail" min="0" max="500" step="1" value="100" />
+        </label>
+      </section>
+
+      <section class="group">
+        <h2>时间</h2>
+        <label>
+          <span class="row"><span>流速</span><span class="val" id="time-val">1.00x</span></span>
+          <input type="range" id="time-scale" min="0" max="3" step="0.05" value="1" />
+        </label>
+        <div class="btn-row">
+          <button id="pause-btn" class="btn">暂停</button>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>操作</h2>
+        <div class="btn-row">
+          <button id="edit-btn" class="btn">编辑模式</button>
+          <button id="clear-btn" class="btn danger">清空沙盘</button>
+        </div>
+        <p class="hint" id="selection-hint" hidden></p>
+      </section>
+
+      <footer class="panel-footer">
+        <span id="entity-count">0 个实体</span>
+      </footer>
+    </aside>
+  </div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
