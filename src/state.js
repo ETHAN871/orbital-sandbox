@@ -10,6 +10,8 @@ export const PREDICT_HORIZON = 5;          // Prediction line spans 5 seconds.
 export const PREDICT_DT = 1 / 60;          // Prediction integration step (s).
 export const PREDICT_STEPS = Math.floor(PREDICT_HORIZON / PREDICT_DT); // 300 points.
 export const LAUNCH_SPEED_K = 0.7;         // Drag-vector → initial-velocity multiplier.
+export const ABSORPTION_DURATION = 0.3;    // Seconds (sim time) for the black-hole devour animation.
+export const ELASTIC_RESTITUTION = 1.0;    // 1 = perfectly elastic planet-planet collision.
 
 // ─── UI defaults & limits ─────────────────────────────────────────
 export const DEFAULTS = Object.freeze({

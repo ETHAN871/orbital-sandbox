@@ -5,7 +5,7 @@
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
 import { state, SIM_DT } from './state.js';
-import { stepVerlet, handleCollisions, appendTrail } from './physics.js';
+import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions } from './physics.js';
 import { drawScene } from './renderer.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
@@ -37,6 +37,7 @@ function frame(now) {
   while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
     stepVerlet(state.entities, SIM_DT);
     handleCollisions(state.entities);
+    updateAbsorptions(state.entities, SIM_DT);
     accumulator -= SIM_DT;
     steps++;
   }
@@ -47,10 +48,14 @@ function frame(now) {
   // of timeScale (the spec's "trail length" is in samples).
   for (const e of state.entities) appendTrail(e, state.trailLength);
 
-  // Drop selection silently if the entity got consumed (e.g., by a black hole).
-  if (state.selectedId !== null && !state.entities.some(e => e.id === state.selectedId)) {
-    state.selectedId = null;
-    syncFromSelection();
+  // Drop selection silently if the selected entity is gone OR mid-absorption
+  // (it's effectively dying — editing its sliders would be pointless).
+  if (state.selectedId !== null) {
+    const sel = state.entities.find(e => e.id === state.selectedId);
+    if (!sel || sel.absorbing) {
+      state.selectedId = null;
+      syncFromSelection();
+    }
   }
 
   drawScene(ctx);

@@ -107,7 +107,8 @@ function handlePointerUp(ev) {
     return;
   }
 
-  // Placement commit.
+  // Placement commit — slingshot semantics: drag *back* to launch *forward*.
+  // The initial velocity is the *negative* of the drag vector.
   if (!state.drag) return;
   const dragVecX = state.drag.currentX - state.drag.startX;
   const dragVecY = state.drag.currentY - state.drag.startY;
@@ -115,8 +116,8 @@ function handlePointerUp(ev) {
     type: state.pending.type,
     x: state.drag.startX,
     y: state.drag.startY,
-    vx: dragVecX * LAUNCH_SPEED_K,
-    vy: dragVecY * LAUNCH_SPEED_K,
+    vx: -dragVecX * LAUNCH_SPEED_K,
+    vy: -dragVecY * LAUNCH_SPEED_K,
     mass: state.pending.mass,
     radius: state.pending.radius,
     charge: state.pending.charge,
@@ -155,20 +156,25 @@ function schedulePrediction() {
 function updatePrediction() {
   const d = state.drag;
   if (!d) return;
+  // Slingshot reversal: launch velocity is opposite the drag vector, so the
+  // prediction curve goes the opposite way from the rubber-band handle.
   const ghost = {
     x: d.startX,
     y: d.startY,
-    vx: (d.currentX - d.startX) * LAUNCH_SPEED_K,
-    vy: (d.currentY - d.startY) * LAUNCH_SPEED_K,
+    vx: -(d.currentX - d.startX) * LAUNCH_SPEED_K,
+    vy: -(d.currentY - d.startY) * LAUNCH_SPEED_K,
     radius: state.pending.radius,
   };
   d.predictionPath = predictTrajectory(ghost, state.entities);
 }
 
 // Topmost-first hit test: iterate in reverse so visually-front entities win.
+// Skip entities mid-absorption — they're shrinking out of existence and
+// shouldn't accept clicks.
 function hitTestEntity(x, y) {
   for (let i = state.entities.length - 1; i >= 0; i--) {
     const e = state.entities[i];
+    if (e.absorbing) continue;
     const dx = x - e.x;
     const dy = y - e.y;
     if (dx * dx + dy * dy <= e.radius * e.radius) return e;

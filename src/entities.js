@@ -42,6 +42,11 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge }) {
     // Verlet uses last acceleration; cached so we don't recompute mid-step.
     ax: 0,
     ay: 0,
+    // Black-hole absorption animation state. null = normal entity. When a
+    // black hole consumes this entity, physics.handleCollisions sets:
+    //   { blackHoleId, elapsedSim, startRadius, startX, startY }
+    // and physics.updateAbsorptions then shrinks + lerps it into the hole.
+    absorbing: null,
   };
 }
 

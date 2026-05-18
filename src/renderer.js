@@ -7,14 +7,16 @@
 //   4. Entities (planets + black holes)
 //   5. Selected highlight ring
 
-import { state } from './state.js';
+import { state, ABSORPTION_DURATION } from './state.js';
 import { resolveDisplayColor } from './entities.js';
 
 const BG_COLOR = '#0a0a0f';
-const SLINGSHOT_COLOR = 'rgba(255,255,255,0.55)';
 const SELECT_RING_COLOR = '#6b8cff';
 const PREDICTION_DASH = [6, 6];
 const PREDICTION_BATCHES = 8;   // sub-segments for fade-along-path effect
+const RUBBER_BAND_DASH = [5, 4];
+const HANDLE_LINE_WIDTH = 2;
+const GHOST_FILL_ALPHA = 0.18;  // faint preview at placement point
 
 export function drawScene(ctx) {
   const { width, height } = state.viewport;
@@ -50,24 +52,54 @@ function drawDragPreview(ctx) {
   const drag = state.drag;
   if (!drag) return;
 
-  // Slingshot reference line: from start to current pointer.
-  ctx.strokeStyle = SLINGSHOT_COLOR;
+  const previewColor = resolveDisplayColor(
+    state.pending.type, state.pending.charge, drag.previewBaseColor,
+  );
+  const radius = state.pending.radius;
+
+  // 1. Ghost circle at the *placement* point (where the body will spawn).
+  //    Faint filled disk + thin outline so users can see "this is where it'll be".
+  ctx.globalAlpha = GHOST_FILL_ALPHA;
+  ctx.fillStyle = previewColor;
+  ctx.beginPath();
+  ctx.arc(drag.startX, drag.startY, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = previewColor;
   ctx.lineWidth = 1;
-  ctx.setLineDash([2, 4]);
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.arc(drag.startX, drag.startY, radius, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // 2. Dashed "rubber band" from placement point to the cursor (handle).
+  ctx.strokeStyle = previewColor;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash(RUBBER_BAND_DASH);
   ctx.beginPath();
   ctx.moveTo(drag.startX, drag.startY);
   ctx.lineTo(drag.currentX, drag.currentY);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Prediction path, color = would-be display color of the entity.
-  const path = drag.predictionPath;
-  if (!path || path.length < 2) return;
+  // 3. Hollow handle ring at the cursor (where the player is "pulling to").
+  //    Size scales with drag distance up to a sensible cap so it's always visible.
+  const dx = drag.currentX - drag.startX;
+  const dy = drag.currentY - drag.startY;
+  const dragDist = Math.hypot(dx, dy);
+  const handleRadius = Math.max(6, Math.min(14, dragDist * 0.08 + 6));
+  ctx.strokeStyle = previewColor;
+  ctx.lineWidth = HANDLE_LINE_WIDTH;
+  ctx.beginPath();
+  ctx.arc(drag.currentX, drag.currentY, handleRadius, 0, Math.PI * 2);
+  ctx.stroke();
 
-  const previewColor = resolveDisplayColor(
-    state.pending.type, state.pending.charge, drag.previewBaseColor,
-  );
-  drawDashedFadingPath(ctx, path, previewColor);
+  // 4. Prediction path — color = the entity's would-be display color.
+  //    Goes opposite to the drag because launch velocity is negated.
+  const path = drag.predictionPath;
+  if (path && path.length >= 2) {
+    drawDashedFadingPath(ctx, path, previewColor);
+  }
 }
 
 // Draw a dashed polyline whose alpha decreases along the path (head full opacity,
@@ -101,10 +133,18 @@ function drawEntities(ctx) {
 }
 
 function drawOneEntity(ctx, e) {
+  // Absorbing entities fade alpha alongside the physics-driven shrink so they
+  // visibly disappear into the black hole. Use elapsedSim directly so we
+  // stay correct if the physics lerp curve ever changes (e.g., easing).
+  if (e.absorbing) {
+    const t = Math.min(1, e.absorbing.elapsedSim / ABSORPTION_DURATION);
+    ctx.globalAlpha = Math.max(0, 1 - t);
+  }
+
   // Body
   ctx.fillStyle = e.color;
   ctx.beginPath();
-  ctx.arc(e.x, e.y, e.radius, 0, Math.PI * 2);
+  ctx.arc(e.x, e.y, Math.max(0, e.radius), 0, Math.PI * 2);
   ctx.fill();
 
   // Edge treatment so black holes remain visible on dark background.
@@ -130,6 +170,9 @@ function drawOneEntity(ctx, e) {
     ctx.textBaseline = 'middle';
     ctx.fillText(e.charge > 0 ? '+' : '−', e.x, e.y);
   }
+
+  // Restore alpha so the absorbing-entity fade doesn't bleed into siblings.
+  if (e.absorbing) ctx.globalAlpha = 1;
 }
 
 function drawSelectionRing(ctx) {
