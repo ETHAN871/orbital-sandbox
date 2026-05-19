@@ -40,12 +40,12 @@ export function bindUI() {
   els.boundaryBtn.addEventListener('click', toggleBoundaryMode);
   els.bgThemeBtn.addEventListener('click', toggleBgTheme);
 
-  // V8.1c: trail-width slider (collapsible "线宽设置" section).
+  // Trail-width slider (collapsible "线宽设置" section).
   bindRangeSlider('trail-width', val => { state.trailWidth = val; }, 1);
 
-  // V8.1c: 7 sliders in the "高级调参" collapsible — each writes directly
-  // to its state.* field. Handlers read state.* at use site, so changes
-  // take effect on the next frame without any extra wiring.
+  // 7 sliders in the "高级调参" collapsible — each writes directly to its
+  // state.* field. Handlers read state.* at use site, so changes take
+  // effect on the next frame without any extra wiring.
   bindRangeSlider('tune-G',           val => { state.G = val; },                  0);
   bindRangeSlider('tune-restitution', val => { state.elasticRestitution = val; }, 2);
   bindRangeSlider('tune-K',           val => { state.launchSpeedK = val; },       2);
@@ -60,7 +60,7 @@ export function bindUI() {
   els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
   els.radiusVal.textContent = formatVal('radius', state.pending.radius / state.radiusBase, 2);
   els.trailVal.textContent = formatVal('trail', state.trailLength, 0);
-  // V8.1c initial sync for new sliders + bg theme button.
+  // Initial sync for new sliders + bg theme button.
   els.trailWidthVal.textContent = formatVal('trail-width', state.trailWidth, 1);
   for (const spec of els.tuneInputs) {
     const v = state[spec.stateKey];
@@ -85,7 +85,7 @@ function cacheElements() {
   els.trailInput = document.getElementById('trail');
   els.trailVal   = document.getElementById('trail-val');
   els.timeInput  = document.getElementById('time-scale');
-  els.timeVal    = document.getElementById('time-val');
+  els.timeVal    = document.getElementById('time-scale-val');
   els.pauseBtn   = document.getElementById('pause-btn');
   els.editBtn    = document.getElementById('edit-btn');
   els.clearBtn   = document.getElementById('clear-btn');
@@ -98,10 +98,9 @@ function cacheElements() {
   els.selSection = document.getElementById('selection-controls');
   els.pinBtn     = document.getElementById('pin-btn');
   els.deleteBtn  = document.getElementById('delete-entity-btn');
-  // V4 additions: persistent toggles in the placement panel.
   els.pendingPinBtn = document.getElementById('pending-pin-btn');
   els.boundaryBtn   = document.getElementById('boundary-btn');
-  // V8.1c: background theme + trail width + advanced tuning panel.
+  // Background theme + trail width + advanced tuning panel.
   els.bgThemeBtn      = document.getElementById('bg-theme-btn');
   els.trailWidthInput = document.getElementById('trail-width');
   els.trailWidthVal   = document.getElementById('trail-width-val');
@@ -174,7 +173,7 @@ function formatVal(id, raw, decimals) {
   if (id === 'radius') return `${raw.toFixed(decimals)}×`;
   // V8.1: trail slider is now a "lifetime in seconds" (slider / 50).
   if (id === 'trail') return `${(raw / 50).toFixed(1)} 秒`;
-  // V8.1c: new tunable sliders with appropriate suffixes.
+  // Tunable sliders with appropriate suffixes.
   if (id === 'trail-width')   return `${raw.toFixed(1)} px`;
   if (id === 'tune-absorb')   return `${raw.toFixed(1)} 秒`;
   if (id === 'tune-eps')      return `${raw.toFixed(1)} px`;
@@ -309,7 +308,7 @@ export function updateEntityCount() {
   els.entityCount.textContent = `${state.entities.length} 个实体`;
 }
 
-// ─── V8.1c handlers ──────────────────────────────────────────────
+// ─── Background theme + advanced-tuning handlers ─────────────────
 const BG_DARK  = '#0a0a0f';
 const BG_LIGHT = '#ececf0';
 
@@ -360,7 +359,7 @@ function deleteSelectedEntity() {
   syncFromSelection();
 }
 
-// ─── Persistent placement toggles (V4) ───────────────────────────
+// ─── Persistent placement toggles ────────────────────────────────
 // Flip `state.pending.pinned`. Newly placed bodies will spawn pinned.
 function togglePendingPin() {
   state.pending.pinned = !state.pending.pinned;

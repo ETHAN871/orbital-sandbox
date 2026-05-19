@@ -49,10 +49,6 @@ function minImageDelta(d, span) {
   return d;
 }
 
-// (pairDelta was V5; V7 inlined it into the N² hot paths to avoid object
-//  allocation. minImageDelta is still used by ghostAccel/touchesBlackHole
-//  where the call count is much lower.)
-
 // ─── Force / acceleration ─────────────────────────────────────────
 // Returns parallel arrays-of-zero accumulator filled in-place.
 // We allocate once per step to avoid GC pressure in the inner loop.
@@ -473,10 +469,6 @@ function touchesBlackHole(x, y, radius, others) {
   return false;
 }
 
-// V8.1: appendTrail removed. Trails are now rendered as a global
-// phosphor-decay canvas (see renderer.updateTrailCanvas), so no per-entity
-// history is maintained in physics anymore.
-
 // ─── Boundary handling ────────────────────────────────────────────
 // Called once per frame from main.js. The buffer extends each viewport
 // edge by `max(w, h) × BOUNDARY_BUFFER_FACTOR` so fast-moving entities
@@ -499,9 +491,6 @@ export function applyBoundary(entities, viewport, mode) {
       else if (e.x > w)   e.x -= w;
       if (e.y < 0)        e.y += h;
       else if (e.y > h)   e.y -= h;
-      // V8.1: trail is a phosphor-decay canvas, not per-entity history;
-      // the new dot just lands on the wrapped position and the old dot
-      // (left on the other side) fades out naturally — no special case.
     }
     return;
   }

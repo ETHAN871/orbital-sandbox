@@ -33,10 +33,10 @@ export const DEFAULTS_TUNING = Object.freeze({
 // the physical value. Slider 1 = base, slider 2 = 2×base, slider 0.5 = half base.
 export const BASE_TIME_SCALE = 2;          // Slider 1.0× = effective 2× real time.
 
-// ─── Dynamic radius base (V6) ─────────────────────────────────────
-// Replaces the V3-V5 fixed `RADIUS_BASE = 10`. The slider 1.0× now corresponds
-// to a viewport-relative radius — bigger screens get bigger default bodies,
-// but a hard floor keeps them tappable on touch / small screens.
+// ─── Dynamic radius base ──────────────────────────────────────────
+// Slider 1.0× corresponds to a viewport-relative radius — bigger screens
+// get bigger default bodies, but a hard floor keeps them tappable on
+// touch / small screens.
 //
 //   base_px = clamp(min(viewport_w, viewport_h) / RADIUS_DIVISOR,
 //                   MIN_RADIUS_PX, MAX_RADIUS_PX)
@@ -64,11 +64,6 @@ export const EDIT_MODE_TIME_RATIO = 0.2;
 // away from the viewport edge (gives them some off-screen room before despawn).
 // In 'wrap' mode they teleport to the opposite side instead.
 export const BOUNDARY_BUFFER_FACTOR = 0.5;
-
-// V8.1: trail rendering switched from per-entity ring-buffer to a global
-// phosphor-decay canvas in renderer.js. The slider 0-500 is repurposed
-// as a lifetime in seconds (lifetime_s = slider / 50). TRAIL_BUFFER_SIZE
-// is no longer needed since no per-entity trail history is stored.
 
 // ─── UI defaults & limits ─────────────────────────────────────────
 export const DEFAULTS = Object.freeze({
@@ -144,8 +139,8 @@ export const state = {
   // Slider value 1.0 corresponds to this many px.
   radiusBase: MIN_RADIUS_PX,
 
-  // V8.1c tunable physics params (formerly module-level const). Driven by
-  // the 高级调参 panel sliders; reset to DEFAULTS_TUNING via reset button.
+  // Tunable physics params — driven by 高级调参 sliders; reset via
+  // DEFAULTS_TUNING.
   G:                  DEFAULTS_TUNING.G,
   epsilon:            DEFAULTS_TUNING.epsilon,
   predictHorizon:     DEFAULTS_TUNING.predictHorizon,

@@ -23,7 +23,7 @@ const SPRITE_PADDING_PX = 8;   // room for pinned ring + antialias
 
 const cache = new Map();       // key → HTMLCanvasElement (canvas with ._ox/._oy)
 
-export function getSprite(type, color, radius, charge, pinned) {
+function getSprite(type, color, radius, charge, pinned) {
   // Quantize radius to 0.5 px to coalesce mid-drag slider variants AND so
   // the sprite is rendered at the same radius the cache key reflects (no
   // visual/cached-key divergence).
@@ -60,8 +60,6 @@ export function ensureEntitySprite(e) {
   }
   return e._sprite;
 }
-
-export function cacheSize() { return cache.size; }
 
 function makeKeyQuantized(type, color, rQ, charge, pinned) {
   return `${type}|${color}|${rQ}|${charge}|${pinned ? 1 : 0}`;

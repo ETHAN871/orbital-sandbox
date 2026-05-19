@@ -11,8 +11,6 @@ import { state } from './state.js';
 import { resolveDisplayColor } from './entities.js';
 import { ensureEntitySprite } from './sprite-cache.js';
 
-// V8.1c: ABSORPTION_DURATION moved to state.absorptionDuration (UI-tunable).
-// BG_COLOR replaced by state.bgColor (light/dark toggle button).
 const SELECT_RING_COLOR = '#6b8cff';
 const PREDICTION_DASH = [6, 6];
 const PREDICTION_BATCHES = 8;   // sub-segments for fade-along-path effect
@@ -256,7 +254,7 @@ function drawHoverGhost(ctx) {
   const r = state.pending.radius;
   const { x, y } = state.hoverPos;
 
-  ctx.globalAlpha = 0.18;
+  ctx.globalAlpha = GHOST_FILL_ALPHA;
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
@@ -344,8 +342,7 @@ function drawDragPreview(ctx) {
 // apply globalAlpha per batch — canvas setLineDash can't fade individual dashes.
 // In wrap mode we skip segments that jump across the boundary so the line
 // doesn't draw a straight slash across the whole viewport.
-// V7: `path` is now `{ data: Float32Array, length: number }` — interleaved
-// (x, y) samples in a flat buffer instead of an array of objects.
+// `path` is `{ data: Float32Array (interleaved x,y), length: number }`.
 function drawDashedFadingPath(ctx, path, color) {
   const n = path.length;
   const data = path.data;
@@ -409,9 +406,10 @@ function drawEntities(ctx) {
   }
 }
 
-// V7: drawOneEntity now takes explicit (drawX, drawY), so the mirror call
-// no longer needs to mutate-and-restore the entity. Passes isMirror=true
-// to suppress charge-glyph text render (visible only on the primary copy).
+// Mirror draw: call drawOneEntity with the mirrored coordinates so we
+// don't have to mutate-and-restore the entity. (The 4th arg to drawOneEntity
+// is the legacy isMirror flag — unused now that sprite caching handles
+// per-call state internally.)
 function drawEntityAtMirror(ctx, e, ox, oy) {
   drawOneEntity(ctx, e, e.x + ox, e.y + oy, true);
 }

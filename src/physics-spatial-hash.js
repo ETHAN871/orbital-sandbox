@@ -23,8 +23,6 @@ let _cellSize = 64;
 let _cells = new Map();          // key "cx,cy" → entity[]
 let _ncx = 0, _ncy = 0;          // grid dims when in wrap mode (for modular indexing)
 
-export function getCellSize() { return _cellSize; }
-
 export function buildSpatialHash(entities) {
   // Cell size MUST be ≥ 2 × maxR so the 3×3 cell-neighbourhood query
   // covers every pair within r_sum_max = 2 × maxR. Otherwise pairs whose
