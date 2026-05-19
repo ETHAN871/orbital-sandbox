@@ -26,14 +26,24 @@ let _ncx = 0, _ncy = 0;          // grid dims when in wrap mode (for modular ind
 export function getCellSize() { return _cellSize; }
 
 export function buildSpatialHash(entities) {
-  // Cell size = 2 × current max radius, clamped to [32, 128] so neither a
-  // single huge planet nor a swarm of tiny ones blows up cell count.
+  // Cell size MUST be ≥ 2 × maxR so the 3×3 cell-neighbourhood query
+  // covers every pair within r_sum_max = 2 × maxR. Otherwise pairs whose
+  // cell distance is 2+ but whose min-image position distance is still <
+  // r_sum get silently dropped — manifesting as "one half of a portal-
+  // straddling body fails to collide" because the boundary-spanning entity
+  // can land 2 cells away from its peer via the wrap path.
+  //
+  // V8.2 originally capped cellSize at 128 to keep cell count down; that
+  // broke collisions for maxR > 64 (entities at max radius 80 had
+  // r_sum=160 but cellSize=128). Cap removed — slightly fewer cells but
+  // tighter geometric correctness, and per-cell density actually drops
+  // with larger cells so the inner k-pair loop is no slower.
   let maxR = 16;
   for (let i = 0; i < entities.length; i++) {
     const r = entities[i].radius;
     if (r > maxR) maxR = r;
   }
-  _cellSize = Math.min(128, Math.max(32, Math.ceil(maxR * 2)));
+  _cellSize = Math.max(32, Math.ceil(maxR * 2));
 
   _ncx = Math.max(1, Math.ceil(state.viewport.width  / _cellSize));
   _ncy = Math.max(1, Math.ceil(state.viewport.height / _cellSize));
