@@ -152,8 +152,9 @@ export function handleCollisions(entities) {
         else if (a.mass < b.mass) { prey = a; predator = b; }
         else if (b.mass < a.mass) { prey = b; predator = a; }
         else continue;                              // equal-mass BHs: stalemate, no effect
-        // Pinned bodies are intentional anchors — they are immune to absorption.
-        if (prey.pinned) continue;
+        // Pinned bodies are *kinematic* anchors only — they still get
+        // consumed by black holes per user intent (固定的黑洞被路过的吞噬
+        // 是预期行为).
         beginAbsorption(prey, predator);
       } else {
         resolveElasticCollision(a, b, dx, dy, dist2, rSum);
