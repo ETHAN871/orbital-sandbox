@@ -5,7 +5,7 @@
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
 import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
-import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions, applyBoundary } from './physics.js';
+import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
 import { drawScene } from './renderer.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
@@ -30,6 +30,12 @@ requestAnimationFrame(frame);
 function frame(now) {
   const realDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
   lastTime = now;
+
+  // V8.2: build the Barnes-Hut quadtree and spatial hash once per frame so
+  // all substeps share them. Worth up to 7x savings on tree-build cost at
+  // high substep count. Position drift between substeps is bounded by
+  // SIM_DT * |v| and stays within Verlet's existing integration tolerance.
+  prepareFrame(state.entities);
 
   // Effective time ratio = user's slider value, UNLESS edit mode is active
   // (then a fixed override applies, independent of the slider). This keeps the

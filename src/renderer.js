@@ -9,6 +9,7 @@
 
 import { state, ABSORPTION_DURATION } from './state.js';
 import { resolveDisplayColor } from './entities.js';
+import { ensureEntitySprite } from './sprite-cache.js';
 
 const BG_COLOR = '#0a0a0f';
 const SELECT_RING_COLOR = '#6b8cff';
@@ -232,70 +233,49 @@ function drawEntityAtMirror(ctx, e, ox, oy) {
   drawOneEntity(ctx, e, e.x + ox, e.y + oy, true);
 }
 
-// V7: takes explicit (drawX, drawY) so mirror copies don't have to mutate
-// the entity's actual position. `isMirror=true` skips expensive per-call
-// state ops that are visually redundant on a ghost copy (notably the
-// charge-glyph text render which forces a font parse).
-function drawOneEntity(ctx, e, drawX, drawY, isMirror) {
+// V8.1: normal entities are rendered via the sprite cache (drawImage of a
+// pre-baked off-screen canvas). This collapses ~5-12 canvas state writes
+// per draw into 1 cheap blit and is especially valuable at boundary
+// corners where each entity gets up to 9× mirror copies.
+//
+// Absorbing entities can't use the cache (their alpha changes per frame),
+// so we keep the V7 arc-fallback path for them. Few entities are absorbing
+// at any time, so the slow path's cost stays small.
+function drawOneEntity(ctx, e, drawX, drawY /* isMirror unused with sprite cache */) {
   if (drawX === undefined) drawX = e.x;
   if (drawY === undefined) drawY = e.y;
 
-  // Absorbing entities fade alpha alongside the physics-driven shrink so they
-  // visibly disappear into the black hole. Use elapsedSim directly so we
-  // stay correct if the physics lerp curve ever changes (e.g., easing).
   if (e.absorbing) {
-    const t = Math.min(1, e.absorbing.elapsedSim / ABSORPTION_DURATION);
-    ctx.globalAlpha = Math.max(0, 1 - t);
+    drawAbsorbingFallback(ctx, e, drawX, drawY);
+    return;
   }
 
+  const sprite = ensureEntitySprite(e);
+  if (!sprite) return;                              // safety
+  ctx.drawImage(sprite, drawX - sprite._ox, drawY - sprite._oy);
+}
+
+// Slow path for absorbing entities — same visuals as V7's arc-based code
+// but parameterised on (drawX, drawY) so mirror copies render at offset.
+function drawAbsorbingFallback(ctx, e, drawX, drawY) {
+  const t = Math.min(1, e.absorbing.elapsedSim / ABSORPTION_DURATION);
+  ctx.globalAlpha = Math.max(0, 1 - t);
   const r = Math.max(0, e.radius);
 
-  // Body
   ctx.fillStyle = e.color;
   ctx.beginPath();
   ctx.arc(drawX, drawY, r, 0, Math.PI * 2);
   ctx.fill();
 
-  // Edge treatment so black holes remain visible on dark background.
   if (e.type === 'black_hole') {
-    if (e.charge === -1) {
-      // White black hole: dark thin rim for contrast
-      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    } else {
-      // Black black hole: faint cyan accretion-disk hint
-      ctx.strokeStyle = 'rgba(120,180,255,0.75)';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    }
-  }
-
-  // Charge sign glyph (subtle): a faint +/- in the middle for non-zero charges on planets.
-  // Skipped on mirror copies — the primary draw already shows it, and the
-  // ctx.font assignment is a notable per-call cost (font parsing).
-  if (!isMirror && e.type === 'planet' && e.charge !== 0 && r >= 10) {
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.font = `${Math.min(r, 18)}px ui-sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(e.charge > 0 ? '+' : '−', drawX, drawY);
-  }
-
-  // Pinned indicator: a yellow dashed ring just outside the body to signal
-  // "this body won't move". Suppressed during absorption to avoid clutter.
-  if (e.pinned && !e.absorbing) {
-    ctx.strokeStyle = '#ffd24d';
+    ctx.strokeStyle = e.charge === -1
+      ? 'rgba(0,0,0,0.55)'
+      : 'rgba(120,180,255,0.75)';
     ctx.lineWidth = 1.5;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.arc(drawX, drawY, r + 4, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.setLineDash([]);
   }
 
-  // Restore alpha so the absorbing-entity fade doesn't bleed into siblings.
-  if (e.absorbing) ctx.globalAlpha = 1;
+  ctx.globalAlpha = 1;
 }
 
 function drawSelectionRing(ctx) {

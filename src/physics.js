@@ -17,6 +17,25 @@ import {
   ABSORPTION_DURATION, ELASTIC_RESTITUTION,
   BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
+import { prepareBHTree, computeAccelerationsBH } from './physics-barneshut.js';
+import { buildSpatialHash, forEachCollisionPair } from './physics-spatial-hash.js';
+
+// V8.2 dispatch threshold. Below this entity count, the O(N²) direct sum
+// has lower constant factor than Barnes-Hut tree build + 9-ghost recursion;
+// above it, BH wins decisively.
+const BH_THRESHOLD = 64;
+
+// V8.2: prepare per-frame data structures once. main.js calls this before
+// the substep loop so the quadtree + spatial hash are built exactly 1× per
+// frame instead of up-to-8× (once per substep). Position drift between
+// substeps is bounded by SIM_DT × velocity and is within Verlet's
+// integration tolerance.
+export function prepareFrame(entities) {
+  if (entities.length >= BH_THRESHOLD) {
+    prepareBHTree(entities);
+    buildSpatialHash(entities);
+  }
+}
 
 // ─── Minimum-image distance helpers (wrap mode) ───────────────────
 // When the world wraps, two points near opposite edges can be closer
@@ -42,6 +61,12 @@ function minImageDelta(d, span) {
 
 export function computeAccelerations(entities, accels) {
   const n = entities.length;
+  // V8.2: dispatch to Barnes-Hut for large N. The direct O(N²) sum below
+  // wins at small N due to lower constant factor + cache locality.
+  if (n >= BH_THRESHOLD) {
+    computeAccelerationsBH(entities, accels);
+    return;
+  }
   for (let i = 0; i < n; i++) { accels[i].ax = 0; accels[i].ay = 0; }
 
   // V7 perf: hoist wrap/viewport reads out of the N² hot path and inline
@@ -154,9 +179,49 @@ export function stepVerlet(entities, dt) {
 //
 // Already-absorbing entities are inert — they neither collide nor get hit.
 
+// V8.2: shared pair handler — invoked by both the direct N² loop (small N)
+// and the spatial-hash candidate iterator (large N). Re-checks absorbing
+// state defensively because a pair earlier in this same frame may have
+// turned `a` or `b` into prey, and we don't want to apply impulse to a body
+// already mid-absorption.
+function processCollisionPair(a, b, dx, dy) {
+  if (a.absorbing || b.absorbing) return;
+  const rSum = a.radius + b.radius;
+  const dist2 = dx * dx + dy * dy;
+  if (dist2 >= rSum * rSum) return;
+
+  const aIsBH = a.type === 'black_hole';
+  const bIsBH = b.type === 'black_hole';
+
+  if (aIsBH || bIsBH) {
+    let prey, predator;
+    if (aIsBH && !bIsBH) { prey = b; predator = a; }
+    else if (!aIsBH && bIsBH) { prey = a; predator = b; }
+    else if (a.mass < b.mass) { prey = a; predator = b; }
+    else if (b.mass < a.mass) { prey = b; predator = a; }
+    else return;                                  // equal-mass BHs: stalemate
+    // Pinned bodies are *kinematic* anchors only — they still get
+    // consumed by black holes per user intent (固定的黑洞被路过的吞噬
+    // 是预期行为).
+    beginAbsorption(prey, predator);
+  } else {
+    resolveElasticCollision(a, b, dx, dy, dist2, rSum);
+  }
+}
+
 export function handleCollisions(entities) {
   const n = entities.length;
-  // V7 perf: same hoisting as computeAccelerations.
+
+  // V8.2: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
+  // The hash is built once per frame in prepareFrame() above; this just
+  // iterates the already-built buckets.
+  if (n >= BH_THRESHOLD) {
+    forEachCollisionPair(entities, processCollisionPair);
+    return;
+  }
+
+  // Direct O(N²) path for small N. V7 perf: same hoisting as
+  // computeAccelerations to avoid per-pair property reads.
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width  : 0;
   const H = wrap ? state.viewport.height : 0;
@@ -180,28 +245,9 @@ export function handleCollisions(entities) {
         if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
         if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
       }
-      const rSum = a.radius + b.radius;
-      const dist2 = dx * dx + dy * dy;
-      if (dist2 >= rSum * rSum) continue;          // not touching
-
-      const aIsBH = a.type === 'black_hole';
-      const bIsBH = b.type === 'black_hole';
-
-      if (aIsBH || bIsBH) {
-        // Pick prey: non-BH always loses to BH; between two BHs, smaller mass loses.
-        let prey, predator;
-        if (aIsBH && !bIsBH) { prey = b; predator = a; }
-        else if (!aIsBH && bIsBH) { prey = a; predator = b; }
-        else if (a.mass < b.mass) { prey = a; predator = b; }
-        else if (b.mass < a.mass) { prey = b; predator = a; }
-        else continue;                              // equal-mass BHs: stalemate, no effect
-        // Pinned bodies are *kinematic* anchors only — they still get
-        // consumed by black holes per user intent (固定的黑洞被路过的吞噬
-        // 是预期行为).
-        beginAbsorption(prey, predator);
-      } else {
-        resolveElasticCollision(a, b, dx, dy, dist2, rSum);
-      }
+      // V8.2: dispatch through shared helper so both N<64 and N≥64 paths
+      // run identical collision/absorption logic.
+      processCollisionPair(a, b, dx, dy);
     }
   }
 }
