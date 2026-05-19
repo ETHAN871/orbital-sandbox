@@ -8,7 +8,7 @@
 // slider thumbs reflect the chosen entity's current values.
 
 import {
-  state, DEFAULTS, RADIUS_BASE, BASE_TIME_SCALE,
+  state, DEFAULTS, RADIUS_BASE, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
@@ -142,14 +142,15 @@ function applyTimeScale(value) {
   updateHeaderTime();
 }
 
-// Top-of-panel time-rate badge — kept in lock-step with the slider value.
-// Shows both the user-facing ratio AND the resulting real-time multiplier so
-// the user can see "1.00× (= 2× real)" at a glance.
+// Top-of-panel time-rate badge — always shows the actual *effective* real-time
+// multiplier, which respects edit-mode override. The slider ratio shown is the
+// constant override when in edit mode, otherwise the user's slider value.
 function updateHeaderTime() {
   if (!els.headerTime) return;
-  const ratio = state.timeScale;
+  const ratio = state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale;
   const effective = ratio * BASE_TIME_SCALE;
-  els.headerTime.textContent = `流速 ${ratio.toFixed(2)}× · 真实 ${effective.toFixed(2)}×`;
+  const editTag = state.isEditMode ? ' · 编辑慢动作' : '';
+  els.headerTime.textContent = `流速 ${ratio.toFixed(2)}× · 真实 ${effective.toFixed(2)}×${editTag}`;
 }
 
 function togglePause() {
@@ -172,36 +173,20 @@ function updatePauseButtonLabel() {
 }
 
 // ─── Edit mode toggle ────────────────────────────────────────────
-// Entering / exiting edit mode forces a particular timeScale, but we must
-// NOT let those forced changes pollute `state.prevTimeScale` — that field is
-// the pause-button's "what to resume to" value. We save/restore it around
-// every `applyTimeScale` call so a later resume picks the user-chosen rate,
-// not the 0.2x slow-down used during edit.
+// Edit mode is now independent of the time slider — the slider keeps the
+// user's chosen rate; main.js overrides the *effective* rate to a constant
+// EDIT_MODE_TIME_RATIO while editing. So toggling edit mode no longer
+// manipulates state.timeScale or the slider DOM at all.
 function toggleEditMode() {
   state.isEditMode = !state.isEditMode;
-  if (state.isEditMode) {
-    state.prevTimeScaleBeforeEdit = state.timeScale;
-    const userPrev = state.prevTimeScale;
-    applyTimeScale(DEFAULTS.editTimeScale);
-    state.prevTimeScale = userPrev;
-    els.timeInput.value = String(DEFAULTS.editTimeScale);
-    els.timeVal.textContent = `${DEFAULTS.editTimeScale.toFixed(2)}x`;
-  } else {
-    const restore = state.prevTimeScaleBeforeEdit ?? DEFAULTS.timeScale;
-    const userPrev = state.prevTimeScale;
-    applyTimeScale(restore);
-    // Only restore the pre-edit `prevTimeScale` if exiting back into a paused
-    // state — otherwise the just-applied non-zero restore is exactly what we
-    // want as the new "resume" value.
-    if (restore === 0) state.prevTimeScale = userPrev;
-    els.timeInput.value = String(restore);
-    els.timeVal.textContent = `${restore.toFixed(2)}x`;
-    state.prevTimeScaleBeforeEdit = null;
+  if (!state.isEditMode) {
+    // Clear selection when leaving edit mode — nothing to edit anymore.
     state.selectedId = null;
   }
   els.editBtn.classList.toggle('active', state.isEditMode);
   els.stage.classList.toggle('edit-mode', state.isEditMode);
   updateModeHint();
+  updateHeaderTime();        // effective rate badge changes when edit toggles
   syncFromSelection();
 }
 

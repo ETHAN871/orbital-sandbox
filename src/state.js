@@ -18,6 +18,10 @@ export const ELASTIC_RESTITUTION = 0.3;    // 0.3 = ~30% bounce-back; 1 = fully 
 // the physical value. Slider 1 = base, slider 2 = 2×base, slider 0.5 = half base.
 export const BASE_TIME_SCALE = 2;          // Slider 1.0× = effective 2× real time.
 export const RADIUS_BASE = 10;             // Slider 1.0× = effective 10 px radius.
+// Edit-mode *overrides* the effective time ratio to a constant value (slider
+// is unchanged — it represents the user's chosen rate for non-edit play).
+// effective_in_edit_mode = EDIT_MODE_TIME_RATIO × BASE_TIME_SCALE = 0.4× real.
+export const EDIT_MODE_TIME_RATIO = 0.2;
 
 // Boundary: entities are destroyed once they pass beyond
 //   max(viewport_w, viewport_h) × BOUNDARY_BUFFER_FACTOR
@@ -34,10 +38,10 @@ export const DEFAULTS = Object.freeze({
   radius: 10,
   charge: 1,
   trailLength: 100,
-  // timeScale is a *ratio*; effective time = timeScale × BASE_TIME_SCALE.
-  // Default 1.0× ratio → 2× real-time (the new default base).
+  // timeScale is a *ratio*; effective time = timeScale × BASE_TIME_SCALE
+  // (overridden to EDIT_MODE_TIME_RATIO × BASE_TIME_SCALE while editing).
+  // Default 1.0× ratio → 2× real-time.
   timeScale: 1,
-  editTimeScale: 0.2,
 });
 
 export const LIMITS = Object.freeze({
@@ -63,7 +67,6 @@ export const state = {
   // UI mode
   isEditMode: false,
   selectedId: null,
-  prevTimeScaleBeforeEdit: null,
 
   // Placement defaults (used when not editing). When `pinned` is true,
   // newly-spawned entities are immediately frozen in place.
