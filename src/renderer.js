@@ -25,7 +25,15 @@ const GHOST_FILL_ALPHA = 0.18;  // faint preview at placement point
 // active entity at its current position. Composite onto the main canvas
 // as a single drawImage. Cost: O(N) per frame instead of O(N × history).
 
-const TRAIL_DOT_R = 1;          // pixel-square half-extent → 3×3 px dot per entity
+// V8.1 trail: thinner AA-circle dot via per-pixel distance to entity center.
+// TRAIL_DOT_RADIUS is the geometric radius; the +0.5 in TRAIL_AA_CUTOFF
+// gives a half-pixel ramp from full alpha to zero at the edge, producing
+// anti-aliased boundaries without canvas state churn.
+const TRAIL_DOT_RADIUS = 0.7;          // ~2 px wide dot, soft edges
+const TRAIL_AA_CUTOFF  = TRAIL_DOT_RADIUS + 0.5;
+const TRAIL_AA_CUTOFF2 = TRAIL_AA_CUTOFF * TRAIL_AA_CUTOFF;
+const TRAIL_AA_BBOX    = Math.ceil(TRAIL_AA_CUTOFF);   // bounding-box half-extent in px
+
 const _colorRgbCache = new Map();
 
 let _trailCanvas = null;
@@ -108,26 +116,43 @@ export function updateTrailCanvas(simDeltaTime) {
     }
   }
 
-  // Plot 3×3 square dots at each non-absorbing entity in entity color.
-  // We write RGBA directly into the buffer; canvas API not used here.
+  // Plot AA-circle dots at each non-absorbing entity. For each pixel in the
+  // dot's bounding box, compute distance from the entity's sub-pixel center;
+  // pixels within radius get full alpha, pixels in the half-pixel "edge ramp"
+  // get alpha proportional to (cutoff - distance). Writing uses max(new, old)
+  // so a faded older trail pixel never gets DIMMED by a current AA edge
+  // contribution.
   for (let k = 0; k < state.entities.length; k++) {
     const e = state.entities[k];
     if (e.absorbing) continue;
     const rgb = colorToRgb(e.color);
     const cr = rgb[0], cg = rgb[1], cb = rgb[2];
-    const px = e.x | 0;                     // floor
-    const py = e.y | 0;
-    for (let dy = -TRAIL_DOT_R; dy <= TRAIL_DOT_R; dy++) {
+    const ex = e.x;
+    const ey = e.y;
+    const px = ex | 0;
+    const py = ey | 0;
+    for (let dy = -TRAIL_AA_BBOX; dy <= TRAIL_AA_BBOX; dy++) {
       const yy = py + dy;
       if (yy < 0 || yy >= h) continue;
-      for (let dx = -TRAIL_DOT_R; dx <= TRAIL_DOT_R; dx++) {
+      const cy = (yy + 0.5) - ey;            // pixel-center → entity-center (Y)
+      const cy2 = cy * cy;
+      for (let dx = -TRAIL_AA_BBOX; dx <= TRAIL_AA_BBOX; dx++) {
         const xx = px + dx;
         if (xx < 0 || xx >= w) continue;
+        const cx = (xx + 0.5) - ex;
+        const d2 = cx * cx + cy2;
+        if (d2 >= TRAIL_AA_CUTOFF2) continue;  // outside dot — fast reject
+        const d = Math.sqrt(d2);
+        // Alpha ramps from full inside the radius to 0 at the cutoff.
+        const aaAlpha = (TRAIL_AA_CUTOFF - d) * 255;
+        const a = aaAlpha >= 255 ? 255 : (aaAlpha | 0);
         const idx = (yy * w + xx) * 4;
-        data[idx]     = cr;
-        data[idx + 1] = cg;
-        data[idx + 2] = cb;
-        data[idx + 3] = 255;                // fresh dot at full alpha
+        if (a > data[idx + 3]) {
+          data[idx]     = cr;
+          data[idx + 1] = cg;
+          data[idx + 2] = cb;
+          data[idx + 3] = a;
+        }
       }
     }
   }
