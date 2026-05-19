@@ -5,7 +5,7 @@
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
 import { state, SIM_DT, BASE_TIME_SCALE } from './state.js';
-import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions } from './physics.js';
+import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions, applyBoundary } from './physics.js';
 import { drawScene } from './renderer.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
@@ -40,6 +40,7 @@ function frame(now) {
     stepVerlet(state.entities, SIM_DT);
     handleCollisions(state.entities);
     updateAbsorptions(state.entities, SIM_DT);
+    applyBoundary(state.entities, state.viewport, state.boundaryMode);
     accumulator -= SIM_DT;
     steps++;
   }

@@ -72,10 +72,14 @@ function handlePointerDown(ev) {
 }
 
 function handlePointerMove(ev) {
-  if (state.isEditMode) return;          // edit mode: no continuous interaction
+  const { x, y } = eventToCanvasCoords(ev);
+  // Always track hover for the placement-mode ghost outline. Renderer
+  // gates on `!isEditMode && !drag` itself.
+  state.hoverPos = { x, y };
+
+  if (state.isEditMode) return;
   if (!state.drag) return;
 
-  const { x, y } = eventToCanvasCoords(ev);
   state.drag.currentX = x;
   state.drag.currentY = y;
   schedulePrediction();
@@ -121,6 +125,7 @@ function handlePointerUp(ev) {
     mass: state.pending.mass,
     radius: state.pending.radius,
     charge: state.pending.charge,
+    pinned: state.pending.pinned,
   });
   state.entities.push(ent);
   state.drag = null;
@@ -132,6 +137,7 @@ function handlePointerLeave() {
   if (state.drag) state.drag = null;
   clickStart = null;
   cancelPendingPrediction();
+  state.hoverPos = null;
 }
 
 function cancelPendingPrediction() {

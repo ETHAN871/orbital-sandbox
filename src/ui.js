@@ -31,11 +31,15 @@ export function bindUI() {
   els.editBtn.addEventListener('click', toggleEditMode);
   els.pinBtn.addEventListener('click', togglePinSelected);
   els.deleteBtn.addEventListener('click', deleteSelectedEntity);
+  els.pendingPinBtn.addEventListener('click', togglePendingPin);
+  els.boundaryBtn.addEventListener('click', toggleBoundaryMode);
 
   // Initial sync — populate slider-side labels from state defaults so the HTML
   // hardcodes don't silently diverge if DEFAULTS change.
   els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
   els.radiusVal.textContent = formatVal('radius', state.pending.radius / RADIUS_BASE, 2);
+  refreshPendingPinBtn();
+  refreshBoundaryBtn();
   syncFromSelection();
   updateModeHint();
   updateHeaderTime();
@@ -64,6 +68,9 @@ function cacheElements() {
   els.selSection = document.getElementById('selection-controls');
   els.pinBtn     = document.getElementById('pin-btn');
   els.deleteBtn  = document.getElementById('delete-entity-btn');
+  // V4 additions: persistent toggles in the placement panel.
+  els.pendingPinBtn = document.getElementById('pending-pin-btn');
+  els.boundaryBtn   = document.getElementById('boundary-btn');
 }
 
 // ─── Segment selectors ────────────────────────────────────────────
@@ -272,4 +279,32 @@ function deleteSelectedEntity() {
   removeEntityById(state.selectedId);
   state.selectedId = null;
   syncFromSelection();
+}
+
+// ─── Persistent placement toggles (V4) ───────────────────────────
+// Flip `state.pending.pinned`. Newly placed bodies will spawn pinned.
+function togglePendingPin() {
+  state.pending.pinned = !state.pending.pinned;
+  refreshPendingPinBtn();
+}
+
+function refreshPendingPinBtn() {
+  if (!els.pendingPinBtn) return;
+  els.pendingPinBtn.classList.toggle('active', state.pending.pinned);
+  els.pendingPinBtn.textContent = state.pending.pinned
+    ? '📌 创建为固定（开）'
+    : '创建为固定';
+}
+
+// Toggle wrap-around vs destroy boundary mode.
+function toggleBoundaryMode() {
+  state.boundaryMode = state.boundaryMode === 'wrap' ? 'destroy' : 'wrap';
+  refreshBoundaryBtn();
+}
+
+function refreshBoundaryBtn() {
+  if (!els.boundaryBtn) return;
+  const wrap = state.boundaryMode === 'wrap';
+  els.boundaryBtn.classList.toggle('active', wrap);
+  els.boundaryBtn.textContent = wrap ? '循环边界（开）' : '循环边界';
 }

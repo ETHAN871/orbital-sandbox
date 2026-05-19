@@ -49,6 +49,13 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  /* Prevent the browser from entering text-selection drag mode when the
+     user drags a slider thumb across label text (visible as a ctrl-c style
+     ghost outline that blocks further slider movement). Inputs still
+     receive pointer events normally. */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
 }
 
 .panel-header h1 {

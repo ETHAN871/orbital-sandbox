@@ -14,6 +14,7 @@
 import {
   G, EPSILON, PREDICT_STEPS, PREDICT_DT,
   ABSORPTION_DURATION, ELASTIC_RESTITUTION,
+  BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
 
 // ─── Force / acceleration ─────────────────────────────────────────
@@ -348,5 +349,45 @@ export function appendTrail(entity, maxLen) {
   // (e.g. 500 → 20) in one call, instead of N×O(n) Array.shift() invocations.
   if (entity.trail.length > maxLen) {
     entity.trail.splice(0, entity.trail.length - maxLen);
+  }
+}
+
+// ─── Boundary handling ────────────────────────────────────────────
+// Called once per frame from main.js. The buffer extends each viewport
+// edge by `max(w, h) × BOUNDARY_BUFFER_FACTOR` so fast-moving entities
+// have some off-screen room before despawn.
+//
+// destroy mode → splice entities past the buffered edge (skip absorbing
+//                entities; their animation should complete first).
+// wrap mode    → teleport entities to the opposite edge, clearing the
+//                trail so the wrap-line doesn't draw across the viewport.
+
+export function applyBoundary(entities, viewport, mode) {
+  const w = viewport.width;
+  const h = viewport.height;
+  if (w <= 0 || h <= 0) return;
+
+  if (mode === 'wrap') {
+    for (const e of entities) {
+      if (e.absorbing) continue;
+      let wrapped = false;
+      if (e.x < 0)        { e.x += w; wrapped = true; }
+      else if (e.x > w)   { e.x -= w; wrapped = true; }
+      if (e.y < 0)        { e.y += h; wrapped = true; }
+      else if (e.y > h)   { e.y -= h; wrapped = true; }
+      if (wrapped) e.trail.length = 0;
+    }
+    return;
+  }
+
+  // destroy mode
+  const buffer = Math.max(w, h) * BOUNDARY_BUFFER_FACTOR;
+  for (let i = entities.length - 1; i >= 0; i--) {
+    const e = entities[i];
+    if (e.absorbing) continue;
+    if (e.x < -buffer || e.x > w + buffer ||
+        e.y < -buffer || e.y > h + buffer) {
+      entities.splice(i, 1);
+    }
   }
 }

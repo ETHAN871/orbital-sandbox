@@ -26,7 +26,7 @@ export function resolveDisplayColor(type, charge, baseColor) {
 // Position and velocity come from the placement gesture; mass/radius/charge
 // come from the "pending" template (or selected entity in edit mode).
 
-export function createEntity({ type, x, y, vx, vy, mass, radius, charge }) {
+export function createEntity({ type, x, y, vx, vy, mass, radius, charge, pinned = false }) {
   const baseColor = type === 'planet' ? randomPlanetColor() : '#000000';
   return {
     id: nextEntityId(),
@@ -49,8 +49,9 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge }) {
     absorbing: null,
     // Pinned bodies are kinematically frozen — they keep applying gravity
     // and participate in collisions (as infinite-mass anchors), but their
-    // position and velocity never change. Toggleable in edit mode.
-    pinned: false,
+    // position and velocity never change. Settable at creation (panel
+    // toggle) or via the per-entity edit-mode button.
+    pinned,
   };
 }
 

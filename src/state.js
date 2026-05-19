@@ -19,6 +19,12 @@ export const ELASTIC_RESTITUTION = 0.3;    // 0.3 = ~30% bounce-back; 1 = fully 
 export const BASE_TIME_SCALE = 2;          // Slider 1.0× = effective 2× real time.
 export const RADIUS_BASE = 10;             // Slider 1.0× = effective 10 px radius.
 
+// Boundary: entities are destroyed once they pass beyond
+//   max(viewport_w, viewport_h) × BOUNDARY_BUFFER_FACTOR
+// away from the viewport edge (gives them some off-screen room before despawn).
+// In 'wrap' mode they teleport to the opposite side instead.
+export const BOUNDARY_BUFFER_FACTOR = 0.5;
+
 // ─── UI defaults & limits ─────────────────────────────────────────
 export const DEFAULTS = Object.freeze({
   type: 'planet',
@@ -59,12 +65,14 @@ export const state = {
   selectedId: null,
   prevTimeScaleBeforeEdit: null,
 
-  // Placement defaults (used when not editing)
+  // Placement defaults (used when not editing). When `pinned` is true,
+  // newly-spawned entities are immediately frozen in place.
   pending: {
     type: DEFAULTS.type,
     mass: DEFAULTS.mass,
     radius: DEFAULTS.radius,
     charge: DEFAULTS.charge,
+    pinned: false,
   },
 
   // Display / sim
@@ -74,6 +82,14 @@ export const state = {
 
   // Drag-to-place transient state
   drag: null, // null or { startX, startY, currentX, currentY, predictionPath: [{x,y}, ...] }
+
+  // Pointer hover position in canvas coords (or null when off-canvas).
+  // Used by renderer to draw a ghost outline preview for placement mode.
+  hoverPos: null,
+
+  // 'destroy' (default) → entities past viewport+buffer are removed.
+  // 'wrap'              → entities wrap to the opposite edge.
+  boundaryMode: 'destroy',
 
   // Cached viewport (set by main.js on resize)
   viewport: { width: 0, height: 0 },

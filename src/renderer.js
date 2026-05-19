@@ -22,9 +22,41 @@ export function drawScene(ctx) {
   const { width, height } = state.viewport;
   drawBackground(ctx, width, height);
   drawTrails(ctx);
+  drawHoverGhost(ctx);
   drawDragPreview(ctx);
   drawEntities(ctx);
   drawSelectionRing(ctx);
+}
+
+// Show a translucent preview at the cursor when placement mode is active
+// and the pointer is on the canvas — lets users gauge the radius before
+// committing to a drag. Suppressed during an active drag (drag has its own
+// ghost at the placement point) and in edit mode (clicking selects, not places).
+function drawHoverGhost(ctx) {
+  if (state.isEditMode) return;
+  if (state.drag) return;
+  if (!state.hoverPos) return;
+
+  const color = resolveDisplayColor(
+    state.pending.type, state.pending.charge,
+    state.pending.type === 'planet' ? '#ffffff' : '#000000',
+  );
+  const r = state.pending.radius;
+  const { x, y } = state.hoverPos;
+
+  ctx.globalAlpha = 0.18;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 function drawBackground(ctx, w, h) {
