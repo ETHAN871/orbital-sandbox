@@ -62,14 +62,21 @@ export function updateTrailCanvas(simDeltaTime) {
   // slider=0   → lifetime=0   → fadeAlpha=1   → instant clear (no trail visible)
   // slider=100 → lifetime=2s  → ~per-frame alpha matches a 2-second decay
   // slider=500 → lifetime=10s → very long trail
+  //
+  // Fade uses `destination-out` composite so each frame REDUCES existing
+  // pixels' alpha by `a`, eventually leaving fully-transparent pixels.
+  // Previous V8.1 used `source-over` with `rgba(10,10,15,a)` which left
+  // residual opaque-dark pixels visible against the dark background as a
+  // ghostly gray smear. With destination-out, faded trails truly vanish.
   const lifetime = state.trailLength / 50;
   if (lifetime <= 0) {
     tctx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
   } else if (simDeltaTime > 0) {
-    // Per-frame fade alpha: simDeltaTime / lifetime. Clamped to [0, 1].
     const a = Math.min(1, simDeltaTime / lifetime);
-    tctx.fillStyle = `rgba(10, 10, 15, ${a})`;
+    tctx.globalCompositeOperation = 'destination-out';
+    tctx.fillStyle = `rgba(0, 0, 0, ${a})`;       // color ignored in destination-out; only alpha matters
     tctx.fillRect(0, 0, _trailCanvas.width, _trailCanvas.height);
+    tctx.globalCompositeOperation = 'source-over'; // restore default for dot plotting below
   }
   // If simDeltaTime == 0 (paused) we apply NO fade AND skip plotting new
   // dots — trail is truly frozen. Otherwise plotting opaque dots over
