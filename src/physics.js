@@ -460,27 +460,9 @@ function touchesBlackHole(x, y, radius, others) {
   return false;
 }
 
-// ─── Trail maintenance ────────────────────────────────────────────
-// Called by main loop after each frame to record a sample.
-// The trail is capped at `maxLen` points; older samples drop off the front.
-
-export function appendTrail(entity, maxLen) {
-  const t = entity.trail;
-  if (maxLen <= 0) {
-    t.size = 0;
-    t.head = 0;
-    return;
-  }
-  const cap = t.buf.length >> 1;          // bytes/2 = sample slots
-  // Write at head, advance, increment size (capped at min(maxLen, cap)).
-  t.buf[t.head * 2]     = entity.x;
-  t.buf[t.head * 2 + 1] = entity.y;
-  t.head = (t.head + 1) % cap;
-  const newCap = maxLen < cap ? maxLen : cap;
-  if (t.size < newCap) t.size++;
-  else if (t.size > newCap) t.size = newCap;
-  // O(1) — no array shifts, no allocations.
-}
+// V8.1: appendTrail removed. Trails are now rendered as a global
+// phosphor-decay canvas (see renderer.updateTrailCanvas), so no per-entity
+// history is maintained in physics anymore.
 
 // ─── Boundary handling ────────────────────────────────────────────
 // Called once per frame from main.js. The buffer extends each viewport
@@ -504,9 +486,9 @@ export function applyBoundary(entities, viewport, mode) {
       else if (e.x > w)   e.x -= w;
       if (e.y < 0)        e.y += h;
       else if (e.y > h)   e.y -= h;
-      // Note: we no longer clear `e.trail` on wrap. The renderer detects
-      // wrap-crossing segments (consecutive points with abs delta > span/2)
-      // and skips drawing them, keeping pre-wrap history visible.
+      // V8.1: trail is a phosphor-decay canvas, not per-entity history;
+      // the new dot just lands on the wrapped position and the old dot
+      // (left on the other side) fades out naturally — no special case.
     }
     return;
   }

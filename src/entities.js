@@ -1,7 +1,7 @@
 // entities.js — Entity factory and color rules.
 // Entities are plain objects (no class). Schema documented in state.js.
 
-import { nextEntityId, TRAIL_BUFFER_SIZE } from './state.js';
+import { nextEntityId } from './state.js';
 
 // ─── Color rules ──────────────────────────────────────────────────
 // Planets get a vivid random color (chosen once at creation).
@@ -38,14 +38,10 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge, pinned 
     vx, vy,
     baseColor,                 // stable random color for planets
     color: resolveDisplayColor(type, charge, baseColor), // derived; refresh on edit
-    // Ring buffer over a single Float32Array (interleaved x,y,x,y...).
-    // V7 perf: avoids per-frame { x, y } allocation AND O(trail.length)
-    // Array.splice on every push when full.
-    trail: {
-      buf: new Float32Array(TRAIL_BUFFER_SIZE * 2),
-      head: 0,                 // index of next write slot (in samples, not floats)
-      size: 0,                 // current sample count (≤ TRAIL_BUFFER_SIZE and ≤ state.trailLength)
-    },
+    // V8.1: per-entity trail history removed. Trails now render as a
+    // global phosphor-decay canvas (renderer.js); each frame draws one
+    // dot at the entity's current position and a fade overlay handles
+    // history.
     // Verlet uses last acceleration; cached so we don't recompute mid-step.
     ax: 0,
     ay: 0,

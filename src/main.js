@@ -5,8 +5,8 @@
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
 import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
-import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
-import { drawScene } from './renderer.js';
+import { stepVerlet, handleCollisions, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
+import { drawScene, updateTrailCanvas } from './renderer.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 
@@ -55,13 +55,12 @@ function frame(now) {
   // Drop accumulated lag if we hit the substep cap (avoids permanent slowdown).
   if (steps >= MAX_SUBSTEPS) accumulator = 0;
 
-  // Sample trails once per visual frame, BUT only when at least one physics
-  // substep actually ran. If paused (timeScale=0 → steps=0), entities haven't
-  // moved, so pushing a duplicate trail point is pure waste (and would still
-  // pay the ring-buffer advance + size cap update).
-  if (steps > 0) {
-    for (const e of state.entities) appendTrail(e, state.trailLength);
-  }
+  // V8.1: update the phosphor-decay trail canvas once per visual frame.
+  // The fade rate is keyed on simulation time (not wall time), so pausing
+  // freezes trails and 3× time-scale fades 3× faster. We pass the
+  // sim-time delta corresponding to the substeps that actually ran.
+  const simDelta = steps * SIM_DT;
+  updateTrailCanvas(simDelta);
 
   // Drop selection silently if the selected entity is gone OR mid-absorption
   // (it's effectively dying — editing its sliders would be pointless).

@@ -2,7 +2,7 @@
 //
 // Layer order (back to front):
 //   1. Background
-//   2. Historical trails
+//   2. Trail canvas (phosphor-decay, persistent off-screen)
 //   3. Slingshot line + dashed prediction (only during drag)
 //   4. Entities (planets + black holes)
 //   5. Selected highlight ring
@@ -18,6 +18,75 @@ const PREDICTION_BATCHES = 8;   // sub-segments for fade-along-path effect
 const RUBBER_BAND_DASH = [5, 4];
 const HANDLE_LINE_WIDTH = 2;
 const GHOST_FILL_ALPHA = 0.18;  // faint preview at placement point
+
+// ─── V8.1 phosphor-decay trail canvas ─────────────────────────────
+// Persistent off-screen canvas: each frame we (1) overlay a translucent
+// black fill to fade existing pixels and (2) plot one small dot per
+// active entity at its current position. Composite onto the main canvas
+// as a single drawImage. Cost: O(N) per frame instead of O(N × history).
+
+const TRAIL_DOT_RADIUS = 1.5;   // px; visually a 3 px dot
+
+let _trailCanvas = null;
+let _trailCtx = null;
+
+function ensureTrailCanvas() {
+  const w = state.viewport.width;
+  const h = state.viewport.height;
+  if (w <= 0 || h <= 0) return null;
+  if (!_trailCanvas || _trailCanvas.width !== w || _trailCanvas.height !== h) {
+    _trailCanvas = document.createElement('canvas');
+    _trailCanvas.width = w;
+    _trailCanvas.height = h;
+    _trailCtx = _trailCanvas.getContext('2d');
+  }
+  return _trailCtx;
+}
+
+// Hard clear (e.g., on "clear sandbox"). Currently called from ui.js's
+// clear-button handler when the trail buffer should be visually wiped.
+export function resetTrailCanvas() {
+  if (_trailCtx) {
+    _trailCtx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
+  }
+}
+
+// Apply fade + draw current-frame dots. Called once per RAF from main.js
+// with the simulation-time delta (so trail decays with sim clock, not
+// wall clock — pause freezes trails, fast-forward fades faster).
+export function updateTrailCanvas(simDeltaTime) {
+  const tctx = ensureTrailCanvas();
+  if (!tctx) return;
+
+  // Slider value 0-500 mapped to lifetime in seconds: lifetime = slider / 50.
+  // slider=0   → lifetime=0   → fadeAlpha=1   → instant clear (no trail visible)
+  // slider=100 → lifetime=2s  → ~per-frame alpha matches a 2-second decay
+  // slider=500 → lifetime=10s → very long trail
+  const lifetime = state.trailLength / 50;
+  if (lifetime <= 0) {
+    tctx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
+  } else if (simDeltaTime > 0) {
+    // Per-frame fade alpha: simDeltaTime / lifetime. Clamped to [0, 1].
+    const a = Math.min(1, simDeltaTime / lifetime);
+    tctx.fillStyle = `rgba(10, 10, 15, ${a})`;
+    tctx.fillRect(0, 0, _trailCanvas.width, _trailCanvas.height);
+  }
+  // If simDeltaTime == 0 (paused) we apply NO fade AND skip plotting new
+  // dots — trail is truly frozen. Otherwise plotting opaque dots over
+  // existing pixels would saturate the center pixel of each entity's
+  // current location, preventing decay on subsequent resume.
+  if (simDeltaTime <= 0) return;
+
+  // Plot a dot at each non-absorbing entity's current position.
+  for (let i = 0; i < state.entities.length; i++) {
+    const e = state.entities[i];
+    if (e.absorbing) continue;
+    tctx.fillStyle = e.color;
+    tctx.beginPath();
+    tctx.arc(e.x, e.y, TRAIL_DOT_RADIUS, 0, Math.PI * 2);
+    tctx.fill();
+  }
+}
 
 export function drawScene(ctx) {
   const { width, height } = state.viewport;
@@ -65,41 +134,13 @@ function drawBackground(ctx, w, h) {
   ctx.fillRect(0, 0, w, h);
 }
 
+// V8.1: composite the phosphor-decay trail canvas onto the main view.
+// Fade + dot plotting happens in updateTrailCanvas (called per RAF from
+// main.js); this just blits the result. drawImage handles alpha naturally.
 function drawTrails(ctx) {
+  if (!_trailCanvas) return;
   if (state.trailLength <= 0) return;
-  const W = state.viewport.width;
-  const H = state.viewport.height;
-  const wrap = state.boundaryMode === 'wrap';
-  const wrapX = wrap ? W * 0.5 : Infinity;
-  const wrapY = wrap ? H * 0.5 : Infinity;
-  for (const e of state.entities) {
-    const t = e.trail;
-    if (t.size < 2) continue;
-    const cap = t.buf.length >> 1;
-    // Oldest sample index = (head - size + cap) % cap.
-    const start = (t.head - t.size + cap) % cap;
-    ctx.strokeStyle = e.color;
-    ctx.lineWidth = 1.5;
-    ctx.globalAlpha = 0.5;
-    ctx.beginPath();
-    let prevX = t.buf[start * 2];
-    let prevY = t.buf[start * 2 + 1];
-    ctx.moveTo(prevX, prevY);
-    for (let i = 1; i < t.size; i++) {
-      const idx = (start + i) % cap;
-      const x = t.buf[idx * 2];
-      const y = t.buf[idx * 2 + 1];
-      // Skip segments that "teleport" across the wrap boundary.
-      if (Math.abs(x - prevX) > wrapX || Math.abs(y - prevY) > wrapY) {
-        ctx.moveTo(x, y);
-      } else {
-        ctx.lineTo(x, y);
-      }
-      prevX = x; prevY = y;
-    }
-    ctx.stroke();
-  }
-  ctx.globalAlpha = 1;
+  ctx.drawImage(_trailCanvas, 0, 0);
 }
 
 function drawDragPreview(ctx) {

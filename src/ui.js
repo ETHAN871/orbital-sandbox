@@ -12,6 +12,7 @@ import {
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
+import { resetTrailCanvas } from './renderer.js';
 
 const els = {};
 
@@ -26,6 +27,9 @@ export function bindUI() {
   els.pauseBtn.addEventListener('click', togglePause);
   els.clearBtn.addEventListener('click', () => {
     clearEntities();
+    // V8.1: also wipe the phosphor trail canvas — otherwise old dots
+    // would linger and fade slowly even after entities are gone.
+    resetTrailCanvas();
     syncFromSelection();
   });
   els.editBtn.addEventListener('click', toggleEditMode);
@@ -38,6 +42,7 @@ export function bindUI() {
   // hardcodes don't silently diverge if DEFAULTS change.
   els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
   els.radiusVal.textContent = formatVal('radius', state.pending.radius / state.radiusBase, 2);
+  els.trailVal.textContent = formatVal('trail', state.trailLength, 0);
   refreshPendingPinBtn();
   refreshBoundaryBtn();
   syncFromSelection();
@@ -122,6 +127,8 @@ function bindRangeSlider(id, onChange, decimals = 0) {
 function formatVal(id, raw, decimals) {
   if (id === 'time-scale') return `${raw.toFixed(decimals)}x`;
   if (id === 'radius') return `${raw.toFixed(decimals)}×`;
+  // V8.1: trail slider is now a "lifetime in seconds" (slider / 50).
+  if (id === 'trail') return `${(raw / 50).toFixed(1)} 秒`;
   return decimals > 0 ? raw.toFixed(decimals) : String(Math.round(raw));
 }
 

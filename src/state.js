@@ -50,11 +50,10 @@ export const EDIT_MODE_TIME_RATIO = 0.2;
 // In 'wrap' mode they teleport to the opposite side instead.
 export const BOUNDARY_BUFFER_FACTOR = 0.5;
 
-// Trail ring-buffer capacity (matches LIMITS.trail.max). Each entity's trail
-// stores up to this many (x, y) samples in a single Float32Array of length
-// 2× this constant, avoiding per-frame {x,y} object allocation and the
-// O(trail.length) cost of Array.splice(0, 1).
-export const TRAIL_BUFFER_SIZE = 500;
+// V8.1: trail rendering switched from per-entity ring-buffer to a global
+// phosphor-decay canvas in renderer.js. The slider 0-500 is repurposed
+// as a lifetime in seconds (lifetime_s = slider / 50). TRAIL_BUFFER_SIZE
+// is no longer needed since no per-entity trail history is stored.
 
 // ─── UI defaults & limits ─────────────────────────────────────────
 export const DEFAULTS = Object.freeze({
