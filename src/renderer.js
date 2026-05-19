@@ -25,10 +25,12 @@ const GHOST_FILL_ALPHA = 0.18;  // faint preview at placement point
 // active entity at its current position. Composite onto the main canvas
 // as a single drawImage. Cost: O(N) per frame instead of O(N × history).
 
-const TRAIL_DOT_RADIUS = 1.5;   // px; visually a 3 px dot
+const TRAIL_DOT_R = 1;          // pixel-square half-extent → 3×3 px dot per entity
+const _colorRgbCache = new Map();
 
 let _trailCanvas = null;
 let _trailCtx = null;
+let _trailData = null;          // Canvas's ImageData — manipulated directly each frame.
 
 function ensureTrailCanvas() {
   const w = state.viewport.width;
@@ -39,65 +41,141 @@ function ensureTrailCanvas() {
     _trailCanvas.width = w;
     _trailCanvas.height = h;
     _trailCtx = _trailCanvas.getContext('2d');
+    _trailData = _trailCtx.createImageData(w, h);   // all zero → fully transparent
   }
   return _trailCtx;
 }
 
-// Hard clear (e.g., on "clear sandbox"). Currently called from ui.js's
-// clear-button handler when the trail buffer should be visually wiped.
+// Hard clear (e.g., on "clear sandbox"). Resets the entire ImageData buffer
+// and pushes the cleared state to the canvas.
 export function resetTrailCanvas() {
-  if (_trailCtx) {
-    _trailCtx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
-  }
+  if (!_trailData || !_trailCtx) return;
+  _trailData.data.fill(0);
+  _trailCtx.putImageData(_trailData, 0, 0);
 }
 
-// Apply fade + draw current-frame dots. Called once per RAF from main.js
-// with the simulation-time delta (so trail decays with sim clock, not
-// wall clock — pause freezes trails, fast-forward fades faster).
+// Apply LINEAR alpha decay + plot current-frame dots. Operates directly on
+// the ImageData byte buffer because canvas composite ops (destination-out
+// etc.) only support multiplicative/exponential decay, which leaves
+// pixels at ~37% alpha after `lifetime` sec and reads as a persistent
+// gray smear on the dark background.
+//
+// True linear: alpha decreases by a constant 255/lifetime per second of
+// simulation time. After `lifetime` sim seconds the pixel hits 0 exactly
+// and stays there. Called once per RAF from main.js with the sim-time
+// delta (paused → freeze, fast-forward → fade faster).
+//
+// Cost: one Uint8ClampedArray sweep of the trail canvas (~2M ops at 1080p)
+// + one putImageData. Hot path but unavoidable for strict linear decay.
 export function updateTrailCanvas(simDeltaTime) {
   const tctx = ensureTrailCanvas();
   if (!tctx) return;
+  const w = _trailCanvas.width;
+  const h = _trailCanvas.height;
+  const data = _trailData.data;             // Uint8ClampedArray, RGBA per pixel
+  const len = data.length;
 
-  // Slider value 0-500 mapped to lifetime in seconds: lifetime = slider / 50.
-  // slider=0   → lifetime=0   → fadeAlpha=1   → instant clear
-  // slider=100 → lifetime=2s  → trail invisible (<1% alpha) after ~2 sim seconds
-  // slider=500 → lifetime=10s → ~10 sec trail
-  //
-  // Fade uses `destination-out`: each frame multiplies pixel alpha by (1-a).
-  // For a pixel to reach ~1% alpha after `lifetime` sim seconds we need
-  //   (1 - a)^(lifetime/dt) ≈ 0.01
-  //   → ln(1 - a) ≈ -4.6 · dt / lifetime
-  //   → a ≈ 1 - exp(-4.6 · dt / lifetime) ≈ 5 · dt / lifetime  (small-a Taylor)
-  // The factor of 5 (≈ -ln(0.01)) is the difference between a "lifetime"
-  // meaning "1/e characteristic time" (mathematician's convention; the V8.1
-  // first attempt) and "time until visually-gone" (user's expectation).
-  // Without this factor, trails sit at ~37% alpha after `lifetime` sec and
-  // present as a persistent dim smear that looks gray on dark backgrounds.
+  // Slider 0-500 → lifetime in sim seconds = slider / 50.
+  // slider 0 → instant wipe; slider 100 → 2 s; slider 500 → 10 s.
   const lifetime = state.trailLength / 50;
-  if (lifetime <= 0) {
-    tctx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
-  } else if (simDeltaTime > 0) {
-    const a = Math.min(1, 5 * simDeltaTime / lifetime);
-    tctx.globalCompositeOperation = 'destination-out';
-    tctx.fillStyle = `rgba(0, 0, 0, ${a})`;       // color ignored in destination-out; only alpha matters
-    tctx.fillRect(0, 0, _trailCanvas.width, _trailCanvas.height);
-    tctx.globalCompositeOperation = 'source-over'; // restore default for dot plotting below
-  }
-  // If simDeltaTime == 0 (paused) we apply NO fade AND skip plotting new
-  // dots — trail is truly frozen. Otherwise plotting opaque dots over
-  // existing pixels would saturate the center pixel of each entity's
-  // current location, preventing decay on subsequent resume.
-  if (simDeltaTime <= 0) return;
 
-  // Plot a dot at each non-absorbing entity's current position.
-  for (let i = 0; i < state.entities.length; i++) {
-    const e = state.entities[i];
-    if (e.absorbing) continue;
-    tctx.fillStyle = e.color;
-    tctx.beginPath();
-    tctx.arc(e.x, e.y, TRAIL_DOT_RADIUS, 0, Math.PI * 2);
-    tctx.fill();
+  if (lifetime <= 0) {
+    // Instant wipe.
+    data.fill(0);
+    tctx.putImageData(_trailData, 0, 0);
+    return;
   }
+
+  if (simDeltaTime <= 0) {
+    // Paused — leave trail buffer alone (don't fade, don't plot new dots).
+    // The canvas already shows the last-pushed state.
+    return;
+  }
+
+  // Linear alpha decrement per frame. dec = 255 × (Δt / lifetime).
+  // For lifetime = 2 s and Δt ≈ 1/30 s (2 substeps at 60 Hz): dec ≈ 4.
+  // After 60 frames (~ 2 s sim time) every pixel's alpha has dropped 255
+  // and is fully transparent — exactly what "lifetime = 2 s" should mean.
+  const decFloat = 255 * simDeltaTime / lifetime;
+  if (decFloat >= 255) {
+    data.fill(0);
+  } else {
+    // Math.ceil so we never undershoot — guarantees zero by lifetime.
+    const dec = Math.max(1, Math.ceil(decFloat));
+    for (let i = 3; i < len; i += 4) {
+      const v = data[i] - dec;
+      data[i] = v > 0 ? v : 0;
+    }
+  }
+
+  // Plot 3×3 square dots at each non-absorbing entity in entity color.
+  // We write RGBA directly into the buffer; canvas API not used here.
+  for (let k = 0; k < state.entities.length; k++) {
+    const e = state.entities[k];
+    if (e.absorbing) continue;
+    const rgb = colorToRgb(e.color);
+    const cr = rgb[0], cg = rgb[1], cb = rgb[2];
+    const px = e.x | 0;                     // floor
+    const py = e.y | 0;
+    for (let dy = -TRAIL_DOT_R; dy <= TRAIL_DOT_R; dy++) {
+      const yy = py + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -TRAIL_DOT_R; dx <= TRAIL_DOT_R; dx++) {
+        const xx = px + dx;
+        if (xx < 0 || xx >= w) continue;
+        const idx = (yy * w + xx) * 4;
+        data[idx]     = cr;
+        data[idx + 1] = cg;
+        data[idx + 2] = cb;
+        data[idx + 3] = 255;                // fresh dot at full alpha
+      }
+    }
+  }
+
+  // Push manipulated buffer to the canvas in a single GPU transfer.
+  tctx.putImageData(_trailData, 0, 0);
+}
+
+// Parse `e.color` ("hsl(...)" or "#rrggbb") to [r, g, b] 0-255. Cached so
+// each unique color string is parsed only once across the session.
+function colorToRgb(c) {
+  const cached = _colorRgbCache.get(c);
+  if (cached) return cached;
+  let result;
+  if (c.charCodeAt(0) === 0x23 /* '#' */) {
+    const hex = c.slice(1);
+    if (hex.length === 6) {
+      result = [
+        parseInt(hex.slice(0, 2), 16),
+        parseInt(hex.slice(2, 4), 16),
+        parseInt(hex.slice(4, 6), 16),
+      ];
+    } else if (hex.length === 3) {
+      result = [
+        parseInt(hex[0] + hex[0], 16),
+        parseInt(hex[1] + hex[1], 16),
+        parseInt(hex[2] + hex[2], 16),
+      ];
+    } else {
+      result = [128, 128, 128];
+    }
+  } else {
+    const m = c.match(/hsl\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*\)/);
+    result = m ? hslToRgb(+m[1], +m[2], +m[3]) : [128, 128, 128];
+  }
+  _colorRgbCache.set(c, result);
+  return result;
+}
+
+function hslToRgb(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => {
+    const v = l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return Math.round(255 * v);
+  };
+  return [f(0), f(8), f(4)];
 }
 
 export function drawScene(ctx) {
