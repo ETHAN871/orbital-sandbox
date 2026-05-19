@@ -59,20 +59,25 @@ export function updateTrailCanvas(simDeltaTime) {
   if (!tctx) return;
 
   // Slider value 0-500 mapped to lifetime in seconds: lifetime = slider / 50.
-  // slider=0   → lifetime=0   → fadeAlpha=1   → instant clear (no trail visible)
-  // slider=100 → lifetime=2s  → ~per-frame alpha matches a 2-second decay
-  // slider=500 → lifetime=10s → very long trail
+  // slider=0   → lifetime=0   → fadeAlpha=1   → instant clear
+  // slider=100 → lifetime=2s  → trail invisible (<1% alpha) after ~2 sim seconds
+  // slider=500 → lifetime=10s → ~10 sec trail
   //
-  // Fade uses `destination-out` composite so each frame REDUCES existing
-  // pixels' alpha by `a`, eventually leaving fully-transparent pixels.
-  // Previous V8.1 used `source-over` with `rgba(10,10,15,a)` which left
-  // residual opaque-dark pixels visible against the dark background as a
-  // ghostly gray smear. With destination-out, faded trails truly vanish.
+  // Fade uses `destination-out`: each frame multiplies pixel alpha by (1-a).
+  // For a pixel to reach ~1% alpha after `lifetime` sim seconds we need
+  //   (1 - a)^(lifetime/dt) ≈ 0.01
+  //   → ln(1 - a) ≈ -4.6 · dt / lifetime
+  //   → a ≈ 1 - exp(-4.6 · dt / lifetime) ≈ 5 · dt / lifetime  (small-a Taylor)
+  // The factor of 5 (≈ -ln(0.01)) is the difference between a "lifetime"
+  // meaning "1/e characteristic time" (mathematician's convention; the V8.1
+  // first attempt) and "time until visually-gone" (user's expectation).
+  // Without this factor, trails sit at ~37% alpha after `lifetime` sec and
+  // present as a persistent dim smear that looks gray on dark backgrounds.
   const lifetime = state.trailLength / 50;
   if (lifetime <= 0) {
     tctx.clearRect(0, 0, _trailCanvas.width, _trailCanvas.height);
   } else if (simDeltaTime > 0) {
-    const a = Math.min(1, simDeltaTime / lifetime);
+    const a = Math.min(1, 5 * simDeltaTime / lifetime);
     tctx.globalCompositeOperation = 'destination-out';
     tctx.fillStyle = `rgba(0, 0, 0, ${a})`;       // color ignored in destination-out; only alpha matters
     tctx.fillRect(0, 0, _trailCanvas.width, _trailCanvas.height);
