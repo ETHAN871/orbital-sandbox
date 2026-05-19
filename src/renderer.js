@@ -66,6 +66,11 @@ function drawBackground(ctx, w, h) {
 
 function drawTrails(ctx) {
   if (state.trailLength <= 0) return;
+  const W = state.viewport.width;
+  const H = state.viewport.height;
+  const wrap = state.boundaryMode === 'wrap';
+  const wrapX = wrap ? W * 0.5 : Infinity;
+  const wrapY = wrap ? H * 0.5 : Infinity;
   for (const e of state.entities) {
     const trail = e.trail;
     if (trail.length < 2) continue;
@@ -73,8 +78,19 @@ function drawTrails(ctx) {
     ctx.lineWidth = 1.5;
     ctx.globalAlpha = 0.5;
     ctx.beginPath();
-    ctx.moveTo(trail[0].x, trail[0].y);
-    for (let i = 1; i < trail.length; i++) ctx.lineTo(trail[i].x, trail[i].y);
+    let prevX = trail[0].x, prevY = trail[0].y;
+    ctx.moveTo(prevX, prevY);
+    for (let i = 1; i < trail.length; i++) {
+      const x = trail[i].x, y = trail[i].y;
+      // Skip segments that "teleport" across the wrap boundary — those
+      // are the visual cousin of the entity's coordinate jump.
+      if (Math.abs(x - prevX) > wrapX || Math.abs(y - prevY) > wrapY) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+      prevX = x; prevY = y;
+    }
     ctx.stroke();
   }
   ctx.globalAlpha = 1;
@@ -137,9 +153,14 @@ function drawDragPreview(ctx) {
 // Draw a dashed polyline whose alpha decreases along the path (head full opacity,
 // tail vanishing). We split the path into `PREDICTION_BATCHES` sub-strokes and
 // apply globalAlpha per batch — canvas setLineDash can't fade individual dashes.
+// In wrap mode we skip segments that jump across the boundary so the line
+// doesn't draw a straight slash across the whole viewport.
 function drawDashedFadingPath(ctx, path, color) {
   const n = path.length;
   const batchSize = Math.max(2, Math.ceil(n / PREDICTION_BATCHES));
+  const wrap = state.boundaryMode === 'wrap';
+  const wrapX = wrap ? state.viewport.width * 0.5 : Infinity;
+  const wrapY = wrap ? state.viewport.height * 0.5 : Infinity;
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.5;
   ctx.setLineDash(PREDICTION_DASH);
@@ -150,8 +171,17 @@ function drawDashedFadingPath(ctx, path, color) {
     const alpha = 1 - b / PREDICTION_BATCHES;     // 1.0 → ~0.125
     ctx.globalAlpha = alpha * 0.85;
     ctx.beginPath();
-    ctx.moveTo(path[start].x, path[start].y);
-    for (let i = start + 1; i <= end; i++) ctx.lineTo(path[i].x, path[i].y);
+    let prevX = path[start].x, prevY = path[start].y;
+    ctx.moveTo(prevX, prevY);
+    for (let i = start + 1; i <= end; i++) {
+      const x = path[i].x, y = path[i].y;
+      if (Math.abs(x - prevX) > wrapX || Math.abs(y - prevY) > wrapY) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+      prevX = x; prevY = y;
+    }
     ctx.stroke();
   }
   ctx.globalAlpha = 1;
@@ -159,9 +189,40 @@ function drawDashedFadingPath(ctx, path, color) {
 }
 
 function drawEntities(ctx) {
+  const wrap = state.boundaryMode === 'wrap';
+  const W = state.viewport.width;
+  const H = state.viewport.height;
   for (const e of state.entities) {
     drawOneEntity(ctx, e);
+    if (!wrap || e.absorbing) continue;
+
+    // Portal-style mirror: when the body straddles a wrap edge, draw a
+    // ghost copy at the opposite edge so the user sees the body
+    // continuously crossing instead of teleporting.
+    const r = Math.max(0, e.radius);
+    const nearLeft   = e.x < r;
+    const nearRight  = e.x > W - r;
+    const nearTop    = e.y < r;
+    const nearBottom = e.y > H - r;
+    if (nearLeft)   drawEntityAtMirror(ctx, e, W, 0);
+    if (nearRight)  drawEntityAtMirror(ctx, e, -W, 0);
+    if (nearTop)    drawEntityAtMirror(ctx, e, 0, H);
+    if (nearBottom) drawEntityAtMirror(ctx, e, 0, -H);
+    if (nearLeft && nearTop)     drawEntityAtMirror(ctx, e, W, H);
+    if (nearLeft && nearBottom)  drawEntityAtMirror(ctx, e, W, -H);
+    if (nearRight && nearTop)    drawEntityAtMirror(ctx, e, -W, H);
+    if (nearRight && nearBottom) drawEntityAtMirror(ctx, e, -W, -H);
   }
+}
+
+// Temporarily offset the entity's coords, redraw, then restore. Cheaper
+// than refactoring drawOneEntity to take explicit position params, and
+// safe because the renderer is single-threaded.
+function drawEntityAtMirror(ctx, e, ox, oy) {
+  const sx = e.x, sy = e.y;
+  e.x = sx + ox; e.y = sy + oy;
+  drawOneEntity(ctx, e);
+  e.x = sx; e.y = sy;
 }
 
 function drawOneEntity(ctx, e) {

@@ -106,11 +106,17 @@ function setActiveSegment(group, activeBtn) {
 function bindRangeSlider(id, onChange, decimals = 0) {
   const input = document.getElementById(id);
   const valEl = document.getElementById(`${id}-val`);
-  input.addEventListener('input', () => {
+  // Bind BOTH `input` (continuous during drag) and `change` (fires on
+  // release). Defensive: some browsers / CSS combos suppress `input` events
+  // for range sliders mid-drag; the `change` fallback guarantees the
+  // displayed value catches up by release at the latest.
+  const handler = () => {
     const raw = parseFloat(input.value);
     onChange(raw);
     valEl.textContent = formatVal(id, raw, decimals);
-  });
+  };
+  input.addEventListener('input', handler);
+  input.addEventListener('change', handler);
 }
 
 function formatVal(id, raw, decimals) {

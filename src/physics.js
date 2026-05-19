@@ -12,10 +12,36 @@
 // (m_A drops out, as in standard Newtonian gravity.)
 
 import {
+  state,
   G, EPSILON, PREDICT_STEPS, PREDICT_DT,
   ABSORPTION_DURATION, ELASTIC_RESTITUTION,
   BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
+
+// ─── Minimum-image distance helpers (wrap mode) ───────────────────
+// When the world wraps, two points near opposite edges can be closer
+// going "around" than going straight. We use the standard PBC (periodic
+// boundary condition) minimum-image convention: for each axis, if the
+// straight delta exceeds half the span, replace it with the wrap-around
+// delta. Equivalent to: delta - round(delta / span) * span.
+
+function minImageDelta(d, span) {
+  if (span <= 0) return d;
+  if (d > span * 0.5) return d - span;
+  if (d < -span * 0.5) return d + span;
+  return d;
+}
+
+// Returns the (dx, dy) from `a` to `b`, honoring wrap mode when enabled.
+function pairDelta(a, b) {
+  let dx = b.x - a.x;
+  let dy = b.y - a.y;
+  if (state.boundaryMode === 'wrap') {
+    dx = minImageDelta(dx, state.viewport.width);
+    dy = minImageDelta(dy, state.viewport.height);
+  }
+  return { dx, dy };
+}
 
 // ─── Force / acceleration ─────────────────────────────────────────
 // Returns parallel arrays-of-zero accumulator filled in-place.
@@ -34,8 +60,7 @@ export function computeAccelerations(entities, accels) {
     for (let j = i + 1; j < n; j++) {
       const b = entities[j];
       if (b.absorbing) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
+      const { dx, dy } = pairDelta(a, b);
       const r2Raw = dx * dx + dy * dy;
       const minR = Math.max(a.radius + b.radius, EPSILON);
       const r2 = Math.max(r2Raw, minR * minR);
@@ -136,8 +161,7 @@ export function handleCollisions(entities) {
       if (a.absorbing) break;
       const b = entities[j];
       if (b.absorbing) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
+      const { dx, dy } = pairDelta(a, b);
       const rSum = a.radius + b.radius;
       const dist2 = dx * dx + dy * dy;
       if (dist2 >= rSum * rSum) continue;          // not touching
@@ -279,6 +303,9 @@ export function predictTrajectory(ghost, others) {
   let vy = ghost.vy;
   let ax = 0;
   let ay = 0;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = state.viewport.width;
+  const H = state.viewport.height;
 
   // Initial acceleration from frozen snapshot.
   ({ ax, ay } = ghostAccel(x, y, ghost.radius, others));
@@ -287,6 +314,14 @@ export function predictTrajectory(ghost, others) {
     // Verlet position step.
     x += vx * PREDICT_DT + 0.5 * ax * PREDICT_DT * PREDICT_DT;
     y += vy * PREDICT_DT + 0.5 * ay * PREDICT_DT * PREDICT_DT;
+
+    // Mirror physics boundary handling so predicted path stays visualizable.
+    // Renderer skips polyline segments that jump > viewport/2 to hide the
+    // wrap-around jump line.
+    if (wrap) {
+      if (x < 0) x += W; else if (x > W) x -= W;
+      if (y < 0) y += H; else if (y > H) y -= H;
+    }
 
     // Stop early if the ghost would already have been consumed by a black hole.
     if (touchesBlackHole(x, y, ghost.radius, others)) {
@@ -307,11 +342,18 @@ export function predictTrajectory(ghost, others) {
 
 function ghostAccel(x, y, radius, others) {
   let ax = 0, ay = 0;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = state.viewport.width;
+  const H = state.viewport.height;
   for (let k = 0; k < others.length; k++) {
     const o = others[k];
     if (o.charge === 0 || o.absorbing) continue;
-    const dx = o.x - x;
-    const dy = o.y - y;
+    let dx = o.x - x;
+    let dy = o.y - y;
+    if (wrap) {
+      dx = minImageDelta(dx, W);
+      dy = minImageDelta(dy, H);
+    }
     const r2Raw = dx * dx + dy * dy;
     const minR = Math.max(radius + o.radius, EPSILON);
     const r2 = Math.max(r2Raw, minR * minR);
@@ -324,11 +366,18 @@ function ghostAccel(x, y, radius, others) {
 }
 
 function touchesBlackHole(x, y, radius, others) {
+  const wrap = state.boundaryMode === 'wrap';
+  const W = state.viewport.width;
+  const H = state.viewport.height;
   for (let k = 0; k < others.length; k++) {
     const o = others[k];
     if (o.type !== 'black_hole' || o.absorbing) continue;
-    const dx = o.x - x;
-    const dy = o.y - y;
+    let dx = o.x - x;
+    let dy = o.y - y;
+    if (wrap) {
+      dx = minImageDelta(dx, W);
+      dy = minImageDelta(dy, H);
+    }
     const r = radius + o.radius;
     if (dx * dx + dy * dy < r * r) return true;
   }
@@ -370,12 +419,13 @@ export function applyBoundary(entities, viewport, mode) {
   if (mode === 'wrap') {
     for (const e of entities) {
       if (e.absorbing) continue;
-      let wrapped = false;
-      if (e.x < 0)        { e.x += w; wrapped = true; }
-      else if (e.x > w)   { e.x -= w; wrapped = true; }
-      if (e.y < 0)        { e.y += h; wrapped = true; }
-      else if (e.y > h)   { e.y -= h; wrapped = true; }
-      if (wrapped) e.trail.length = 0;
+      if (e.x < 0)        e.x += w;
+      else if (e.x > w)   e.x -= w;
+      if (e.y < 0)        e.y += h;
+      else if (e.y > h)   e.y -= h;
+      // Note: we no longer clear `e.trail` on wrap. The renderer detects
+      // wrap-crossing segments (consecutive points with abs delta > span/2)
+      // and skips drawing them, keeping pre-wrap history visible.
     }
     return;
   }

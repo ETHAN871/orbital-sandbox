@@ -49,13 +49,23 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 18px;
-  /* Prevent the browser from entering text-selection drag mode when the
-     user drags a slider thumb across label text (visible as a ctrl-c style
-     ghost outline that blocks further slider movement). Inputs still
-     receive pointer events normally. */
+}
+
+/* Scope text-selection disable to NON-INTERACTIVE elements only. Putting it
+   on `#panel` directly (the V4 approach) broke `input[type=range]` event
+   delivery on some browsers — `input` events stopped firing during drag,
+   leaving the slider thumb visually correct but state.timeScale frozen.
+   Restricting to text-bearing children fixes that while still suppressing
+   the ctrl-c drag-outline that triggered the original mass-slider bug. */
+#panel h1,
+#panel h2,
+#panel label,
+#panel .row,
+#panel .hint,
+#panel .panel-footer,
+#panel .seg-btn {
   user-select: none;
   -webkit-user-select: none;
-  -webkit-user-drag: none;
 }
 
 .panel-header h1 {
