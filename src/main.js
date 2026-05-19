@@ -4,7 +4,7 @@
 // scaled by `state.timeScale`. This decouples physics stability from frame
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
-import { state, SIM_DT } from './state.js';
+import { state, SIM_DT, BASE_TIME_SCALE } from './state.js';
 import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions } from './physics.js';
 import { drawScene } from './renderer.js';
 import { attachInput } from './input.js';
@@ -31,8 +31,10 @@ function frame(now) {
   const realDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
   lastTime = now;
 
-  // Advance the simulation by realDt × timeScale, in fixed SIM_DT chunks.
-  accumulator += realDt * state.timeScale;
+  // Advance the simulation by realDt × (timeScale × BASE_TIME_SCALE).
+  // state.timeScale is the user-facing slider ratio (1.0 = default); the
+  // BASE constant moves the actual sim speed up to 2× real-time as base.
+  accumulator += realDt * state.timeScale * BASE_TIME_SCALE;
   let steps = 0;
   while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
     stepVerlet(state.entities, SIM_DT);

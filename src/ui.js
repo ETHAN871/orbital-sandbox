@@ -7,7 +7,10 @@
 // `syncFromSelection()` is called by main.js whenever selection changes, so the
 // slider thumbs reflect the chosen entity's current values.
 
-import { state, DEFAULTS, clearEntities, findEntityById } from './state.js';
+import {
+  state, DEFAULTS, RADIUS_BASE, BASE_TIME_SCALE,
+  clearEntities, findEntityById, removeEntityById,
+} from './state.js';
 import { refreshEntityColor } from './entities.js';
 
 const els = {};
@@ -17,7 +20,7 @@ export function bindUI() {
   bindTypeSegment();
   bindChargeSegment();
   bindRangeSlider('mass', val => applyAttribute('mass', val));
-  bindRangeSlider('radius', val => applyAttribute('radius', val));
+  bindRangeSlider('radius', val => applyAttribute('radius', val), 2);
   bindRangeSlider('trail', val => { state.trailLength = val; });
   bindRangeSlider('time-scale', val => applyTimeScale(val), 2);
   els.pauseBtn.addEventListener('click', togglePause);
@@ -26,14 +29,21 @@ export function bindUI() {
     syncFromSelection();
   });
   els.editBtn.addEventListener('click', toggleEditMode);
+  els.pinBtn.addEventListener('click', togglePinSelected);
+  els.deleteBtn.addEventListener('click', deleteSelectedEntity);
 
-  // Initial sync.
+  // Initial sync — populate slider-side labels from state defaults so the HTML
+  // hardcodes don't silently diverge if DEFAULTS change.
+  els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
+  els.radiusVal.textContent = formatVal('radius', state.pending.radius / RADIUS_BASE, 2);
   syncFromSelection();
   updateModeHint();
+  updateHeaderTime();
 }
 
 function cacheElements() {
   els.modeHint   = document.getElementById('mode-hint');
+  els.headerTime = document.getElementById('header-time');     // prominent time-rate badge
   els.massInput  = document.getElementById('mass');
   els.massVal    = document.getElementById('mass-val');
   els.radiusInput= document.getElementById('radius');
@@ -50,6 +60,10 @@ function cacheElements() {
   els.stage      = document.getElementById('stage');
   els.typeBtns   = document.querySelectorAll('[data-type]');
   els.chargeBtns = document.querySelectorAll('[data-charge]');
+  // Selection-only controls (shown when an entity is selected in edit mode):
+  els.selSection = document.getElementById('selection-controls');
+  els.pinBtn     = document.getElementById('pin-btn');
+  els.deleteBtn  = document.getElementById('delete-entity-btn');
 }
 
 // ─── Segment selectors ────────────────────────────────────────────
@@ -94,17 +108,22 @@ function bindRangeSlider(id, onChange, decimals = 0) {
 
 function formatVal(id, raw, decimals) {
   if (id === 'time-scale') return `${raw.toFixed(decimals)}x`;
+  if (id === 'radius') return `${raw.toFixed(decimals)}×`;
   return decimals > 0 ? raw.toFixed(decimals) : String(Math.round(raw));
 }
 
 // ─── Apply an attribute to selected entity OR pending template ────
+// The `radius` slider value is a *ratio* (slider 1.0 = base 10 px). We
+// convert ratio → effective px on the way in so internal entity.radius
+// remains in physics-space units everywhere else.
 function applyAttribute(key, value) {
+  const stored = key === 'radius' ? value * RADIUS_BASE : value;
   const sel = state.selectedId !== null ? findEntityById(state.selectedId) : null;
   if (sel) {
-    sel[key] = value;
+    sel[key] = stored;
     refreshEntityColor(sel);
   } else {
-    state.pending[key] = value;
+    state.pending[key] = stored;
   }
 }
 
@@ -113,6 +132,17 @@ function applyTimeScale(value) {
   state.timeScale = value;
   if (value > 0) state.prevTimeScale = value;
   updatePauseButtonLabel();
+  updateHeaderTime();
+}
+
+// Top-of-panel time-rate badge — kept in lock-step with the slider value.
+// Shows both the user-facing ratio AND the resulting real-time multiplier so
+// the user can see "1.00× (= 2× real)" at a glance.
+function updateHeaderTime() {
+  if (!els.headerTime) return;
+  const ratio = state.timeScale;
+  const effective = ratio * BASE_TIME_SCALE;
+  els.headerTime.textContent = `流速 ${ratio.toFixed(2)}× · 真实 ${effective.toFixed(2)}×`;
 }
 
 function togglePause() {
@@ -126,6 +156,7 @@ function togglePause() {
   els.timeInput.value = String(state.timeScale);
   els.timeVal.textContent = `${state.timeScale.toFixed(2)}x`;
   updatePauseButtonLabel();
+  updateHeaderTime();
 }
 
 function updatePauseButtonLabel() {
@@ -185,18 +216,24 @@ export function syncFromSelection() {
     b.classList.toggle('active', active);
     b.setAttribute('aria-checked', String(active));
   });
-  // Sliders
+  // Sliders. radius is stored in entity as px; the slider displays a ratio.
   els.massInput.value = String(src.mass);
   els.massVal.textContent = String(Math.round(src.mass));
-  els.radiusInput.value = String(src.radius);
-  els.radiusVal.textContent = String(Math.round(src.radius));
+  const radiusRatio = src.radius / RADIUS_BASE;
+  els.radiusInput.value = String(radiusRatio);
+  els.radiusVal.textContent = `${radiusRatio.toFixed(2)}×`;
 
-  // Selection hint banner
+  // Selection hint banner + selection-only controls panel.
   if (sel) {
     els.selHint.hidden = false;
-    els.selHint.textContent = `已选中 #${sel.id} · ${sel.type === 'black_hole' ? '黑洞' : '行星'}`;
+    const pinTag = sel.pinned ? ' · 📌已固定' : '';
+    els.selHint.textContent = `已选中 #${sel.id} · ${sel.type === 'black_hole' ? '黑洞' : '行星'}${pinTag}`;
+    els.selSection.hidden = !state.isEditMode;
+    els.pinBtn.textContent = sel.pinned ? '解除固定' : '固定';
+    els.pinBtn.classList.toggle('active', sel.pinned);
   } else {
     els.selHint.hidden = true;
+    els.selSection.hidden = true;
   }
   updateModeHint();
 }
@@ -212,4 +249,27 @@ function updateModeHint() {
 // Footer entity counter — called per frame by main.js.
 export function updateEntityCount() {
   els.entityCount.textContent = `${state.entities.length} 个实体`;
+}
+
+// ─── Selection-only handlers ─────────────────────────────────────
+// Toggle pinned on the selected entity. Visual + selection-hint refresh
+// happens via syncFromSelection.
+function togglePinSelected() {
+  const sel = state.selectedId !== null ? findEntityById(state.selectedId) : null;
+  if (!sel) return;
+  sel.pinned = !sel.pinned;
+  if (sel.pinned) {
+    // Halt any residual motion immediately — feels weird otherwise.
+    sel.vx = 0; sel.vy = 0; sel.ax = 0; sel.ay = 0;
+  }
+  syncFromSelection();
+}
+
+// Remove the currently-selected entity and clear selection. Distinct from
+// the "clear all" sandbox button which wipes everything.
+function deleteSelectedEntity() {
+  if (state.selectedId === null) return;
+  removeEntityById(state.selectedId);
+  state.selectedId = null;
+  syncFromSelection();
 }

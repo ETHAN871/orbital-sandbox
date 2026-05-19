@@ -11,22 +11,33 @@ export const PREDICT_DT = 1 / 60;          // Prediction integration step (s).
 export const PREDICT_STEPS = Math.floor(PREDICT_HORIZON / PREDICT_DT); // 300 points.
 export const LAUNCH_SPEED_K = 0.7;         // Drag-vector → initial-velocity multiplier.
 export const ABSORPTION_DURATION = 0.3;    // Seconds (sim time) for the black-hole devour animation.
-export const ELASTIC_RESTITUTION = 0.3;    // 1 = perfectly elastic planet-planet collision.
+export const ELASTIC_RESTITUTION = 0.3;    // 0.3 = ~30% bounce-back; 1 = fully elastic, 0 = perfectly inelastic.
+
+// Slider semantics: the time-scale and radius sliders display *ratios* — the
+// value the user sees is multiplied by the corresponding base constant to get
+// the physical value. Slider 1 = base, slider 2 = 2×base, slider 0.5 = half base.
+export const BASE_TIME_SCALE = 2;          // Slider 1.0× = effective 2× real time.
+export const RADIUS_BASE = 10;             // Slider 1.0× = effective 10 px radius.
 
 // ─── UI defaults & limits ─────────────────────────────────────────
 export const DEFAULTS = Object.freeze({
   type: 'planet',
   mass: 100,
-  radius: 20,
+  // Default effective radius in px. Slider ratio = radius / RADIUS_BASE, so
+  // a default px-radius of 10 corresponds to slider ratio 1.0.
+  radius: 10,
   charge: 1,
   trailLength: 100,
+  // timeScale is a *ratio*; effective time = timeScale × BASE_TIME_SCALE.
+  // Default 1.0× ratio → 2× real-time (the new default base).
   timeScale: 1,
   editTimeScale: 0.2,
 });
 
 export const LIMITS = Object.freeze({
   mass:   { min: 1,   max: 1000 },
-  radius: { min: 5,   max: 80 },
+  // radius slider is a ratio: 0.1 = tiny (1 px), 10 = huge (100 px).
+  radius: { min: 0.1, max: 10 },
   trail:  { min: 0,   max: 500 },
   time:   { min: 0,   max: 3 },
 });

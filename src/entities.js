@@ -47,6 +47,10 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge }) {
     //   { blackHoleId, elapsedSim, startRadius, startX, startY }
     // and physics.updateAbsorptions then shrinks + lerps it into the hole.
     absorbing: null,
+    // Pinned bodies are kinematically frozen — they keep applying gravity
+    // and participate in collisions (as infinite-mass anchors), but their
+    // position and velocity never change. Toggleable in edit mode.
+    pinned: false,
   };
 }
 

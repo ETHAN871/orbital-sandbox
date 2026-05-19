@@ -171,6 +171,18 @@ function drawOneEntity(ctx, e) {
     ctx.fillText(e.charge > 0 ? '+' : '−', e.x, e.y);
   }
 
+  // Pinned indicator: a yellow dashed ring just outside the body to signal
+  // "this body won't move". Suppressed during absorption to avoid clutter.
+  if (e.pinned && !e.absorbing) {
+    ctx.strokeStyle = '#ffd24d';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, Math.max(0, e.radius) + 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
   // Restore alpha so the absorbing-entity fade doesn't bleed into siblings.
   if (e.absorbing) ctx.globalAlpha = 1;
 }

@@ -82,9 +82,11 @@ export function stepVerlet(entities, dt) {
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
 
-  // Position update using cached acceleration from last step.
+  // Position update using cached acceleration from last step. Pinned bodies
+  // are skipped — they neither move nor accelerate, only act as anchors.
   for (let i = 0; i < n; i++) {
     const e = entities[i];
+    if (e.pinned) continue;
     e.x += e.vx * dt + 0.5 * e.ax * dt * dt;
     e.y += e.vy * dt + 0.5 * e.ay * dt * dt;
   }
@@ -93,8 +95,11 @@ export function stepVerlet(entities, dt) {
   computeAccelerations(entities, _scratch);
 
   // Velocity update averages old + new acceleration; then store new as next-step cache.
+  // Pinned bodies have their kinematic state clamped to zero — even if the
+  // user toggled pin while the body was in motion, this halts it cleanly.
   for (let i = 0; i < n; i++) {
     const e = entities[i];
+    if (e.pinned) { e.vx = 0; e.vy = 0; e.ax = 0; e.ay = 0; continue; }
     const newAx = _scratch[i].ax;
     const newAy = _scratch[i].ay;
     e.vx += 0.5 * (e.ax + newAx) * dt;
@@ -147,6 +152,8 @@ export function handleCollisions(entities) {
         else if (a.mass < b.mass) { prey = a; predator = b; }
         else if (b.mass < a.mass) { prey = b; predator = a; }
         else continue;                              // equal-mass BHs: stalemate, no effect
+        // Pinned bodies are intentional anchors — they are immune to absorption.
+        if (prey.pinned) continue;
         beginAbsorption(prey, predator);
       } else {
         resolveElasticCollision(a, b, dx, dy, dist2, rSum);
@@ -183,18 +190,23 @@ function beginAbsorption(prey, predator) {
 // We deliberately do NOT recompute accelerations here — the O(dt²) staleness
 // self-corrects on the next substep, and a re-pass would cost O(n²).
 function resolveElasticCollision(a, b, dx, dy, dist2, rSum) {
-  const invMa = 1 / a.mass;
-  const invMb = 1 / b.mass;
+  // Pinned bodies behave as infinite-mass anchors: inverse mass = 0 means
+  // they receive zero impulse and zero positional correction, and all the
+  // motion is absorbed by the non-pinned partner. Two pinned bodies stuck
+  // overlapping is a user choice — just bail.
+  const invMa = a.pinned ? 0 : 1 / a.mass;
+  const invMb = b.pinned ? 0 : 1 / b.mass;
   const invMassSum = invMa + invMb;
+  if (invMassSum === 0) return;
 
   const dist = Math.sqrt(dist2);
   if (dist === 0) {
-    // Perfectly co-located: split on both axes so we don't jitter next step.
-    const half = rSum * 0.5;
-    a.x -= half * invMa / invMassSum;
-    a.y -= half * invMa / invMassSum;
-    b.x += half * invMb / invMassSum;
-    b.y += half * invMb / invMassSum;
+    // Perfectly co-located: pick a single arbitrary axis (+x) and split mass-
+    // weighted along it. Splitting along BOTH axes pushes only `rSum/2 * √2 / 2 ≈ 0.353·rSum`
+    // of separation per body — still overlapping next frame and causing jitter.
+    // Pushing rSum along one axis cleanly separates regardless of pinned status.
+    a.x -= rSum * (invMa / invMassSum);
+    b.x += rSum * (invMb / invMassSum);
     return;
   }
   const nx = dx / dist;
