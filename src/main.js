@@ -4,7 +4,7 @@
 // scaled by `state.timeScale`. This decouples physics stability from frame
 // rate and lets the user slow/speed/pause time without affecting accuracy.
 
-import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO } from './state.js';
+import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
 import { stepVerlet, handleCollisions, appendTrail, updateAbsorptions, applyBoundary } from './physics.js';
 import { drawScene } from './renderer.js';
 import { attachInput } from './input.js';
@@ -84,4 +84,20 @@ function setupCanvas() {
 
   state.viewport.width = w;
   state.viewport.height = h;
+
+  // Recompute the dynamic radius base. Existing entities keep their per-
+  // instance radius (no rescale = no surprise resize on browser-zoom or
+  // window drag). The "next-to-place" pending body rescales proportionally
+  // so the user's slider ratio stays meaningful across viewport changes.
+  const prevBase = state.radiusBase;
+  const newBase = computeRadiusBase(state.viewport);
+  if (prevBase > 0 && newBase !== prevBase && state.pending.radius > 0) {
+    const ratio = state.pending.radius / prevBase;
+    state.pending.radius = ratio * newBase;
+  }
+  state.radiusBase = newBase;
+  // Refresh slider DOM so the displayed ratio reflects the new base. Safe
+  // to call before bindUI has run because syncFromSelection itself is no-op
+  // until DOM refs are cached.
+  syncFromSelection();
 }

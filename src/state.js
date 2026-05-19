@@ -17,7 +17,28 @@ export const ELASTIC_RESTITUTION = 0.3;    // 0.3 = ~30% bounce-back; 1 = fully 
 // value the user sees is multiplied by the corresponding base constant to get
 // the physical value. Slider 1 = base, slider 2 = 2×base, slider 0.5 = half base.
 export const BASE_TIME_SCALE = 2;          // Slider 1.0× = effective 2× real time.
-export const RADIUS_BASE = 10;             // Slider 1.0× = effective 10 px radius.
+
+// ─── Dynamic radius base (V6) ─────────────────────────────────────
+// Replaces the V3-V5 fixed `RADIUS_BASE = 10`. The slider 1.0× now corresponds
+// to a viewport-relative radius — bigger screens get bigger default bodies,
+// but a hard floor keeps them tappable on touch / small screens.
+//
+//   base_px = clamp(min(viewport_w, viewport_h) / RADIUS_DIVISOR,
+//                   MIN_RADIUS_PX, MAX_RADIUS_PX)
+//
+// main.js recomputes state.radiusBase on every setupCanvas (init + resize).
+// Existing entities keep their creation-time radius; only `state.pending`
+// rescales proportionally so the next-placed body fits the new viewport.
+
+export const RADIUS_DIVISOR = 60;          // Default radius ≈ min(W,H) / 60.
+export const MIN_RADIUS_PX  = 14;          // Floor — diameter 28 px, tappable.
+export const MAX_RADIUS_PX  = 80;          // Ceiling — avoids defaults eating 4K screens.
+
+export function computeRadiusBase(viewport) {
+  const minEdge = Math.max(1, Math.min(viewport.width || 0, viewport.height || 0));
+  const dyn = minEdge / RADIUS_DIVISOR;
+  return Math.max(MIN_RADIUS_PX, Math.min(MAX_RADIUS_PX, dyn));
+}
 // Edit-mode *overrides* the effective time ratio to a constant value (slider
 // is unchanged — it represents the user's chosen rate for non-edit play).
 // effective_in_edit_mode = EDIT_MODE_TIME_RATIO × BASE_TIME_SCALE = 0.4× real.
@@ -33,9 +54,11 @@ export const BOUNDARY_BUFFER_FACTOR = 0.5;
 export const DEFAULTS = Object.freeze({
   type: 'planet',
   mass: 100,
-  // Default effective radius in px. Slider ratio = radius / RADIUS_BASE, so
-  // a default px-radius of 10 corresponds to slider ratio 1.0.
-  radius: 10,
+  // Initial effective radius in px (fallback before first viewport setup).
+  // After main.js setupCanvas runs, state.pending.radius is rescaled to
+  // state.radiusBase × current ratio, so this static value only matters for
+  // the brief window before the first canvas measure.
+  radius: 14,
   charge: 1,
   trailLength: 100,
   // timeScale is a *ratio*; effective time = timeScale × BASE_TIME_SCALE
@@ -96,6 +119,10 @@ export const state = {
 
   // Cached viewport (set by main.js on resize)
   viewport: { width: 0, height: 0 },
+
+  // Dynamic radius base — see computeRadiusBase(). Recomputed each setupCanvas.
+  // Slider value 1.0 corresponds to this many px.
+  radiusBase: MIN_RADIUS_PX,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────

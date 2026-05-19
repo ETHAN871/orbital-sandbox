@@ -8,7 +8,7 @@
 // slider thumbs reflect the chosen entity's current values.
 
 import {
-  state, DEFAULTS, RADIUS_BASE, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
+  state, DEFAULTS, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
@@ -37,7 +37,7 @@ export function bindUI() {
   // Initial sync — populate slider-side labels from state defaults so the HTML
   // hardcodes don't silently diverge if DEFAULTS change.
   els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
-  els.radiusVal.textContent = formatVal('radius', state.pending.radius / RADIUS_BASE, 2);
+  els.radiusVal.textContent = formatVal('radius', state.pending.radius / state.radiusBase, 2);
   refreshPendingPinBtn();
   refreshBoundaryBtn();
   syncFromSelection();
@@ -130,7 +130,7 @@ function formatVal(id, raw, decimals) {
 // convert ratio → effective px on the way in so internal entity.radius
 // remains in physics-space units everywhere else.
 function applyAttribute(key, value) {
-  const stored = key === 'radius' ? value * RADIUS_BASE : value;
+  const stored = key === 'radius' ? value * state.radiusBase : value;
   const sel = state.selectedId !== null ? findEntityById(state.selectedId) : null;
   if (sel) {
     sel[key] = stored;
@@ -197,8 +197,11 @@ function toggleEditMode() {
 }
 
 // ─── Selection ↔ slider sync ─────────────────────────────────────
-// Called by main.js after input.js mutates state.selectedId.
+// Called by main.js after input.js mutates state.selectedId, and also by
+// setupCanvas on resize. The setupCanvas call can fire before bindUI
+// has cached element refs — guard so we don't crash on undefined DOM.
 export function syncFromSelection() {
+  if (!els.massInput) return;
   const sel = state.selectedId !== null ? findEntityById(state.selectedId) : null;
   const src = sel ?? state.pending;
 
@@ -217,7 +220,7 @@ export function syncFromSelection() {
   // Sliders. radius is stored in entity as px; the slider displays a ratio.
   els.massInput.value = String(src.mass);
   els.massVal.textContent = String(Math.round(src.mass));
-  const radiusRatio = src.radius / RADIUS_BASE;
+  const radiusRatio = src.radius / state.radiusBase;
   els.radiusInput.value = String(radiusRatio);
   els.radiusVal.textContent = `${radiusRatio.toFixed(2)}×`;
 

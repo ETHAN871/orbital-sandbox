@@ -19,6 +19,7 @@ import { createEntity, randomPlanetColor } from './entities.js';
 import { predictTrajectory } from './physics.js';
 
 const CLICK_MOVEMENT_THRESHOLD = 5;     // px — distinguishes click vs drag in edit mode
+const HIT_TEST_BUFFER_PX = 8;           // px — expands tap zone past visible edge for ergonomic touch
 
 let canvasRef = null;
 let onSelectionChangeCb = () => {};
@@ -176,14 +177,16 @@ function updatePrediction() {
 
 // Topmost-first hit test: iterate in reverse so visually-front entities win.
 // Skip entities mid-absorption — they're shrinking out of existence and
-// shouldn't accept clicks.
+// shouldn't accept clicks. Hit radius is visible radius + buffer so users
+// can tap slightly outside the body on touch / small targets.
 function hitTestEntity(x, y) {
   for (let i = state.entities.length - 1; i >= 0; i--) {
     const e = state.entities[i];
     if (e.absorbing) continue;
     const dx = x - e.x;
     const dy = y - e.y;
-    if (dx * dx + dy * dy <= e.radius * e.radius) return e;
+    const hitR = e.radius + HIT_TEST_BUFFER_PX;
+    if (dx * dx + dy * dy <= hitR * hitR) return e;
   }
   return null;
 }
