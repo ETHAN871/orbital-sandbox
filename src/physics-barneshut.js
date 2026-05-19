@@ -21,7 +21,12 @@
 // the correct net far-field force.
 
 import { quadtree } from 'd3-quadtree';
-import { state, G, EPSILON } from './state.js';
+import { state } from './state.js';
+// V8.1c: G and EPSILON are now state fields (state.G, state.epsilon).
+// We read them once at computeAccelerationsBH entry into module-level
+// shadows so the recursive accumulate() inner loop hits locals.
+let G = 80;        // overwritten at function entry
+let EPSILON = 4;   // overwritten at function entry
 
 const THETA = 0.5;
 const THETA2 = THETA * THETA;
@@ -184,6 +189,10 @@ export function prepareBHTree(entities) {
 }
 
 export function computeAccelerationsBH(entities, accels) {
+  // V8.1c: refresh module-level shadows from runtime-tunable state.
+  G = state.G;
+  EPSILON = state.epsilon;
+
   const n = entities.length;
   for (let i = 0; i < n; i++) { accels[i].ax = 0; accels[i].ay = 0; }
   if (n === 0 || !_tree || !_extent) return;

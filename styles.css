@@ -218,6 +218,37 @@ input[type="range"]::-moz-range-thumb {
   color: var(--text-dim);
 }
 
+/* V8.1c collapsible <details> sections — styled to match `.group` blocks.
+   `<summary>` is the always-visible header; the rest of the details body
+   is hidden until expanded. */
+details.collapsible > summary {
+  cursor: pointer;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-bottom: 8px;
+  user-select: none;
+  list-style: none;
+  outline: none;
+}
+details.collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+details.collapsible > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  transition: transform 0.15s;
+  color: var(--accent);
+}
+details.collapsible[open] > summary::before {
+  content: "▾ ";
+}
+details.collapsible > summary:hover {
+  color: var(--text);
+}
+
 #selection-hint {
   margin-top: 8px;
   padding: 6px 8px;

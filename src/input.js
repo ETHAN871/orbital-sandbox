@@ -14,7 +14,7 @@
 //
 // We use pointer events so mouse, touch, and pen all work.
 
-import { state, LAUNCH_SPEED_K } from './state.js';
+import { state } from './state.js';
 import { createEntity, randomPlanetColor } from './entities.js';
 import { predictTrajectory } from './physics.js';
 
@@ -121,8 +121,8 @@ function handlePointerUp(ev) {
     type: state.pending.type,
     x: state.drag.startX,
     y: state.drag.startY,
-    vx: -dragVecX * LAUNCH_SPEED_K,
-    vy: -dragVecY * LAUNCH_SPEED_K,
+    vx: -dragVecX * state.launchSpeedK,
+    vy: -dragVecY * state.launchSpeedK,
     mass: state.pending.mass,
     radius: state.pending.radius,
     charge: state.pending.charge,
@@ -168,8 +168,8 @@ function updatePrediction() {
   const ghost = {
     x: d.startX,
     y: d.startY,
-    vx: -(d.currentX - d.startX) * LAUNCH_SPEED_K,
-    vy: -(d.currentY - d.startY) * LAUNCH_SPEED_K,
+    vx: -(d.currentX - d.startX) * state.launchSpeedK,
+    vy: -(d.currentY - d.startY) * state.launchSpeedK,
     radius: state.pending.radius,
   };
   d.predictionPath = predictTrajectory(ghost, state.entities);

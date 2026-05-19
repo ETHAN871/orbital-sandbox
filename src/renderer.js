@@ -7,11 +7,12 @@
 //   4. Entities (planets + black holes)
 //   5. Selected highlight ring
 
-import { state, ABSORPTION_DURATION } from './state.js';
+import { state } from './state.js';
 import { resolveDisplayColor } from './entities.js';
 import { ensureEntitySprite } from './sprite-cache.js';
 
-const BG_COLOR = '#0a0a0f';
+// V8.1c: ABSORPTION_DURATION moved to state.absorptionDuration (UI-tunable).
+// BG_COLOR replaced by state.bgColor (light/dark toggle button).
 const SELECT_RING_COLOR = '#6b8cff';
 const PREDICTION_DASH = [6, 6];
 const PREDICTION_BATCHES = 8;   // sub-segments for fade-along-path effect
@@ -25,14 +26,16 @@ const GHOST_FILL_ALPHA = 0.18;  // faint preview at placement point
 // active entity at its current position. Composite onto the main canvas
 // as a single drawImage. Cost: O(N) per frame instead of O(N × history).
 
-// V8.1 trail: thinner AA-circle dot via per-pixel distance to entity center.
-// TRAIL_DOT_RADIUS is the geometric radius; the +0.5 in TRAIL_AA_CUTOFF
-// gives a half-pixel ramp from full alpha to zero at the edge, producing
-// anti-aliased boundaries without canvas state churn.
-const TRAIL_DOT_RADIUS = 0.7;          // ~2 px wide dot, soft edges
-const TRAIL_AA_CUTOFF  = TRAIL_DOT_RADIUS + 0.5;
-const TRAIL_AA_CUTOFF2 = TRAIL_AA_CUTOFF * TRAIL_AA_CUTOFF;
-const TRAIL_AA_BBOX    = Math.ceil(TRAIL_AA_CUTOFF);   // bounding-box half-extent in px
+// V8.1c trail dot: solid interior + 1 px AA edge.
+// Radius R = state.trailWidth / 2 (slider 1-6 px → R 0.5-3.0).
+// For a pixel at distance d from the entity center:
+//   d ≤ R - 0.5         → α = 255 (fully solid; thickness doesn't vary
+//                          with sub-pixel position, fixing V8.1's "线宽
+//                          不一致" perception bug)
+//   R - 0.5 < d ≤ R + 0.5 → α linearly ramps from 255 down to 0
+//   d > R + 0.5         → skip
+// Writing uses max(new, existing) so the AA edge of a fresh dot never
+// dims older bright trail pixels at the same pixel.
 
 const _colorRgbCache = new Map();
 
@@ -116,12 +119,15 @@ export function updateTrailCanvas(simDeltaTime) {
     }
   }
 
-  // Plot AA-circle dots at each non-absorbing entity. For each pixel in the
-  // dot's bounding box, compute distance from the entity's sub-pixel center;
-  // pixels within radius get full alpha, pixels in the half-pixel "edge ramp"
-  // get alpha proportional to (cutoff - distance). Writing uses max(new, old)
-  // so a faded older trail pixel never gets DIMMED by a current AA edge
-  // contribution.
+  // Plot solid-interior + 1 px AA edge dots at each non-absorbing entity.
+  // Geometry parameters derived from the user's trailWidth slider (1-6 px).
+  const R = state.trailWidth * 0.5;
+  const R_INNER = R - 0.5;                    // strictly-solid radius
+  const R_OUTER = R + 0.5;                    // outer AA edge (alpha → 0)
+  const R_INNER2 = R_INNER > 0 ? R_INNER * R_INNER : 0;
+  const R_OUTER2 = R_OUTER * R_OUTER;
+  const BBOX = Math.ceil(R_OUTER);
+
   for (let k = 0; k < state.entities.length; k++) {
     const e = state.entities[k];
     if (e.absorbing) continue;
@@ -131,21 +137,42 @@ export function updateTrailCanvas(simDeltaTime) {
     const ey = e.y;
     const px = ex | 0;
     const py = ey | 0;
-    for (let dy = -TRAIL_AA_BBOX; dy <= TRAIL_AA_BBOX; dy++) {
+    // Single-pixel fast path: at width = 1 px (R = 0.5), the BBOX scan
+    // produces a faint plus-shape (1 center pixel + 4 half-alpha cardinals).
+    // Snap to one crisp center pixel instead.
+    if (R <= 0.5) {
+      if (px >= 0 && px < w && py >= 0 && py < h) {
+        const idx = (py * w + px) * 4;
+        if (255 > data[idx + 3]) {
+          data[idx]     = cr;
+          data[idx + 1] = cg;
+          data[idx + 2] = cb;
+          data[idx + 3] = 255;
+        }
+      }
+      continue;
+    }
+    for (let dy = -BBOX; dy <= BBOX; dy++) {
       const yy = py + dy;
       if (yy < 0 || yy >= h) continue;
-      const cy = (yy + 0.5) - ey;            // pixel-center → entity-center (Y)
+      const cy = (yy + 0.5) - ey;             // pixel-center → entity-center (Y)
       const cy2 = cy * cy;
-      for (let dx = -TRAIL_AA_BBOX; dx <= TRAIL_AA_BBOX; dx++) {
+      for (let dx = -BBOX; dx <= BBOX; dx++) {
         const xx = px + dx;
         if (xx < 0 || xx >= w) continue;
         const cx = (xx + 0.5) - ex;
         const d2 = cx * cx + cy2;
-        if (d2 >= TRAIL_AA_CUTOFF2) continue;  // outside dot — fast reject
-        const d = Math.sqrt(d2);
-        // Alpha ramps from full inside the radius to 0 at the cutoff.
-        const aaAlpha = (TRAIL_AA_CUTOFF - d) * 255;
-        const a = aaAlpha >= 255 ? 255 : (aaAlpha | 0);
+        if (d2 >= R_OUTER2) continue;         // outside dot — fast reject
+        let a;
+        if (d2 <= R_INNER2) {
+          a = 255;                            // strictly solid interior
+        } else {
+          // Edge ramp: linear from 255 at R_INNER to 0 at R_OUTER (width 1 px).
+          const d = Math.sqrt(d2);
+          const ramp = (R_OUTER - d) * 255;
+          a = ramp >= 255 ? 255 : (ramp | 0);
+        }
+        if (a === 0) continue;
         const idx = (yy * w + xx) * 4;
         if (a > data[idx + 3]) {
           data[idx]     = cr;
@@ -245,7 +272,7 @@ function drawHoverGhost(ctx) {
 }
 
 function drawBackground(ctx, w, h) {
-  ctx.fillStyle = BG_COLOR;
+  ctx.fillStyle = state.bgColor;
   ctx.fillRect(0, 0, w, h);
 }
 
@@ -414,7 +441,7 @@ function drawOneEntity(ctx, e, drawX, drawY /* isMirror unused with sprite cache
 // Slow path for absorbing entities — same visuals as V7's arc-based code
 // but parameterised on (drawX, drawY) so mirror copies render at offset.
 function drawAbsorbingFallback(ctx, e, drawX, drawY) {
-  const t = Math.min(1, e.absorbing.elapsedSim / ABSORPTION_DURATION);
+  const t = Math.min(1, e.absorbing.elapsedSim / state.absorptionDuration);
   ctx.globalAlpha = Math.max(0, 1 - t);
   const r = Math.max(0, e.radius);
 

@@ -8,7 +8,8 @@
 // slider thumbs reflect the chosen entity's current values.
 
 import {
-  state, DEFAULTS, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
+  state, DEFAULTS, DEFAULTS_TUNING,
+  BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
@@ -37,12 +38,36 @@ export function bindUI() {
   els.deleteBtn.addEventListener('click', deleteSelectedEntity);
   els.pendingPinBtn.addEventListener('click', togglePendingPin);
   els.boundaryBtn.addEventListener('click', toggleBoundaryMode);
+  els.bgThemeBtn.addEventListener('click', toggleBgTheme);
+
+  // V8.1c: trail-width slider (collapsible "线宽设置" section).
+  bindRangeSlider('trail-width', val => { state.trailWidth = val; }, 1);
+
+  // V8.1c: 7 sliders in the "高级调参" collapsible — each writes directly
+  // to its state.* field. Handlers read state.* at use site, so changes
+  // take effect on the next frame without any extra wiring.
+  bindRangeSlider('tune-G',           val => { state.G = val; },                  0);
+  bindRangeSlider('tune-restitution', val => { state.elasticRestitution = val; }, 2);
+  bindRangeSlider('tune-K',           val => { state.launchSpeedK = val; },       2);
+  bindRangeSlider('tune-bh',          val => { state.bhThreshold = val; },        0);
+  bindRangeSlider('tune-absorb',      val => { state.absorptionDuration = val; }, 1);
+  bindRangeSlider('tune-eps',         val => { state.epsilon = val; },            1);
+  bindRangeSlider('tune-predict',     val => { state.predictHorizon = val; },     1);
+  els.tuneResetBtn.addEventListener('click', resetTuning);
 
   // Initial sync — populate slider-side labels from state defaults so the HTML
   // hardcodes don't silently diverge if DEFAULTS change.
   els.timeVal.textContent = formatVal('time-scale', state.timeScale, 2);
   els.radiusVal.textContent = formatVal('radius', state.pending.radius / state.radiusBase, 2);
   els.trailVal.textContent = formatVal('trail', state.trailLength, 0);
+  // V8.1c initial sync for new sliders + bg theme button.
+  els.trailWidthVal.textContent = formatVal('trail-width', state.trailWidth, 1);
+  for (const spec of els.tuneInputs) {
+    const v = state[spec.stateKey];
+    if (spec.input) spec.input.value = String(v);
+    if (spec.valEl) spec.valEl.textContent = formatVal(spec.id, v, spec.decimals);
+  }
+  refreshBgThemeBtn();
   refreshPendingPinBtn();
   refreshBoundaryBtn();
   syncFromSelection();
@@ -76,6 +101,26 @@ function cacheElements() {
   // V4 additions: persistent toggles in the placement panel.
   els.pendingPinBtn = document.getElementById('pending-pin-btn');
   els.boundaryBtn   = document.getElementById('boundary-btn');
+  // V8.1c: background theme + trail width + advanced tuning panel.
+  els.bgThemeBtn      = document.getElementById('bg-theme-btn');
+  els.trailWidthInput = document.getElementById('trail-width');
+  els.trailWidthVal   = document.getElementById('trail-width-val');
+  els.tuneResetBtn    = document.getElementById('tune-reset-btn');
+  // For the bulk-reset button, list each advanced-tuning slider with its
+  // input/valEl/decimals/stateKey so resetTuning() can iterate uniformly.
+  els.tuneInputs = [
+    { id: 'tune-G',           stateKey: 'G',                  decimals: 0 },
+    { id: 'tune-restitution', stateKey: 'elasticRestitution', decimals: 2 },
+    { id: 'tune-K',           stateKey: 'launchSpeedK',       decimals: 2 },
+    { id: 'tune-bh',          stateKey: 'bhThreshold',        decimals: 0 },
+    { id: 'tune-absorb',      stateKey: 'absorptionDuration', decimals: 1 },
+    { id: 'tune-eps',         stateKey: 'epsilon',            decimals: 1 },
+    { id: 'tune-predict',     stateKey: 'predictHorizon',     decimals: 1 },
+  ].map(spec => ({
+    ...spec,
+    input: document.getElementById(spec.id),
+    valEl: document.getElementById(`${spec.id}-val`),
+  }));
 }
 
 // ─── Segment selectors ────────────────────────────────────────────
@@ -129,6 +174,11 @@ function formatVal(id, raw, decimals) {
   if (id === 'radius') return `${raw.toFixed(decimals)}×`;
   // V8.1: trail slider is now a "lifetime in seconds" (slider / 50).
   if (id === 'trail') return `${(raw / 50).toFixed(1)} 秒`;
+  // V8.1c: new tunable sliders with appropriate suffixes.
+  if (id === 'trail-width')   return `${raw.toFixed(1)} px`;
+  if (id === 'tune-absorb')   return `${raw.toFixed(1)} 秒`;
+  if (id === 'tune-eps')      return `${raw.toFixed(1)} px`;
+  if (id === 'tune-predict')  return `${raw.toFixed(1)} 秒`;
   return decimals > 0 ? raw.toFixed(decimals) : String(Math.round(raw));
 }
 
@@ -257,6 +307,34 @@ function updateModeHint() {
 // Footer entity counter — called per frame by main.js.
 export function updateEntityCount() {
   els.entityCount.textContent = `${state.entities.length} 个实体`;
+}
+
+// ─── V8.1c handlers ──────────────────────────────────────────────
+const BG_DARK  = '#0a0a0f';
+const BG_LIGHT = '#ececf0';
+
+// Cycle canvas background between dark and light. Panel theme unchanged.
+function toggleBgTheme() {
+  if (!els.bgThemeBtn) return;
+  state.bgColor = state.bgColor === BG_LIGHT ? BG_DARK : BG_LIGHT;
+  refreshBgThemeBtn();
+}
+
+function refreshBgThemeBtn() {
+  if (!els.bgThemeBtn) return;
+  const isLight = state.bgColor === BG_LIGHT;
+  els.bgThemeBtn.textContent = isLight ? '深色背景' : '浅色背景';
+  els.bgThemeBtn.classList.toggle('active', isLight);
+}
+
+// Reset all 7 advanced-tuning sliders to DEFAULTS_TUNING.
+function resetTuning() {
+  for (const spec of els.tuneInputs) {
+    const def = DEFAULTS_TUNING[spec.stateKey];
+    state[spec.stateKey] = def;
+    if (spec.input) spec.input.value = String(def);
+    if (spec.valEl) spec.valEl.textContent = formatVal(spec.id, def, spec.decimals);
+  }
 }
 
 // ─── Selection-only handlers ─────────────────────────────────────

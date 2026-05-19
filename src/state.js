@@ -2,16 +2,31 @@
 // Single source of truth. Other modules import this and mutate
 // it through small helper functions (no direct deep-mutation from UI).
 
-// ─── Physics constants ────────────────────────────────────────────
-export const G = 80;            // Gravitational constant, tuned for visual orbits at default params.
-export const EPSILON = 4;       // Softening floor for r² to prevent singularity (px).
-export const SIM_DT = 1 / 60;   // Fixed physics timestep (s) — independent of frame rate.
-export const PREDICT_HORIZON = 5;          // Prediction line spans 5 seconds.
+// ─── Physics timing constants (fixed, not user-tunable) ──────────
+// SIM_DT and PREDICT_DT are integration step sizes; changing them would
+// break Verlet stability and animation timing. Other "constants" that
+// USED to live here (G, EPSILON, PREDICT_HORIZON, LAUNCH_SPEED_K,
+// ABSORPTION_DURATION, ELASTIC_RESTITUTION, BH_THRESHOLD) are now
+// runtime-mutable state fields (see `state.xxx` below), driven by the
+// "高级调参" UI panel. `DEFAULTS_TUNING` keeps their original values
+// so the "恢复默认" button can reset.
+export const SIM_DT = 1 / 60;              // Fixed physics timestep (s).
 export const PREDICT_DT = 1 / 60;          // Prediction integration step (s).
-export const PREDICT_STEPS = Math.floor(PREDICT_HORIZON / PREDICT_DT); // 300 points.
-export const LAUNCH_SPEED_K = 0.7;         // Drag-vector → initial-velocity multiplier.
-export const ABSORPTION_DURATION = 0.3;    // Seconds (sim time) for the black-hole devour animation.
-export const ELASTIC_RESTITUTION = 0.3;    // 0.3 = ~30% bounce-back; 1 = fully elastic, 0 = perfectly inelastic.
+// Maximum prediction step count: predictHorizon max = 15s × 60Hz = 900 steps.
+// The _predictBuf is pre-allocated at this size so the slider can shrink
+// without re-allocation.
+export const PREDICT_STEPS_MAX = Math.floor(15 / PREDICT_DT);
+
+// Tunable physics defaults. Frozen so "恢复默认" button reads stable values.
+export const DEFAULTS_TUNING = Object.freeze({
+  G: 80,                       // Gravitational constant.
+  epsilon: 4,                  // Softening floor for r² (px).
+  predictHorizon: 5,           // Prediction line span (sec sim time).
+  launchSpeedK: 0.7,           // Drag-vector → initial-velocity multiplier.
+  absorptionDuration: 0.3,     // Black-hole devour animation length (sec sim).
+  elasticRestitution: 0.3,     // 0=inelastic, 1=fully elastic.
+  bhThreshold: 64,             // N≥ this → Barnes-Hut, else direct O(N²).
+});
 
 // Slider semantics: the time-scale and radius sliders display *ratios* — the
 // value the user sees is multiplied by the corresponding base constant to get
@@ -128,6 +143,24 @@ export const state = {
   // Dynamic radius base — see computeRadiusBase(). Recomputed each setupCanvas.
   // Slider value 1.0 corresponds to this many px.
   radiusBase: MIN_RADIUS_PX,
+
+  // V8.1c tunable physics params (formerly module-level const). Driven by
+  // the 高级调参 panel sliders; reset to DEFAULTS_TUNING via reset button.
+  G:                  DEFAULTS_TUNING.G,
+  epsilon:            DEFAULTS_TUNING.epsilon,
+  predictHorizon:     DEFAULTS_TUNING.predictHorizon,
+  launchSpeedK:       DEFAULTS_TUNING.launchSpeedK,
+  absorptionDuration: DEFAULTS_TUNING.absorptionDuration,
+  elasticRestitution: DEFAULTS_TUNING.elasticRestitution,
+  bhThreshold:        DEFAULTS_TUNING.bhThreshold,
+
+  // Canvas background color — toggled by the 深/浅 button.
+  // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.
+  bgColor: '#0a0a0f',
+
+  // Trail dot width in px (diameter). Renderer derives radius R = trailWidth / 2.
+  // Default 3 px → solid 3×3 with 1 px AA edge.
+  trailWidth: 3,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────

@@ -13,17 +13,15 @@
 
 import {
   state,
-  G, EPSILON, PREDICT_STEPS, PREDICT_DT,
-  ABSORPTION_DURATION, ELASTIC_RESTITUTION,
+  PREDICT_DT, PREDICT_STEPS_MAX,
   BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
 import { prepareBHTree, computeAccelerationsBH } from './physics-barneshut.js';
 import { buildSpatialHash, forEachCollisionPair } from './physics-spatial-hash.js';
 
-// V8.2 dispatch threshold. Below this entity count, the O(N²) direct sum
-// has lower constant factor than Barnes-Hut tree build + 9-ghost recursion;
-// above it, BH wins decisively.
-const BH_THRESHOLD = 64;
+// V8.1c: BH dispatch threshold is now user-tunable via state.bhThreshold.
+// Functions read state.bhThreshold at call time so the slider takes
+// effect immediately on the next frame.
 
 // V8.2: prepare per-frame data structures once. main.js calls this before
 // the substep loop so the quadtree + spatial hash are built exactly 1× per
@@ -31,7 +29,7 @@ const BH_THRESHOLD = 64;
 // substeps is bounded by SIM_DT × velocity and is within Verlet's
 // integration tolerance.
 export function prepareFrame(entities) {
-  if (entities.length >= BH_THRESHOLD) {
+  if (entities.length >= state.bhThreshold) {
     prepareBHTree(entities);
     buildSpatialHash(entities);
   }
@@ -63,7 +61,7 @@ export function computeAccelerations(entities, accels) {
   const n = entities.length;
   // V8.2: dispatch to Barnes-Hut for large N. The direct O(N²) sum below
   // wins at small N due to lower constant factor + cache locality.
-  if (n >= BH_THRESHOLD) {
+  if (n >= state.bhThreshold) {
     computeAccelerationsBH(entities, accels);
     return;
   }
@@ -71,11 +69,15 @@ export function computeAccelerations(entities, accels) {
 
   // V7 perf: hoist wrap/viewport reads out of the N² hot path and inline
   // pairDelta so the inner loop allocates zero objects.
+  // V8.1c: also snapshot tunable G/epsilon once per call so the inner
+  // loop reads locals instead of property lookups.
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width  : 0;
   const H = wrap ? state.viewport.height : 0;
   const halfW = W * 0.5;
   const halfH = H * 0.5;
+  const G = state.G;
+  const EPSILON = state.epsilon;
 
   for (let i = 0; i < n; i++) {
     const a = entities[i];
@@ -215,7 +217,7 @@ export function handleCollisions(entities) {
   // V8.2: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
   // The hash is built once per frame in prepareFrame() above; this just
   // iterates the already-built buckets.
-  if (n >= BH_THRESHOLD) {
+  if (n >= state.bhThreshold) {
     forEachCollisionPair(entities, processCollisionPair);
     return;
   }
@@ -318,7 +320,7 @@ function resolveElasticCollision(a, b, dx, dy, dist2, rSum) {
   const velAlongNormal = rvx * nx + rvy * ny;
   if (velAlongNormal > 0) return;                  // already separating
 
-  const j = -(1 + ELASTIC_RESTITUTION) * velAlongNormal / invMassSum;
+  const j = -(1 + state.elasticRestitution) * velAlongNormal / invMassSum;
   const ix = j * nx;
   const iy = j * ny;
   a.vx -= ix * invMa;
@@ -350,7 +352,7 @@ export function updateAbsorptions(entities, dt) {
     if (!bh) { entities.splice(i, 1); continue; }
 
     abs.elapsedSim += dt;
-    const t = Math.min(1, abs.elapsedSim / ABSORPTION_DURATION);
+    const t = Math.min(1, abs.elapsedSim / state.absorptionDuration);
 
     e.x = abs.startX + (bh.x - abs.startX) * t;
     e.y = abs.startY + (bh.y - abs.startY) * t;
@@ -370,7 +372,10 @@ export function updateAbsorptions(entities, dt) {
 // per-frame predict doesn't allocate 300 `{x,y}` objects + a fresh path
 // array each invocation. The returned object holds a reference to this
 // same buffer, with a `length` indicating how many samples are valid.
-const _predictBuf = new Float32Array(PREDICT_STEPS * 2);
+// V8.1c: buffer sized for the MAX possible prediction horizon (15s).
+// Each call computes its own step count from state.predictHorizon, so the
+// slider can shrink/grow without reallocation.
+const _predictBuf = new Float32Array(PREDICT_STEPS_MAX * 2);
 const _predictResult = { data: _predictBuf, length: 0 };
 const _ghostAccelScratch = { ax: 0, ay: 0 };
 
@@ -382,6 +387,12 @@ export function predictTrajectory(ghost, others) {
   const wrap = state.boundaryMode === 'wrap';
   const W = state.viewport.width;
   const H = state.viewport.height;
+  // Dynamic step count: predictHorizon in seconds × steps-per-second.
+  // Clamped to MAX so we never write past the pre-allocated buffer.
+  const steps = Math.min(
+    PREDICT_STEPS_MAX,
+    Math.max(1, Math.floor(state.predictHorizon / PREDICT_DT)),
+  );
 
   // Initial acceleration from frozen snapshot (writes into _ghostAccelScratch).
   ghostAccel(x, y, ghost.radius, others, _ghostAccelScratch);
@@ -389,7 +400,7 @@ export function predictTrajectory(ghost, others) {
   let ay = _ghostAccelScratch.ay;
 
   let written = 0;
-  for (let s = 0; s < PREDICT_STEPS; s++) {
+  for (let s = 0; s < steps; s++) {
     x += vx * PREDICT_DT + 0.5 * ax * PREDICT_DT * PREDICT_DT;
     y += vy * PREDICT_DT + 0.5 * ay * PREDICT_DT * PREDICT_DT;
     if (wrap) {
@@ -420,6 +431,8 @@ function ghostAccel(x, y, radius, others, out) {
   const H = wrap ? state.viewport.height : 0;
   const halfW = W * 0.5;
   const halfH = H * 0.5;
+  const G = state.G;
+  const EPSILON = state.epsilon;
   for (let k = 0; k < others.length; k++) {
     const o = others[k];
     if (o.charge === 0 || o.absorbing) continue;
