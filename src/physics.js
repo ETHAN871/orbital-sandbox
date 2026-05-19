@@ -32,16 +32,9 @@ function minImageDelta(d, span) {
   return d;
 }
 
-// Returns the (dx, dy) from `a` to `b`, honoring wrap mode when enabled.
-function pairDelta(a, b) {
-  let dx = b.x - a.x;
-  let dy = b.y - a.y;
-  if (state.boundaryMode === 'wrap') {
-    dx = minImageDelta(dx, state.viewport.width);
-    dy = minImageDelta(dy, state.viewport.height);
-  }
-  return { dx, dy };
-}
+// (pairDelta was V5; V7 inlined it into the N² hot paths to avoid object
+//  allocation. minImageDelta is still used by ghostAccel/touchesBlackHole
+//  where the call count is much lower.)
 
 // ─── Force / acceleration ─────────────────────────────────────────
 // Returns parallel arrays-of-zero accumulator filled in-place.
@@ -50,6 +43,14 @@ function pairDelta(a, b) {
 export function computeAccelerations(entities, accels) {
   const n = entities.length;
   for (let i = 0; i < n; i++) { accels[i].ax = 0; accels[i].ay = 0; }
+
+  // V7 perf: hoist wrap/viewport reads out of the N² hot path and inline
+  // pairDelta so the inner loop allocates zero objects.
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width  : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
 
   for (let i = 0; i < n; i++) {
     const a = entities[i];
@@ -60,7 +61,12 @@ export function computeAccelerations(entities, accels) {
     for (let j = i + 1; j < n; j++) {
       const b = entities[j];
       if (b.absorbing) continue;
-      const { dx, dy } = pairDelta(a, b);
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      if (wrap) {
+        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      }
       const r2Raw = dx * dx + dy * dy;
       const minR = Math.max(a.radius + b.radius, EPSILON);
       const r2 = Math.max(r2Raw, minR * minR);
@@ -150,6 +156,13 @@ export function stepVerlet(entities, dt) {
 
 export function handleCollisions(entities) {
   const n = entities.length;
+  // V7 perf: same hoisting as computeAccelerations.
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width  : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
+
   for (let i = 0; i < n - 1; i++) {
     const a = entities[i];
     if (a.absorbing) continue;
@@ -161,7 +174,12 @@ export function handleCollisions(entities) {
       if (a.absorbing) break;
       const b = entities[j];
       if (b.absorbing) continue;
-      const { dx, dy } = pairDelta(a, b);
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      if (wrap) {
+        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      }
       const rSum = a.radius + b.radius;
       const dist2 = dx * dx + dy * dy;
       if (dist2 >= rSum * rSum) continue;          // not touching
@@ -270,12 +288,19 @@ function resolveElasticCollision(a, b, dx, dy, dist2, rSum) {
 
 export function updateAbsorptions(entities, dt) {
   if (dt <= 0) return;
+  // Build an id→entity map ONLY if at least one entity is absorbing.
+  // Avoids a per-frame Map allocation when nothing is being eaten.
+  let idMap = null;
   for (let i = entities.length - 1; i >= 0; i--) {
     const e = entities[i];
     const abs = e.absorbing;
     if (!abs) continue;
+    if (!idMap) {
+      idMap = new Map();
+      for (let k = 0; k < entities.length; k++) idMap.set(entities[k].id, entities[k]);
+    }
 
-    const bh = entities.find(x => x.id === abs.blackHoleId);
+    const bh = idMap.get(abs.blackHoleId);
     if (!bh) { entities.splice(i, 1); continue; }
 
     abs.elapsedSim += dt;
@@ -295,64 +320,68 @@ export function updateAbsorptions(entities, dt) {
 // treated as stationary during the 5-second look-ahead — a standard
 // approximation that keeps cost low and feels right for placement UI.
 
+// Module-level scratch for prediction — reused across calls so the drag's
+// per-frame predict doesn't allocate 300 `{x,y}` objects + a fresh path
+// array each invocation. The returned object holds a reference to this
+// same buffer, with a `length` indicating how many samples are valid.
+const _predictBuf = new Float32Array(PREDICT_STEPS * 2);
+const _predictResult = { data: _predictBuf, length: 0 };
+const _ghostAccelScratch = { ax: 0, ay: 0 };
+
 export function predictTrajectory(ghost, others) {
-  const path = new Array(PREDICT_STEPS);
   let x = ghost.x;
   let y = ghost.y;
   let vx = ghost.vx;
   let vy = ghost.vy;
-  let ax = 0;
-  let ay = 0;
   const wrap = state.boundaryMode === 'wrap';
   const W = state.viewport.width;
   const H = state.viewport.height;
 
-  // Initial acceleration from frozen snapshot.
-  ({ ax, ay } = ghostAccel(x, y, ghost.radius, others));
+  // Initial acceleration from frozen snapshot (writes into _ghostAccelScratch).
+  ghostAccel(x, y, ghost.radius, others, _ghostAccelScratch);
+  let ax = _ghostAccelScratch.ax;
+  let ay = _ghostAccelScratch.ay;
 
+  let written = 0;
   for (let s = 0; s < PREDICT_STEPS; s++) {
-    // Verlet position step.
     x += vx * PREDICT_DT + 0.5 * ax * PREDICT_DT * PREDICT_DT;
     y += vy * PREDICT_DT + 0.5 * ay * PREDICT_DT * PREDICT_DT;
-
-    // Mirror physics boundary handling so predicted path stays visualizable.
-    // Renderer skips polyline segments that jump > viewport/2 to hide the
-    // wrap-around jump line.
     if (wrap) {
       if (x < 0) x += W; else if (x > W) x -= W;
       if (y < 0) y += H; else if (y > H) y -= H;
     }
+    _predictBuf[s * 2]     = x;
+    _predictBuf[s * 2 + 1] = y;
+    written = s + 1;
+    if (touchesBlackHole(x, y, ghost.radius, others)) break;
 
-    // Stop early if the ghost would already have been consumed by a black hole.
-    if (touchesBlackHole(x, y, ghost.radius, others)) {
-      path.length = s + 1;
-      path[s] = { x, y };
-      break;
-    }
-
-    const next = ghostAccel(x, y, ghost.radius, others);
-    vx += 0.5 * (ax + next.ax) * PREDICT_DT;
-    vy += 0.5 * (ay + next.ay) * PREDICT_DT;
-    ax = next.ax;
-    ay = next.ay;
-    path[s] = { x, y };
+    ghostAccel(x, y, ghost.radius, others, _ghostAccelScratch);
+    vx += 0.5 * (ax + _ghostAccelScratch.ax) * PREDICT_DT;
+    vy += 0.5 * (ay + _ghostAccelScratch.ay) * PREDICT_DT;
+    ax = _ghostAccelScratch.ax;
+    ay = _ghostAccelScratch.ay;
   }
-  return path;
+  _predictResult.length = written;
+  return _predictResult;
 }
 
-function ghostAccel(x, y, radius, others) {
+// V7 perf: writes result into `out.ax`/`out.ay` instead of returning a fresh
+// object. Called 300×/drag-frame from predictTrajectory.
+function ghostAccel(x, y, radius, others, out) {
   let ax = 0, ay = 0;
   const wrap = state.boundaryMode === 'wrap';
-  const W = state.viewport.width;
-  const H = state.viewport.height;
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
   for (let k = 0; k < others.length; k++) {
     const o = others[k];
     if (o.charge === 0 || o.absorbing) continue;
     let dx = o.x - x;
     let dy = o.y - y;
     if (wrap) {
-      dx = minImageDelta(dx, W);
-      dy = minImageDelta(dy, H);
+      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
     }
     const r2Raw = dx * dx + dy * dy;
     const minR = Math.max(radius + o.radius, EPSILON);
@@ -362,7 +391,8 @@ function ghostAccel(x, y, radius, others) {
     ax += mag * dx / r;
     ay += mag * dy / r;
   }
-  return { ax, ay };
+  out.ax = ax;
+  out.ay = ay;
 }
 
 function touchesBlackHole(x, y, radius, others) {
@@ -389,16 +419,21 @@ function touchesBlackHole(x, y, radius, others) {
 // The trail is capped at `maxLen` points; older samples drop off the front.
 
 export function appendTrail(entity, maxLen) {
+  const t = entity.trail;
   if (maxLen <= 0) {
-    entity.trail.length = 0;
+    t.size = 0;
+    t.head = 0;
     return;
   }
-  entity.trail.push({ x: entity.x, y: entity.y });
-  // Single splice handles both the steady-state +1 case AND a slider-slam
-  // (e.g. 500 → 20) in one call, instead of N×O(n) Array.shift() invocations.
-  if (entity.trail.length > maxLen) {
-    entity.trail.splice(0, entity.trail.length - maxLen);
-  }
+  const cap = t.buf.length >> 1;          // bytes/2 = sample slots
+  // Write at head, advance, increment size (capped at min(maxLen, cap)).
+  t.buf[t.head * 2]     = entity.x;
+  t.buf[t.head * 2 + 1] = entity.y;
+  t.head = (t.head + 1) % cap;
+  const newCap = maxLen < cap ? maxLen : cap;
+  if (t.size < newCap) t.size++;
+  else if (t.size > newCap) t.size = newCap;
+  // O(1) — no array shifts, no allocations.
 }
 
 // ─── Boundary handling ────────────────────────────────────────────

@@ -49,9 +49,13 @@ function frame(now) {
   // Drop accumulated lag if we hit the substep cap (avoids permanent slowdown).
   if (steps >= MAX_SUBSTEPS) accumulator = 0;
 
-  // Sample trails once per visual frame so trail-point density is independent
-  // of timeScale (the spec's "trail length" is in samples).
-  for (const e of state.entities) appendTrail(e, state.trailLength);
+  // Sample trails once per visual frame, BUT only when at least one physics
+  // substep actually ran. If paused (timeScale=0 → steps=0), entities haven't
+  // moved, so pushing a duplicate trail point is pure waste (and would still
+  // pay the ring-buffer advance + size cap update).
+  if (steps > 0) {
+    for (const e of state.entities) appendTrail(e, state.trailLength);
+  }
 
   // Drop selection silently if the selected entity is gone OR mid-absorption
   // (it's effectively dying — editing its sliders would be pointless).

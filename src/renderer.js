@@ -72,18 +72,23 @@ function drawTrails(ctx) {
   const wrapX = wrap ? W * 0.5 : Infinity;
   const wrapY = wrap ? H * 0.5 : Infinity;
   for (const e of state.entities) {
-    const trail = e.trail;
-    if (trail.length < 2) continue;
+    const t = e.trail;
+    if (t.size < 2) continue;
+    const cap = t.buf.length >> 1;
+    // Oldest sample index = (head - size + cap) % cap.
+    const start = (t.head - t.size + cap) % cap;
     ctx.strokeStyle = e.color;
     ctx.lineWidth = 1.5;
     ctx.globalAlpha = 0.5;
     ctx.beginPath();
-    let prevX = trail[0].x, prevY = trail[0].y;
+    let prevX = t.buf[start * 2];
+    let prevY = t.buf[start * 2 + 1];
     ctx.moveTo(prevX, prevY);
-    for (let i = 1; i < trail.length; i++) {
-      const x = trail[i].x, y = trail[i].y;
-      // Skip segments that "teleport" across the wrap boundary — those
-      // are the visual cousin of the entity's coordinate jump.
+    for (let i = 1; i < t.size; i++) {
+      const idx = (start + i) % cap;
+      const x = t.buf[idx * 2];
+      const y = t.buf[idx * 2 + 1];
+      // Skip segments that "teleport" across the wrap boundary.
       if (Math.abs(x - prevX) > wrapX || Math.abs(y - prevY) > wrapY) {
         ctx.moveTo(x, y);
       } else {
@@ -155,8 +160,11 @@ function drawDragPreview(ctx) {
 // apply globalAlpha per batch — canvas setLineDash can't fade individual dashes.
 // In wrap mode we skip segments that jump across the boundary so the line
 // doesn't draw a straight slash across the whole viewport.
+// V7: `path` is now `{ data: Float32Array, length: number }` — interleaved
+// (x, y) samples in a flat buffer instead of an array of objects.
 function drawDashedFadingPath(ctx, path, color) {
   const n = path.length;
+  const data = path.data;
   const batchSize = Math.max(2, Math.ceil(n / PREDICTION_BATCHES));
   const wrap = state.boundaryMode === 'wrap';
   const wrapX = wrap ? state.viewport.width * 0.5 : Infinity;
@@ -171,10 +179,12 @@ function drawDashedFadingPath(ctx, path, color) {
     const alpha = 1 - b / PREDICTION_BATCHES;     // 1.0 → ~0.125
     ctx.globalAlpha = alpha * 0.85;
     ctx.beginPath();
-    let prevX = path[start].x, prevY = path[start].y;
+    let prevX = data[start * 2];
+    let prevY = data[start * 2 + 1];
     ctx.moveTo(prevX, prevY);
     for (let i = start + 1; i <= end; i++) {
-      const x = path[i].x, y = path[i].y;
+      const x = data[i * 2];
+      const y = data[i * 2 + 1];
       if (Math.abs(x - prevX) > wrapX || Math.abs(y - prevY) > wrapY) {
         ctx.moveTo(x, y);
       } else {
@@ -215,17 +225,21 @@ function drawEntities(ctx) {
   }
 }
 
-// Temporarily offset the entity's coords, redraw, then restore. Cheaper
-// than refactoring drawOneEntity to take explicit position params, and
-// safe because the renderer is single-threaded.
+// V7: drawOneEntity now takes explicit (drawX, drawY), so the mirror call
+// no longer needs to mutate-and-restore the entity. Passes isMirror=true
+// to suppress charge-glyph text render (visible only on the primary copy).
 function drawEntityAtMirror(ctx, e, ox, oy) {
-  const sx = e.x, sy = e.y;
-  e.x = sx + ox; e.y = sy + oy;
-  drawOneEntity(ctx, e);
-  e.x = sx; e.y = sy;
+  drawOneEntity(ctx, e, e.x + ox, e.y + oy, true);
 }
 
-function drawOneEntity(ctx, e) {
+// V7: takes explicit (drawX, drawY) so mirror copies don't have to mutate
+// the entity's actual position. `isMirror=true` skips expensive per-call
+// state ops that are visually redundant on a ghost copy (notably the
+// charge-glyph text render which forces a font parse).
+function drawOneEntity(ctx, e, drawX, drawY, isMirror) {
+  if (drawX === undefined) drawX = e.x;
+  if (drawY === undefined) drawY = e.y;
+
   // Absorbing entities fade alpha alongside the physics-driven shrink so they
   // visibly disappear into the black hole. Use elapsedSim directly so we
   // stay correct if the physics lerp curve ever changes (e.g., easing).
@@ -234,10 +248,12 @@ function drawOneEntity(ctx, e) {
     ctx.globalAlpha = Math.max(0, 1 - t);
   }
 
+  const r = Math.max(0, e.radius);
+
   // Body
   ctx.fillStyle = e.color;
   ctx.beginPath();
-  ctx.arc(e.x, e.y, Math.max(0, e.radius), 0, Math.PI * 2);
+  ctx.arc(drawX, drawY, r, 0, Math.PI * 2);
   ctx.fill();
 
   // Edge treatment so black holes remain visible on dark background.
@@ -256,12 +272,14 @@ function drawOneEntity(ctx, e) {
   }
 
   // Charge sign glyph (subtle): a faint +/- in the middle for non-zero charges on planets.
-  if (e.type === 'planet' && e.charge !== 0 && e.radius >= 10) {
+  // Skipped on mirror copies — the primary draw already shows it, and the
+  // ctx.font assignment is a notable per-call cost (font parsing).
+  if (!isMirror && e.type === 'planet' && e.charge !== 0 && r >= 10) {
     ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.font = `${Math.min(e.radius, 18)}px ui-sans-serif`;
+    ctx.font = `${Math.min(r, 18)}px ui-sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(e.charge > 0 ? '+' : '−', e.x, e.y);
+    ctx.fillText(e.charge > 0 ? '+' : '−', drawX, drawY);
   }
 
   // Pinned indicator: a yellow dashed ring just outside the body to signal
@@ -271,7 +289,7 @@ function drawOneEntity(ctx, e) {
     ctx.lineWidth = 1.5;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
-    ctx.arc(e.x, e.y, Math.max(0, e.radius) + 4, 0, Math.PI * 2);
+    ctx.arc(drawX, drawY, r + 4, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
   }
