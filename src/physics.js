@@ -172,6 +172,21 @@ function _pairKey(a, b) {
 // dispatch (forEachCollisionPair in physics-spatial-hash.js).
 let _currentSimDt = 0;
 
+// Refund grace period: when a real collision is detected (preVn ≪ 0),
+// the refund pass (G'') is disabled for the next REFUND_GRACE_FRAMES
+// substeps. Lets the velocity solver's impulse cascade settle the
+// post-collision cluster into stable motion without the refund
+// draining its momentum on intra-cluster sub-pixel corrections.
+//
+// GRACE_TRIGGER_PRE_VN: only pre-kick approach speeds faster than 1
+// px/s trigger the grace. This excludes the 0.0001-0.1 px/s noise
+// floor of statically-placed clusters and slow-orbital warm-up
+// substeps where the contact is geometrically "new" only by
+// bookkeeping (_prevPairs empty on first substep).
+const REFUND_GRACE_FRAMES = 40;             // ~0.33 s at SIM_DT=1/120
+const GRACE_TRIGGER_PRE_VN = -1.0;          // px/s
+let _refundSkipCounter = 0;
+
 // Pre-kick approach-velocity threshold for "this is a real collision,
 // not a kick-induced spurious approach". A few ULPs above zero leaves
 // margin for FP noise without misclassifying truly slow impacts.
@@ -290,6 +305,24 @@ export function stepPBD(entities, dt) {
   // pipeline left the inward velocity component implicit in Δx; here
   // we cancel it explicitly at the velocity level, which is the
   // canonical fix for "stacking under gravity" per Box2D / Catto.
+  //
+  // Detect REAL collisions this substep — pairs with a significant
+  // pre-kick approach velocity (much faster than the gravity kick
+  // could account for). If found, trigger a refund grace period so
+  // the impulse cascade can settle without G'' draining its momentum.
+  //
+  // Uses preVn (not wasPersistent) because wasPersistent's tighter
+  // threshold (-1e-6) classifies sub-mm/s numerical noise as "new
+  // collision" — fine for restitution gating (no-bounce-near-zero)
+  // but would spuriously trigger grace on the first substep of any
+  // statically-placed cluster. -1.0 px/s here cleanly separates
+  // user-shot bullets (preVn ≪ -10) from numerical noise (|preVn| ≪ 0.1).
+  for (let k = 0; k < _contactCount; k++) {
+    if (_contacts[k].preVn < GRACE_TRIGGER_PRE_VN) {
+      _refundSkipCounter = REFUND_GRACE_FRAMES;
+      break;
+    }
+  }
   _solveContactVelocities(_contactCount);
 
   // ── G. Position solver (non-linear Gauss-Seidel) ───────────────
@@ -346,7 +379,27 @@ export function stepPBD(entities, dt) {
   // step C kicked with — physically consistent because it represents
   // the body's effective acceleration (gravity minus implicit
   // constraint absorption).
-  for (let i = 0; i < n; i++) {
+  // Gate: skip refund entirely during a "grace period" after any new
+  // contact. The refund is mathematically right only when gravity
+  // is the dominant non-impulsive force doing work over the substep;
+  // post-collision cluster cascades have velocity-solver impulses
+  // (and their cascade aftermath) as the dominant force, and the
+  // refund's "subtract gravity work over Δx" double-discounts the
+  // cluster's CoM momentum that the impulse installed.
+  //
+  // Per-body Δv-magnitude gating was tried (5 px/s threshold) but
+  // failed: post-cascade individual body |Δv| drops to 0.5-1 px/s
+  // — indistinguishable from the gravity-kick |Δv| of stable configs
+  // — yet the cluster is still in transient settling motion. A
+  // simpler scene-wide grace-frame counter cleanly separates the
+  // two regimes: during the cascade and its settle-down, refund is
+  // off; once the cluster reaches stable motion (~40 substeps =
+  // 0.33 s), refund re-engages on a per-body basis (now finds
+  // Δx_proj ≈ 0 for rigid cluster translation, so naturally
+  // no-ops anyway).
+  if (_refundSkipCounter > 0) {
+    _refundSkipCounter--;
+  } else for (let i = 0; i < n; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
     const dx = e.x - e._sxProj;
@@ -357,17 +410,11 @@ export function stepPBD(entities, dt) {
     const v2 = e.vx * e.vx + e.vy * e.vy;
     const v2New = v2 + 2 * adx;
     if (v2New <= 0) {
-      // Body lacked enough KE to pay for the projection's PE
-      // increase. Stop completely; defensive — for orbital dynamics
-      // this branch never fires.
       e.vx = 0;
       e.vy = 0;
       continue;
     }
     if (v2 < 1e-12) {
-      // Body was effectively at rest before the projection and the
-      // projection gave it some energy. Direction = sign(a·Δx) along
-      // the displacement axis.
       const mag = Math.sqrt(v2New);
       const invDxLen = 1 / Math.sqrt(dx2);
       const sign = adx > 0 ? 1 : -1;
@@ -882,7 +929,7 @@ function processCollisionPair(a, b, dx, dy) {
     }
     let c = _contacts[_contactCount];
     if (!c) {
-      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, wasPersistent: false };
+      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, preVn: 0, wasPersistent: false };
       _contacts[_contactCount] = c;
     }
     const dist = Math.sqrt(dist2);
@@ -915,11 +962,16 @@ function processCollisionPair(a, b, dx, dy) {
     // (post-kick) velocity. For bodies with no acceleration this turn
     // (e.g., charge=0 collision setups), preVn == vnApproach.
     let wasPersistent = _prevPairs.has(_pairKey(a, b));
+    // Always compute preVn — needed by the refund grace gate to
+    // distinguish real impacts (large negative preVn) from contacts
+    // that were "new" only by bookkeeping (e.g., first substep of a
+    // statically-placed cluster where _prevPairs is still empty).
+    const dt = _currentSimDt;
+    const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
+    const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
+    const preVn = preRvx * nx + preRvy * ny;
+    c.preVn = preVn;
     if (!wasPersistent) {
-      const dt = _currentSimDt;
-      const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
-      const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
-      const preVn = preRvx * nx + preRvy * ny;
       // Real approach pre-kick → genuine new collision (wasPersistent stays false).
       // Pre-kick separating or essentially zero → persistent.
       if (preVn > PRE_KICK_APPROACH_THRESHOLD) wasPersistent = true;
