@@ -367,7 +367,16 @@ uniform vec2 uViewport;
 uniform vec4 uEntities[MAX_ENTITIES];
 uniform int uEntityCount;
 uniform float uEpsilon;
-uniform float uContourSpacing;
+// V9.x — logarithmic contour spacing. Rings live at |φ| = threshold·k^n
+// for integer n ∈ [0, NUM_BANDS). This gives small-mass entities a few
+// outer rings (n near 0, low |φ|) and high-mass entities many inner
+// rings (n near NUM_BANDS, high |φ|) regardless of the global mass
+// ratio — so a small body next to a huge one still shows topographic
+// detail. uLogK = ln(k); uContourThreshold is the |φ| at the outermost
+// (n=0) ring. Both set by CPU each frame from the scene's mass extremes;
+// see _drawEquipotential in renderer-webgl.js.
+uniform float uLogK;
+uniform float uContourThreshold;
 uniform float uContourLineW;
 uniform float uDpr;                  // device pixel ratio: 1 CSS-px = DPR fragments
 uniform vec4 uColor;
@@ -399,22 +408,30 @@ void main() {
   // comment — they would terminate the surrounding JS template literal.)
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   float phi = computePhi(p);
-  // Skip blank-field zones (numerically — if everything is zero, no lines).
-  if (uContourSpacing <= 0.0) discard;
-  // Derivative magnitude in screen pixels (dFdx/dFdy step ≈ 1 px each).
+  float absPhi = abs(phi);
+  // Skip far-field (below outermost ring) and degenerate (no field at all).
+  if (absPhi < uContourThreshold) discard;
+  if (uLogK <= 0.0) discard;
+  // Log-spaced ring index: n=0 at outermost ring (|φ|=threshold), grows
+  // toward inner (deep-well) rings. dSteps = distance in step-units to
+  // nearest integer ring. abs(mod(...) - 0.5) gives a triangle wave in
+  // [0, 0.5] peaking at half-step (midway between rings).
+  float n = log(absPhi / uContourThreshold) / uLogK;
+  float halfStep = 0.5;
+  float dSteps = abs(mod(n + halfStep, 1.0) - halfStep);
+  // Gradient magnitude in fragments (dFdx/dFdy step = 1 fragment).
   float gx = dFdx(phi);
   float gy = dFdy(phi);
   float gradMag = sqrt(gx * gx + gy * gy);
   if (gradMag < 1e-6) discard;
-  // Distance from nearest contour line, measured in φ units centered.
-  float half_spacing = uContourSpacing * 0.5;
-  float dPhi = abs(mod(phi + half_spacing, uContourSpacing) - half_spacing);
-  // gradMag is Δφ per fragment (dFdx/dFdy step = 1 fragment). dPhi / gradMag
-  // gives distance in fragments; divide by DPR to get CSS-px so the line
-  // width threshold (uContourLineW, in CSS-px) is correctly compared. At
-  // DPR=1 this collapses to the naive dPhi/gradMag. At HiDPI DPR>1 the
-  // line would otherwise appear DPR× narrower than intended.
-  float dPxFrag = dPhi / gradMag;
+  // Pixel-width of one full log-step: derived from d/dr[ln|φ|] = |∇φ|/|φ|,
+  // so one step (Δlog|φ| = logK) spans pxPerStep = |φ|·logK/|∇φ| fragments.
+  // For a single 1/r body this gives pxPerStep ∝ r — far-field rings are
+  // naturally sparse in screen space, near-body rings tighter. The
+  // logarithmic mapping is what makes light bodies still get visible
+  // outer rings near their weak |φ| neighbourhood.
+  float pxPerStep = absPhi * uLogK / gradMag;
+  float dPxFrag = dSteps * pxPerStep;
   float dPxCss  = dPxFrag / max(uDpr, 1.0);
   float halfW = uContourLineW * 0.5;
   if (dPxCss > halfW + 0.5) discard;

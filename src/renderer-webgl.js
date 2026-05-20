@@ -160,14 +160,17 @@ let _streamlineInstanceData = new Float32Array(0);
 // Wall-clock anchor for the synchronized pulse (ms). Pulse phase derives
 // from (now - _pulseStartMs) % UI_PULSE_PERIOD_MS.
 let _pulseStartMs = 0;
-// V9.x: exponential moving average of the contour band spacing. The
-// (φmax-φmin)/numBands estimate jitters frame-to-frame as entities move
-// — even small shifts make every contour line slide one or two pixels
-// every frame, producing a visible "wobble". Low-pass-filter the spacing
-// with an EMA so it tracks gross changes in ~12 frames (~200 ms at 60Hz)
-// but ignores per-frame noise. Reset to the latest sample when zero
-// (first frame after init or scene clear) so we don't start at zero.
-let _smoothedContourSpacing = 0;
+// V9.x: exponential moving averages for the two log-contour parameters.
+// `uContourThreshold` is the |φ| of the outermost ring (largest visible
+// distance from any emitter); `uLogK` is ln(k) where k is the inter-ring
+// |φ| ratio. Both are recomputed each frame from the scene's mass
+// extremes — without EMA they jitter slightly as entities move (sample
+// points catch slightly different φ peaks frame to frame), sliding every
+// contour line ±1 px. EMA with τ ≈ 12 frames (~200 ms) tracks gross
+// scene changes but smooths per-frame noise. Snap to instant value when
+// zero (first frame / after Clear Sandbox / scene became empty).
+let _smoothedContourThreshold = 0;
+let _smoothedLogK = 0;
 
 // Shader source strings live in src/shaders.js. Each program exports a
 // `{ VS, FS }` pair. See that file for per-program attribute layouts and
@@ -319,15 +322,16 @@ function _initPrograms() {
   _progEquipotential = _makeProgram(EQUIPOTENTIAL.VS, EQUIPOTENTIAL.FS);
   _progStreamline    = _makeProgram(STREAMLINE.VS,    STREAMLINE.FS);
 
-  _progEquipotential.aPos             = gl.getAttribLocation(_progEquipotential.prog, 'aPos');
-  _progEquipotential.uViewport        = gl.getUniformLocation(_progEquipotential.prog, 'uViewport');
-  _progEquipotential.uEntities        = gl.getUniformLocation(_progEquipotential.prog, 'uEntities[0]');
-  _progEquipotential.uEntityCount     = gl.getUniformLocation(_progEquipotential.prog, 'uEntityCount');
-  _progEquipotential.uEpsilon         = gl.getUniformLocation(_progEquipotential.prog, 'uEpsilon');
-  _progEquipotential.uContourSpacing  = gl.getUniformLocation(_progEquipotential.prog, 'uContourSpacing');
-  _progEquipotential.uContourLineW    = gl.getUniformLocation(_progEquipotential.prog, 'uContourLineW');
-  _progEquipotential.uDpr             = gl.getUniformLocation(_progEquipotential.prog, 'uDpr');
-  _progEquipotential.uColor           = gl.getUniformLocation(_progEquipotential.prog, 'uColor');
+  _progEquipotential.aPos              = gl.getAttribLocation(_progEquipotential.prog, 'aPos');
+  _progEquipotential.uViewport         = gl.getUniformLocation(_progEquipotential.prog, 'uViewport');
+  _progEquipotential.uEntities         = gl.getUniformLocation(_progEquipotential.prog, 'uEntities[0]');
+  _progEquipotential.uEntityCount      = gl.getUniformLocation(_progEquipotential.prog, 'uEntityCount');
+  _progEquipotential.uEpsilon          = gl.getUniformLocation(_progEquipotential.prog, 'uEpsilon');
+  _progEquipotential.uLogK             = gl.getUniformLocation(_progEquipotential.prog, 'uLogK');
+  _progEquipotential.uContourThreshold = gl.getUniformLocation(_progEquipotential.prog, 'uContourThreshold');
+  _progEquipotential.uContourLineW     = gl.getUniformLocation(_progEquipotential.prog, 'uContourLineW');
+  _progEquipotential.uDpr              = gl.getUniformLocation(_progEquipotential.prog, 'uDpr');
+  _progEquipotential.uColor            = gl.getUniformLocation(_progEquipotential.prog, 'uColor');
 
   _progStreamline.aCorner       = gl.getAttribLocation(_progStreamline.prog, 'aCorner');
   _progStreamline.iSeed         = gl.getAttribLocation(_progStreamline.prog, 'iSeed');
@@ -740,11 +744,12 @@ function _hslToRgb(h, s, l) {
 // ─── Public: reset trail ──────────────────────────────────────────
 
 export function resetTrailCanvas() {
-  // Also resets the V9.1 contour-spacing EMA. Called from the "Clear
-  // Sandbox" button → if we kept the EMA across a scene clear, the next
-  // (typically smaller) scene would rebuild its contour spacing slowly
-  // over ~12 frames, showing visibly wrong spacing during that ramp.
-  _smoothedContourSpacing = 0;
+  // Also resets the V9.1 contour-EMA state. Called from the "Clear
+  // Sandbox" button → if we kept the EMAs across a scene clear, the next
+  // (typically smaller) scene would rebuild its contour shape slowly
+  // over ~12 frames, showing visibly wrong rings during that ramp.
+  _smoothedContourThreshold = 0;
+  _smoothedLogK = 0;
   if (_disabled || !_gl) return;
   if (!_fboA || !_fboB) return;
   const gl = _gl;
@@ -1356,18 +1361,16 @@ function _drawEquipotential() {
   const gl = _gl;
   // When wrap mode is active, CPU samplers must use the same 9-ghost PBC
   // sum the GPU shader does (via the ghost copies pre-packed into the
-  // uniform array). Otherwise the (φmax-φmin) range we compute here
-  // disagrees with what the shader actually renders, and the contour
-  // spacing falls out of sync at the wrap boundary.
+  // uniform array). Otherwise the φ range we compute here disagrees
+  // with what the shader actually renders.
   const boundary = (state.boundaryMode === 'wrap')
     ? { width: _vpW, height: _vpH }
     : null;
 
-  // Adaptive contour spacing: sample φ at 9 viewport reference points
-  // PLUS each visible entity's position (where φ-extremes always live —
-  // near ε floor depth). Spacing = (φmax − φmin) / numBands puts roughly
-  // numBands visible contour lines across the actual rendered φ-range,
-  // regardless of how strong or weak the dominant entity is.
+  // ─── Stage 1: find φ extremes for threshold ─────────────────────
+  // Sample at viewport reference points + each visible entity center.
+  // The deepest extremes (= largest |φ|) live at entity centers due to
+  // Plummer softening: |φ_max_at_body| = G·|q·m|/ε.
   let phiMin = +Infinity;
   let phiMax = -Infinity;
   for (let i = 0; i < _PHI_SAMPLE_FRACS.length; i++) {
@@ -1377,8 +1380,6 @@ function _drawEquipotential() {
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
-  // Sample at each VISIBLE entity (use state.entities, not the packed
-  // ghost array) so the deepest wells / highest peaks of φ are caught.
   for (let i = 0; i < state.entities.length; i++) {
     const e = state.entities[i];
     if (e.absorbing) continue;
@@ -1387,23 +1388,58 @@ function _drawEquipotential() {
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
-  const phiRange = phiMax - phiMin;
-  // If all samples collapse to the same value (no field variation visible),
-  // skip the pass entirely — there's nothing to draw.
-  if (!isFinite(phiRange) || phiRange <= 1e-6) return;
-  const instantSpacing = phiRange / UI_CONTOUR_NUM_BANDS;
-  // EMA-smooth the spacing across frames to eliminate per-frame jitter.
-  // α=0.08 gives a 1/α ≈ 12-frame time constant (≈ 200ms at 60Hz). The
-  // first frame after init / a long pause snaps to the instant value to
-  // avoid a slow ramp-up from zero.
-  if (_smoothedContourSpacing <= 1e-6) {
-    _smoothedContourSpacing = instantSpacing;
-  } else {
-    _smoothedContourSpacing = 0.92 * _smoothedContourSpacing + 0.08 * instantSpacing;
-  }
-  const spacing = _smoothedContourSpacing;
+  const phiTop = Math.max(Math.abs(phiMin), Math.abs(phiMax));
+  if (!isFinite(phiTop) || phiTop <= 1e-6) return;
 
-  // Theme-aware contour color: light gray on dark bg, dark gray on light bg.
+  // ─── Stage 2: adaptive k from mass extremes ─────────────────────
+  // k = ratio of |φ| between adjacent rings. Adaptive so that the
+  // lightest emitter still gets RINGS_FOR_LIGHTEST visible rings AND
+  // the heaviest gets NUM_BANDS - RINGS_FOR_LIGHTEST rings:
+  //   k = (m_max / m_min)^(1 / (NUM_BANDS - RINGS_FOR_LIGHTEST))
+  // When all emitters have similar |q·m|, default to a √2 ratio so
+  // we get a familiar topographic feel without quirky aliasing.
+  let qmMax = 0;
+  let qmMin = Infinity;
+  for (let i = 0; i < state.entities.length; i++) {
+    const e = state.entities[i];
+    if (e.absorbing) continue;
+    const qm = Math.abs(e.charge * e.mass);
+    if (qm <= 0) continue;
+    if (qm > qmMax) qmMax = qm;
+    if (qm < qmMin) qmMin = qm;
+  }
+  const RINGS_FOR_LIGHTEST = 3;
+  const ratio = (qmMax > 0 && qmMin > 0 && qmMin < qmMax) ? qmMax / qmMin : 1;
+  let k;
+  if (ratio < 2) {
+    k = Math.SQRT2;     // ≈ 1.414 — pleasant default for ~uniform masses
+  } else {
+    const exponent = 1 / Math.max(1, UI_CONTOUR_NUM_BANDS - RINGS_FOR_LIGHTEST);
+    k = Math.pow(ratio, exponent);
+  }
+  // Clamp to a sane visual range (avoids k → 1 which would make rings
+  // collapse onto each other, and k → ∞ which would put adjacent rings
+  // factor-of-10 apart and skip masses entirely).
+  k = Math.max(1.2, Math.min(2.5, k));
+
+  // ─── Stage 3: threshold (outermost ring's |φ|) ──────────────────
+  // Rings live at |φ| = threshold · k^n for n = 0..NUM_BANDS-1.
+  // Outermost ring (n=0) at threshold; innermost (n=NUM_BANDS-1) at
+  // threshold·k^(NUM_BANDS-1). We want the innermost to reach phiTop,
+  // so threshold = phiTop / k^(NUM_BANDS-1).
+  const instantThreshold = phiTop / Math.pow(k, UI_CONTOUR_NUM_BANDS - 1);
+  const instantLogK = Math.log(k);
+
+  // ─── Stage 4: EMA-smooth threshold and logK ─────────────────────
+  if (_smoothedContourThreshold <= 1e-9) {
+    _smoothedContourThreshold = instantThreshold;
+    _smoothedLogK = instantLogK;
+  } else {
+    _smoothedContourThreshold = 0.92 * _smoothedContourThreshold + 0.08 * instantThreshold;
+    _smoothedLogK             = 0.92 * _smoothedLogK             + 0.08 * instantLogK;
+  }
+
+  // ─── Stage 5: theme-aware color ─────────────────────────────────
   const bgRgb = _colorToRgbNorm(state.bgColor);
   const bgIsLight = (bgRgb[0] + bgRgb[1] + bgRgb[2]) > 1.5;
   const cR = bgIsLight ? 0.16 : 0.86;
@@ -1411,17 +1447,14 @@ function _drawEquipotential() {
   const cB = bgIsLight ? 0.20 : 0.90;
   const cA = bgIsLight ? 0.45 : 0.35;
 
+  // ─── Stage 6: draw ──────────────────────────────────────────────
   gl.useProgram(_progEquipotential.prog);
   gl.uniform2f(_progEquipotential.uViewport, _vpW, _vpH);
-  // _fieldEntityData is preallocated to MAX_FIELD_ENTITIES * 4 floats. We
-  // could pass a subarray of just `_fieldEntityCount * 4` here, but the GLSL
-  // `if (i >= uEntityCount) break;` stops reads at uEntityCount, so the
-  // tail bytes are inert. Uploading the full buffer is one less subarray
-  // allocation per frame and the bandwidth (~2 KB) is negligible.
   gl.uniform4fv(_progEquipotential.uEntities, _fieldEntityData);
   gl.uniform1i(_progEquipotential.uEntityCount, _fieldEntityCount);
   gl.uniform1f(_progEquipotential.uEpsilon, state.epsilon);
-  gl.uniform1f(_progEquipotential.uContourSpacing, spacing);
+  gl.uniform1f(_progEquipotential.uLogK, _smoothedLogK);
+  gl.uniform1f(_progEquipotential.uContourThreshold, _smoothedContourThreshold);
   gl.uniform1f(_progEquipotential.uContourLineW, UI_CONTOUR_LINE_W_PX);
   gl.uniform1f(_progEquipotential.uDpr, _dpr);
   gl.uniform4f(_progEquipotential.uColor, cR, cG, cB, cA);
