@@ -224,11 +224,15 @@ in float vDashPeriod;
 out vec4 outColor;
 void main() {
   float d = length(vLocal);
-  float half = vLineW * 0.5;
+  // NOTE: do NOT name this variable 'half' — that is a GLSL ES 3.00
+  // reserved word (future-use for half-precision floats) and shaders
+  // fail to compile. Likewise, no backticks in shader comments either —
+  // they would terminate the surrounding JS template literal.
+  float halfW = vLineW * 0.5;
   float distToRing = abs(d - vRadius);
-  if (distToRing > half + 0.5) discard;
+  if (distToRing > halfW + 0.5) discard;
   // 1-px AA ramp on each edge of the ring.
-  float a = (distToRing <= half - 0.5) ? 1.0 : (half + 0.5 - distToRing);
+  float a = (distToRing <= halfW - 0.5) ? 1.0 : (halfW + 0.5 - distToRing);
   if (vDashPeriod > 0.0) {
     // Arc-length measured from the +X axis (3 o'clock), increasing in the
     // direction atan2 grows (clockwise in screen space since Y is flipped
@@ -301,10 +305,11 @@ in float vDashOn;
 in float vDashPeriod;
 out vec4 outColor;
 void main() {
-  float half = vLineW * 0.5;
+  // 'half' is a GLSL ES 3.00 reserved word — use halfW. See FS_CIRCLE_RING above.
+  float halfW = vLineW * 0.5;
   float absT = abs(vT);
-  if (absT > half + 0.5) discard;
-  float a = (absT <= half - 0.5) ? 1.0 : (half + 0.5 - absT);
+  if (absT > halfW + 0.5) discard;
+  float a = (absT <= halfW - 0.5) ? 1.0 : (halfW + 0.5 - absT);
   if (vDashPeriod > 0.0) {
     float phase = mod(vArc, vDashPeriod);
     if (phase >= vDashOn) discard;
@@ -383,10 +388,11 @@ float computePhi(vec2 p) {
 }
 
 void main() {
-  // vUv comes from VS_FULLSCREEN's `aPos * 0.5 + 0.5`. aPos is in NDC where
+  // vUv comes from VS_FULLSCREEN's aPos*0.5+0.5 mapping. aPos is in NDC where
   // the default framebuffer has y=+1 at the top. CSS-px entity coords have
-  // y=0 at the top instead. Flip vUv.y so `p` is in the same CSS-px space
-  // the entity positions were uploaded in.
+  // y=0 at the top instead. Flip vUv.y so p below is in the same CSS-px
+  // space the entity positions were uploaded in. (No backticks in this
+  // comment — they would terminate the surrounding JS template literal.)
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   float phi = computePhi(p);
   // Skip blank-field zones (numerically — if everything is zero, no lines).
