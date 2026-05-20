@@ -26,7 +26,6 @@ import {
 } from './renderer-webgl.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
-import { maybeLogEnergy } from './debug-energy.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
@@ -103,7 +102,6 @@ function frame(now) {
   drawUI();
 
   updateEntityCount();
-  maybeLogEnergy();   // diagnostic — no-op unless state.__debugEnergy is true
   requestAnimationFrame(frame);
 }
 

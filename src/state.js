@@ -100,14 +100,6 @@ export const DEFAULTS = Object.freeze({
   timeScale: 1,
 });
 
-export const LIMITS = Object.freeze({
-  mass:   { min: 1,   max: 1000 },
-  // radius slider is a ratio: 0.1 = tiny (1 px), 10 = huge (100 px).
-  radius: { min: 0.1, max: 10 },
-  trail:  { min: 0,   max: 500 },
-  time:   { min: 0,   max: 3 },
-});
-
 // ─── Live state ───────────────────────────────────────────────────
 // `entities` is the live list of bodies in the simulation.
 // `nextId` provides stable identity across re-renders/selection.

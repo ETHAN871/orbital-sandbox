@@ -133,7 +133,7 @@ const _scratch = [];   // reused acceleration accumulator
 
 // ─── PBD contact list (Build Step 2+) ─────────────────────────────
 // Filled per-substep by processCollisionPair as it walks the broadphase.
-// Read back by _projectPBDContacts inside stepPBD. Reset at the top of
+// Read back by _solvePositionConstraints inside stepPBD. Reset at the top of
 // every handleCollisions call so a substep never sees stale entries from
 // the previous frame. Pre-allocated to a generous capacity for the
 // typical N ≤ 50 scene; grown if a larger cluster appears.
@@ -260,7 +260,7 @@ export function stepPBD(entities, dt) {
     const ay = _scratch[i].ay;
     e.vx += ax * dt;
     e.vy += ay * dt;
-    // Cache a for downstream readers (debug-energy.js, prediction tooling).
+    // Cache a for downstream readers (prediction tooling).
     e.ax = ax;
     e.ay = ay;
   }
@@ -500,14 +500,13 @@ function _solveContactVelocities(count) {
 // (vnApproach captured at detection sampled a sub-pixel radial component
 // of tangential motion) and stripped real radial velocity needed for
 // curved trajectories. Both responsibilities are now subsumed by
-// `_solveContactVelocities`, which uses iterative impulses and skips
-// persistent contacts via the same COLLISION_THRESHOLD_VN gate.)
+// `_solveContactVelocities`, which uses iterative impulses and the
+// `PRE_KICK_APPROACH_THRESHOLD`-gated `wasPersistent` flag to skip
+// restitution on resting contacts.)
 
 // (Legacy `stepVerlet` removed by the PBD refactor — its position+velocity
 // pipeline is incompatible with the contact-constraint energy semantics
-// PBD enforces. `stepPBD` above is the production step. The Plummer
-// softening + asymmetric force-law internal call sites have been
-// updated to reference stepPBD instead.)
+// PBD enforces. `stepPBD` above is the production step.)
 
 // ─── Collisions ───────────────────────────────────────────────────
 // Two paths depending on the pair's types:
@@ -549,7 +548,7 @@ function processCollisionPair(a, b, dx, dy) {
     beginAbsorption(prey, predator);
   } else {
     // PBD refactor: planet-planet contacts are accumulated here and
-    // resolved later by _projectPBDContacts inside stepPBD. The dx/dy
+    // resolved later by _solvePositionConstraints inside stepPBD. The dx/dy
     // passed in are already wrap-corrected (handleCollisions's broadphase
     // applies the wrap delta), so we capture the contact normal n̂ at
     // detection time. Projection iterations then advance positions along
@@ -625,7 +624,7 @@ export function handleCollisions(entities) {
 
   // PBD refactor: clear the contact list before this substep's broadphase
   // walk. processCollisionPair will push planet-planet pairs onto it.
-  // _projectPBDContacts (run later inside stepPBD) drains it.
+  // _solvePositionConstraints (run later inside stepPBD) drains it.
   _contactCount = 0;
 
   // V8.2: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
@@ -661,8 +660,10 @@ export function handleCollisions(entities) {
         if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
         if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
       }
-      // V8.2: dispatch through shared helper so both N<64 and N≥64 paths
-      // run identical collision/absorption logic.
+      // V8.2: dispatch through shared helper so both small-N (direct) and
+      // large-N (spatial-hash) paths run identical collision logic. The
+      // dispatch boundary is state.bhThreshold (default 256 — see state.js
+      // for the rationale and how to tune).
       processCollisionPair(a, b, dx, dy);
     }
   }
@@ -708,7 +709,7 @@ function beginAbsorption(prey, predator) {
 }
 
 // (Legacy `resolveElasticCollision` removed by the PBD refactor. Position
-// correction is now handled by _projectPBDContacts; restitution is
+// correction is now handled by _solvePositionConstraints; restitution is
 // handled by _solveContactVelocities (the Sequential-Impulses velocity
 // solver). The legacy function's single-pass impulse approach was
 // incompatible with multi-body contact aggregates because it leaked

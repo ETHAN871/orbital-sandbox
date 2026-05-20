@@ -1,8 +1,7 @@
-// renderer-webgl.js — V9.0b WebGL 2 renderer (full pipeline).
+// renderer-webgl.js — WebGL 2 renderer (full pipeline).
 //
-// V9.0b is the final state of the "all rendering on GPU" migration. The
-// Canvas2D overlay (`#overlay` canvas + renderer.js) is gone; every visible
-// pixel is produced by a WebGL 2 shader.
+// Every visible pixel is produced by a WebGL 2 shader. (A previous Canvas2D
+// overlay path was retired; this is the only renderer.)
 //
 // Layer order (back to front):
 //   1. clear with state.bgColor                              (drawScene)
@@ -986,13 +985,13 @@ function _drawEntities() {
 // state.selectedId / absorbing entities, then issues one instanced draw per
 // shader program (or zero if a program has no work this frame).
 
-// Visual constants (matched to V8.1c values to keep visuals identical across the migration).
+// Visual constants — dash lengths / alpha / ring color for the UI overlay.
 const UI_SELECT_RING_COLOR = [0x6b / 255, 0x8c / 255, 0xff / 255]; // #6b8cff
 const UI_GHOST_FILL_ALPHA = 0.18;
 const UI_PREDICTION_BATCHES = 8;
-const UI_PREDICTION_DASH_ON = 6;     // px (V8.1c [6, 6])
+const UI_PREDICTION_DASH_ON = 6;     // px
 const UI_PREDICTION_DASH_OFF = 6;
-const UI_RUBBER_BAND_DASH_ON = 5;    // px (V8.1c [5, 4])
+const UI_RUBBER_BAND_DASH_ON = 5;    // px
 const UI_RUBBER_BAND_DASH_OFF = 4;
 const UI_HOVER_DASH_ON = 3;          // px (V8.1c [3, 3])
 const UI_HOVER_DASH_OFF = 3;
