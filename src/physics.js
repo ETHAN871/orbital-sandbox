@@ -141,17 +141,25 @@ const PBD_ITERATIONS = 4;
 let _contacts = new Array(256);
 let _contactCount = 0;
 
-// Contact-persistence tracking. A pair is "persistent" if EITHER it
-// was a contact last substep OR its PRE-KICK relative normal velocity
-// is essentially zero (orbital tangential motion / resting). Persistent
-// contacts skip restitution bounce; "new" contacts (genuine impact at
-// non-zero approach speed) get the standard -e·vnApproach treatment.
+// Contact persistence + warm-start data.
 //
-// Sprint 2 of the Box2D refactor will REPLACE this Set with a
-// Map<pairKey, normalImpulse> for warm-starting the velocity solver
-// across substeps. For now keep the Set; only `.has()` semantics are
-// used downstream.
-const _prevPairs = new Set();
+// _prevPairImpulses: Map<pairKey, {j, nx, ny}> — the previous
+// substep's converged normal impulse for each pair, plus the normal
+// direction it was applied along. Used to:
+//   (1) Detect persistent contacts (Map.has(key) → wasPersistent=true,
+//       which suppresses restitution bounce on resting contacts).
+//   (2) Warm-start the SI velocity solver: seed each contact's
+//       `c.normalImpulse` with the previous substep's value so the
+//       solver converges in 1-2 iterations rather than 8+ on stacks.
+//
+// Storing the normal direction alongside the impulse magnitude lets
+// us detect wrap-boundary sign flips. If applyBoundary teleported a
+// body across an edge between substeps, the freshly-computed normal
+// may point opposite to the stored one — warm-starting with that
+// reversed direction would inject a spurious impulse. The
+// processCollisionPair guard does a dot-product sign check and
+// discards stale warm-start data when the normal flipped.
+const _prevPairImpulses = new Map();
 function _pairKey(a, b) {
   // Symmetric key — order of arguments doesn't matter.
   const aId = a.id, bId = b.id;
@@ -267,11 +275,14 @@ export function stepPBD(entities, dt) {
   // planet-planet pairs → push onto _contacts[] with warm-start lookup.
   handleCollisions(entities);
 
-  // ── F. Sequential-Impulses velocity solver ─────────────────────
-  // (Sprint 1: 4 iter, no warm-starting. Sprint 2 will upgrade to
-  // 8 iter + accumulated impulse clamp + warm-start from _prevPairs
-  // turned into _prevPairImpulses Map.)
+  // ── F. Sequential-Impulses velocity solver (Box2D-style) ───────
+  // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
+  // clamp ≥ 0. Convergence on resting/stacked contacts comes from
+  // the previous substep's seeded normalImpulse.
   _solveContactVelocities(_contactCount);
+
+  // ── F'. Persist this substep's impulses for next substep's warm-start
+  _rebuildPrevPairImpulses();
 
   // ── G. Position projection ─────────────────────────────────────
   // (Sprint 1: still the direct PBD positional correction. Sprint 3
@@ -341,18 +352,26 @@ function _projectPBDContacts(count) {
   }
 }
 
-// ─── Velocity solver (Sequential Impulses, pre-Box2D baseline) ────
+// ─── Velocity solver (Box2D-style Sequential Impulses) ────────────
 // Drives each contact's relative normal velocity to its target:
 //   • persistent contact (c.wasPersistent) → 0 (no bounce on resting)
 //   • new collision → -e · c.vnApproach (true restitution)
 //
-// This is the 4-iter Gauss-Seidel WITHOUT warm-starting or
-// accumulated-impulse clamping — the standard Box2D additions are
-// planned for the next refactor sprint and will replace this body.
-// For now keep as-is; the next sprint upgrades iteration count to 8
-// and adds the c.normalImpulse accumulation with [0, +∞) clamp plus a
-// pre-iteration warm-start pass from _prevPairImpulses.
-const VELOCITY_ITERATIONS = 4;
+// Box2D additions vs the previous 4-iter PBD-style solver:
+//   (1) Warm-starting: each contact starts the substep with its
+//       previous substep's converged normal impulse already applied
+//       to bodies' velocities. Saves 4-6 iterations of convergence
+//       work on resting / stable orbital contacts.
+//   (2) Accumulated impulse clamping: the running c.normalImpulse
+//       is clamped to [0, +∞) (contacts can only push apart, not
+//       pull together). Each iteration computes a Δλ = newλ − oldλ
+//       and applies that increment, not the raw λ.
+//   (3) 8 iterations (vs 4) — Catto's default for Box2D 2.x,
+//       sufficient for typical N ≤ 50 stacks.
+//
+// Reference: Catto's GDC 2006 "Fast and Simple Physics using
+// Sequential Impulses"; Planck.js's b2ContactSolver::SolveVelocityConstraints.
+const VELOCITY_ITERATIONS = 8;
 
 function _solveContactVelocities(count) {
   if (count === 0) return;
@@ -361,12 +380,36 @@ function _solveContactVelocities(count) {
   const W = wrap ? state.viewport.width : 0;
   const H = wrap ? state.viewport.height : 0;
   const halfW = W * 0.5, halfH = H * 0.5;
+
+  // ── Warm-start pass ────────────────────────────────────────────
+  // Apply each contact's carried-over impulse (set by
+  // processCollisionPair from _prevPairImpulses) to body velocities
+  // BEFORE the iteration loop. Uses the stored c.nx,c.ny normal —
+  // sign-flip protection was already applied at lookup time, so this
+  // is safe even across wrap-boundary teleports.
+  for (let k = 0; k < count; k++) {
+    const c = _contacts[k];
+    if (c.normalImpulse <= 0) continue;
+    const a = c.a, b = c.b;
+    if (a.absorbing || b.absorbing) { c.normalImpulse = 0; continue; }
+    const wA = a.pinned ? 0 : 1 / a.mass;
+    const wB = b.pinned ? 0 : 1 / b.mass;
+    const j = c.normalImpulse;
+    a.vx -= j * c.nx * wA;
+    a.vy -= j * c.ny * wA;
+    b.vx += j * c.nx * wB;
+    b.vy += j * c.ny * wB;
+  }
+
+  // ── 8 Gauss-Seidel iterations with accumulated-impulse clamp ──
   for (let iter = 0; iter < VELOCITY_ITERATIONS; iter++) {
     for (let k = 0; k < count; k++) {
       const c = _contacts[k];
-      const a = c.a;
-      const b = c.b;
+      const a = c.a, b = c.b;
       if (a.absorbing || b.absorbing) continue;
+      // Recompute normal from current positions (wrap-aware) so the
+      // Jacobian matches the body's current geometry, not the stored
+      // detection-time normal.
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
@@ -381,16 +424,25 @@ function _solveContactVelocities(count) {
       const rvy = b.vy - a.vy;
       const vn = rvx * nx + rvy * ny;
       const vnTarget = c.wasPersistent ? 0 : -e * c.vnApproach;
-      if (vn >= vnTarget) continue;
       const wA = a.pinned ? 0 : 1 / a.mass;
       const wB = b.pinned ? 0 : 1 / b.mass;
       const wSum = wA + wB;
       if (wSum === 0) continue;
-      const J = (vnTarget - vn) / wSum;
-      a.vx -= J * nx * wA;
-      a.vy -= J * ny * wA;
-      b.vx += J * nx * wB;
-      b.vy += J * ny * wB;
+      // Accumulated-impulse clamp (the key Box2D trick): the total
+      // c.normalImpulse must be ≥ 0 (push-only constraint). Each iter
+      // computes a desired increment lambdaDesired = (target − vn)/wSum,
+      // tentatively adds it to c.normalImpulse, clamps the SUM, then
+      // applies only the actual difference dLambda to velocities.
+      const lambdaDesired = (vnTarget - vn) / wSum;
+      const oldImpulse = c.normalImpulse;
+      const newImpulse = oldImpulse + lambdaDesired > 0 ? oldImpulse + lambdaDesired : 0;
+      const dLambda = newImpulse - oldImpulse;
+      if (dLambda === 0) continue;
+      c.normalImpulse = newImpulse;
+      a.vx -= dLambda * nx * wA;
+      a.vy -= dLambda * ny * wA;
+      b.vx += dLambda * nx * wB;
+      b.vy += dLambda * ny * wB;
     }
   }
 }
@@ -486,15 +538,17 @@ function processCollisionPair(a, b, dx, dy) {
     const rvx = b.vx - a.vx;
     const rvy = b.vy - a.vy;
     c.vnApproach = rvx * nx + rvy * ny;     // negative = approaching
-    // Persistent contact (skip restitution bounce) iff:
-    //   (i)  pair was in _prevPairs (warm-start) OR
-    //   (ii) PRE-KICK relative normal velocity is essentially zero
-    //        (resting / orbital — captured vnApproach is purely
-    //        kick-induced and shouldn't bounce).
-    // Recover pre-kick v_rel by subtracting a·dt from the post-kick
-    // velocities. For charge=0 bodies (no kick), preVn == vnApproach.
-    let wasPersistent = _prevPairs.has(_pairKey(a, b));
+    // Warm-start lookup + persistence detection.
+    const key = _pairKey(a, b);
+    const prev = _prevPairImpulses.get(key);
+    let wasPersistent = prev !== undefined;
     if (!wasPersistent) {
+      // Pair wasn't in last substep's contact list, but it might still
+      // be a "resting contact that was just brought into existence by
+      // the kick". Use the PRE-KICK relative normal velocity as the
+      // discriminator: if the bodies weren't approaching pre-kick, the
+      // contact is geometrically persistent (the kick just pushed them
+      // together in this substep's predict), not a fresh impact.
       const dt = _currentSimDt;
       const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
       const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
@@ -502,10 +556,18 @@ function processCollisionPair(a, b, dx, dy) {
       if (preVn > PRE_KICK_APPROACH_THRESHOLD) wasPersistent = true;
     }
     c.wasPersistent = wasPersistent;
-    // Sprint 2 of the Box2D refactor will look up the previous
-    // substep's c.normalImpulse here (warm-start). For now reset to
-    // 0 — the velocity solver doesn't accumulate across substeps yet.
-    c.normalImpulse = 0;
+    // Warm-start the velocity solver's accumulated impulse from the
+    // previous substep — but ONLY if the normal direction hasn't flipped
+    // (wrap-boundary teleport case). A negative dot product of the
+    // stored normal with the fresh one means the pair geometry rotated
+    // ~180°: stale warm-start would push in the wrong direction. In
+    // that case discard the carryover and start fresh.
+    if (prev !== undefined) {
+      const sameSide = prev.nx * nx + prev.ny * ny;
+      c.normalImpulse = (sameSide >= 0) ? prev.j : 0;
+    } else {
+      c.normalImpulse = 0;
+    }
     _contactCount++;
   }
 }
@@ -523,7 +585,6 @@ export function handleCollisions(entities) {
   // iterates the already-built buckets.
   if (n >= state.bhThreshold) {
     forEachCollisionPair(entities, processCollisionPair);
-    _rebuildPrevPairs();
     return;
   }
 
@@ -557,18 +618,26 @@ export function handleCollisions(entities) {
       processCollisionPair(a, b, dx, dy);
     }
   }
-  _rebuildPrevPairs();
 }
 
-// Rebuild _prevPairs from the just-populated _contacts. Called at the
-// end of handleCollisions so the next substep's processCollisionPair
-// sees a Set containing THIS substep's pairs — those become "previous"
-// from the next substep's perspective.
-function _rebuildPrevPairs() {
-  _prevPairs.clear();
+// Rebuild _prevPairImpulses from the just-populated _contacts AFTER
+// the velocity solver has converged for this substep. Called from
+// stepPBD (not handleCollisions, because handleCollisions runs BEFORE
+// the solver; we need post-solver impulse values).
+//
+// Keys with c.normalImpulse ≤ 0 are skipped to prevent unbounded Map
+// growth from transient brushing contacts that didn't accumulate
+// meaningful impulse. Normal direction is stored alongside the
+// magnitude for wrap-boundary sign-flip detection in next substep's
+// processCollisionPair.
+function _rebuildPrevPairImpulses() {
+  _prevPairImpulses.clear();
   for (let k = 0; k < _contactCount; k++) {
     const c = _contacts[k];
-    _prevPairs.add(_pairKey(c.a, c.b));
+    if (c.normalImpulse <= 0) continue;
+    _prevPairImpulses.set(_pairKey(c.a, c.b), {
+      j: c.normalImpulse, nx: c.nx, ny: c.ny,
+    });
   }
 }
 
