@@ -322,30 +322,41 @@ void main() {
 // Two programs, both gated by `state.showField` so they incur zero GPU
 // cost when the field overlay is hidden.
 
-// --- Equipotential contour lines ----------------------------------
+// --- Equipotential contour lines (V9.x: log-spaced) ---------------
 // Fragment shader sums φ = Σ_i -G·q·m / sqrt(r² + ε²) per pixel over up to
 // MAX_ENTITIES uniform-array entries (pre-multiplied G·q·m packed into
 // entity.z by the caller so the shader only carries one float multiply
-// per entity per pixel). Contour lines are derived via a derivative-aware
-// mask: `dPx = |mod(φ - spacing/2, spacing) - spacing/2| / |∇φ|`. Where
-// `dPx ≤ lineWidth/2 + 0.5` the pixel is on a contour line; an additional
-// 1-px AA ramp on the outer edge keeps the line crisp at all scales.
-// The derivative `|∇φ|` rises sharply near masses, which is exactly why
-// the contours crowd there (matching real topographic-map intuition: more
-// lines per unit distance == steeper gradient).
+// per entity per pixel).
+//
+// Contour lines are placed at |φ| = uContourThreshold · k^n for integer
+// n ∈ [0, NUM_BANDS). k = exp(uLogK) is set per frame by the CPU from
+// the scene's mass extremes so the lightest emitter still shows ≥3 outer
+// rings and the heaviest gets the full ring set — regardless of how
+// dominant any single mass is.
+//
+// Pixel-distance to nearest ring derives the line mask from a derivative
+// of log|φ| against frame-space, scaled to CSS pixels by uDpr:
+//   n = log(|φ|/threshold) / log(k)
+//   dSteps = |mod(n + 0.5, 1) - 0.5|             # distance to nearest integer
+//   pxPerStep = |φ| · log(k) / |∇φ|              # fragments per unit n
+//   dPxCss = dSteps · pxPerStep / uDpr           # CSS-px from contour
+// For a 1/r isolated body this gives pxPerStep ∝ r — rings naturally
+// space out linearly with distance, matching topographic-map intuition
+// (steeper gradient → tighter rings).
 //
 // Per-instance: none (one fullscreen quad).
 // Per-vertex: aPos (NDC), shared with VS_FULLSCREEN.
 // Uniforms:
-//   uViewport      vec2  CSS-px viewport (W, H) for vUv → world conversion
-//   uEntities      vec4[MAX_ENTITIES]  per-entity (x, y, G·q·m, _unused_)
-//   uEntityCount   int   real count (≤ MAX_ENTITIES); loop early-exit
-//   uEpsilon       float softening floor for r
-//   uContourSpacing float  Δφ between adjacent contour lines (set by CPU
-//                          to (φmax - φmin) / numBands each frame)
-//   uContourLineW  float target line width in px (typically 1.0)
-//   uColor         vec4  contour color (theme-dependent: light gray on
-//                        dark bg, dark gray on light bg)
+//   uViewport         vec2  CSS-px viewport (W, H) for vUv → world conversion
+//   uEntities         vec4[MAX_ENTITIES]  per-entity (x, y, G·q·m, _unused_)
+//   uEntityCount      int   real count (≤ MAX_ENTITIES); loop early-exit
+//   uEpsilon          float softening length for Plummer
+//   uLogK             float ln(k); k = inter-ring |φ| ratio (per-frame)
+//   uContourThreshold float |φ| at the outermost (n=0) ring (per-frame)
+//   uContourLineW     float target line width in CSS-px (typically 1.0)
+//   uDpr              float device pixel ratio for CSS-px line scaling
+//   uColor            vec4  contour color (theme-dependent: light on
+//                           dark bg, dark on light bg)
 //
 // MAX_ENTITIES = 128 sits well under the WebGL 2 minimum-spec
 // MAX_FRAGMENT_UNIFORM_VECTORS = 224; with one vec4 per entity that's
