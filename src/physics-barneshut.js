@@ -19,6 +19,25 @@
 // that's fine, it's still the right far-field monopole moment for our force
 // rule (a_on_target = q_source · G · m_source / r²). The signed sum produces
 // the correct net far-field force.
+//
+// ⚠ Known limitation — Newton's 3rd law NOT exactly conserved (2026-05-20):
+//   This is a per-target traversal: for every body, we walk the tree and
+//   accumulate the force IT receives. There is no pairwise accounting. So
+//   for any pair (A, B), the force A reads off the tree (treating B's
+//   subtree as a monopole at one distance) is not guaranteed to be the
+//   equal-and-opposite of what B reads off the tree from A's subtree (at
+//   a different distance, possibly through a different subdivision level).
+//   The asymmetric residual accumulates as a spurious net force on each
+//   cluster's CoM. On dense wrap-spanning clusters the 9-ghost PBC sum
+//   amplifies the artifact 9× because the residual does not cancel across
+//   image copies. Empirically: ~2.4 px/sec drift on a 143-body hex cluster
+//   at G=80 in wrap mode (direction biased by the cluster's neighbor
+//   adjacency geometry — flat-top hex biases Y; other packings bias
+//   elsewhere). Direct O(N²) summation (the small-N path in physics.js)
+//   has no such residual — every pair contributes a single equal-and-
+//   opposite force. We mitigate by raising state.bhThreshold default to
+//   256 so most user scenes use the exact path; large simulations accept
+//   the trade-off.
 
 import { quadtree } from 'd3-quadtree';
 import { state } from './state.js';

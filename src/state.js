@@ -25,7 +25,25 @@ export const DEFAULTS_TUNING = Object.freeze({
   launchSpeedK: 0.7,           // Drag-vector → initial-velocity multiplier.
   absorptionDuration: 0.3,     // Black-hole devour animation length (sec sim).
   elasticRestitution: 0.3,     // 0=inelastic, 1=fully elastic.
-  bhThreshold: 64,             // N≥ this → Barnes-Hut, else direct O(N²).
+  // bhThreshold: N≥ this → Barnes-Hut monopole approximation; else direct
+  // O(N²) summation. Direct exactly satisfies Newton's 3rd law under the
+  // asymmetric charge force model and conserves cluster CoM. BH's per-body
+  // tree traversal computes an *approximate* force on each body — the
+  // approximation errors are asymmetric (no pairwise accounting: A and B
+  // can both interact with the same cluster C but at different distances
+  // to C's CoM, so the force A receives is not the equal-and-opposite of
+  // the force C's bodies would receive back from A). The residual
+  // accumulates as a spurious net force on the cluster CoM, visible as
+  // slow drift on dense clusters — wrap mode amplifies the artifact via
+  // the 9-ghost PBC sum, and the drift direction depends on cluster
+  // geometry (a flat-top hex grid happens to bias toward Y because more
+  // neighbor pairs share Y-aligned normals; a different packing has a
+  // different bias). Default raised from 64 → 256 (2026-05-20) so typical
+  // user clusters use the exact path. Lowering this slider re-enables the
+  // BH gravity approximation (and its momentum-leak artifact) AND the
+  // spatial-hash collision broadphase (which is correct, but coupled to
+  // the same switch); only the gravity side has the documented drift.
+  bhThreshold: 256,
 });
 
 // Slider semantics: the time-scale and radius sliders display *ratios* — the
