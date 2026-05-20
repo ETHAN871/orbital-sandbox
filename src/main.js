@@ -15,7 +15,7 @@
 //     intercept them).
 
 import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
-import { stepVerlet, handleCollisions, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
+import { stepPBD, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
 import {
   initWebGL,
   drawScene as drawSceneGL,
@@ -26,6 +26,7 @@ import {
 } from './renderer-webgl.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
+import { maybeLogEnergy } from './debug-energy.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
@@ -67,8 +68,10 @@ function frame(now) {
   accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
   let steps = 0;
   while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
-    stepVerlet(state.entities, SIM_DT);
-    handleCollisions(state.entities);
+    // PBD: stepPBD now bundles broadphase (handleCollisions) inside its
+    // pipeline so contact detection happens at predicted positions, not
+    // at pre-step ones. main.js only sequences the higher-level phases.
+    stepPBD(state.entities, SIM_DT);
     updateAbsorptions(state.entities, SIM_DT);
     applyBoundary(state.entities, state.viewport, state.boundaryMode);
     accumulator -= SIM_DT;
@@ -100,6 +103,7 @@ function frame(now) {
   drawUI();
 
   updateEntityCount();
+  maybeLogEnergy();   // diagnostic — no-op unless state.__debugEnergy is true
   requestAnimationFrame(frame);
 }
 

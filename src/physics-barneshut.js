@@ -118,7 +118,7 @@ function accumulate(node, target, ox, oy, accumX, accumY, x0, y0, x1, y1) {
         // correctly captured as a single-point interaction).
         if (node._mq !== 0) {
           const minR = Math.max(target.radius, EPSILON);
-          // Plummer softening — see physics.js stepVerlet for rationale.
+          // Plummer softening — see physics.js stepPBD for rationale.
           const r2Soft = r2 + minR * minR;
           const r = Math.sqrt(r2Soft);
           const mag = node._mq * G / r2Soft;

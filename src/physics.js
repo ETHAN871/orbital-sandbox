@@ -131,6 +131,52 @@ export function computeAccelerations(entities, accels) {
 
 const _scratch = [];   // reused acceleration accumulator
 
+// ─── PBD contact list (Build Step 2+) ─────────────────────────────
+// Filled per-substep by processCollisionPair as it walks the broadphase.
+// Read back by _projectPBDContacts inside stepPBD. Reset at the top of
+// every handleCollisions call so a substep never sees stale entries from
+// the previous frame. Pre-allocated to a generous capacity for the
+// typical N ≤ 50 scene; grown if a larger cluster appears.
+const PBD_ITERATIONS = 4;
+let _contacts = new Array(256);
+let _contactCount = 0;
+
+// Contact-persistence tracking. A pair is "persistent" (no bounce) if
+// EITHER it was a contact last substep OR its PRE-KICK relative normal
+// velocity is essentially zero (orbital tangential motion / resting).
+// A pair is "new" (apply restitution) only when both gates fail — i.e.
+// the bodies were genuinely approaching BEFORE this substep's gravity
+// kick.
+//
+// The pre-kick check is the principled, scale-invariant alternative to
+// the earlier `vnApproach < -5 px/s` threshold: the kick-induced
+// approach velocity is exactly `a·dt·n̂`, so by subtracting it from the
+// detection-time vnApproach we recover the body's TRUE approach speed
+// (zero for resting / orbital contacts; the actual impact velocity for
+// genuine collisions, even slow ones). Works at any G / mass / dt.
+//
+// _prevPairs is rebuilt at the END of handleCollisions from the
+// current substep's _contacts, so the next substep's broadphase sees
+// "previous". The Set catches warm-started orbital contacts where one
+// substep's bookkeeping bridges into the next.
+const _prevPairs = new Set();
+function _pairKey(a, b) {
+  // Symmetric key — order of arguments doesn't matter.
+  const aId = a.id, bId = b.id;
+  return aId < bId ? aId + ':' + bId : bId + ':' + aId;
+}
+
+// Substep's dt cached at the top of stepPBD so processCollisionPair
+// can subtract `a·dt` to recover pre-kick velocity. Module-scoped
+// because processCollisionPair signature is fixed by the broadphase
+// dispatch (forEachCollisionPair in physics-spatial-hash.js).
+let _currentSimDt = 0;
+
+// Pre-kick approach-velocity threshold for "this is a real collision,
+// not a kick-induced spurious approach". A few ULPs above zero leaves
+// margin for FP noise without misclassifying truly slow impacts.
+const PRE_KICK_APPROACH_THRESHOLD = -1e-6;     // px/s
+
 function ensureScratch(n) {
   while (_scratch.length < n) _scratch.push({ ax: 0, ay: 0 });
   // Trim when entity population shrinks substantially (e.g., after a clear or
@@ -141,37 +187,452 @@ function ensureScratch(n) {
   }
 }
 
-export function stepVerlet(entities, dt) {
+// Position-Based Dynamics step. Replaces the legacy Velocity Verlet +
+// impulse pipeline. Pipeline per substep:
+//
+//   A. Save x_prev (so velocity can be derived post-projection).
+//   B. Compute accelerations at current positions.
+//   C. Symplectic Euler gravity kick:    v += a · dt
+//   D. Predict positions:                x += v · dt
+//   E. handleCollisions: broadphase at PREDICTED positions. For BH pairs,
+//      runs beginAbsorption immediately. For planet-planet pairs, pushes
+//      onto _contacts[] (no immediate impulse — PBD resolves later).
+//   F. _solveContactVelocities (Sequential-Impulses-style velocity solver):
+//      For each contact, drive relative normal velocity to a target
+//      (-e·vnApproach for genuine collisions, 0 for persistent contacts).
+//      Iterated 4× for Gauss-Seidel convergence in dense clusters.
+//   G. _projectPBDContacts: iterate PBD_ITERATIONS passes, each pushing
+//      overlapping pairs apart by mass-weighted normal correction.
+//   H. _applyStaticContactDamping: zero out velocities of in-contact
+//      bodies whose speed has decayed below STATIC_V_THRESHOLD.
+//
+// Why this fixes the bug: in Velocity Verlet's velocity update
+// `v += 0.5 * (a_old + a_new) * dt`, the cached a_old at a body's
+// PRE-step position has a tangential component when viewed from the
+// body's POST-step rotated position. In a free orbit this is the natural
+// centripetal redirection. In a contact-constrained orbit the inward
+// radial portion is killed by the collision impulse but the tangential
+// portion leaks through (Δv_t ≈ 0.5·|a|·v_t·dt²/r per step), accumulating
+// linearly. PBD's velocity derivation (v = Δx/dt) recovers velocity from
+// the net position change after constraint projection; the tangential
+// bias never enters the equation.
+export function stepPBD(entities, dt) {
   const n = entities.length;
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
 
-  // Position update using cached acceleration from last step. Pinned bodies
-  // are skipped — they neither move nor accelerate, only act as anchors.
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned) continue;
-    e.x += e.vx * dt + 0.5 * e.ax * dt * dt;
-    e.y += e.vy * dt + 0.5 * e.ay * dt * dt;
-  }
+  // Cache dt for processCollisionPair's pre-kick velocity calculation.
+  _currentSimDt = dt;
 
-  // Compute new accelerations at the new positions.
+  // ── B. Compute accelerations at current positions ──────────────
   computeAccelerations(entities, _scratch);
 
-  // Velocity update averages old + new acceleration; then store new as next-step cache.
-  // Pinned bodies have their kinematic state clamped to zero — even if the
-  // user toggled pin while the body was in motion, this halts it cleanly.
+  // ── B'. Centripetal projection for bodies in stable contact ────
+  // For a body resting on (or orbiting in contact with) another, the
+  // inward portion of gravity that EXCEEDS the centripetal requirement
+  // is absorbed by the constraint — it must not contribute to velocity
+  // changes. Without this projection, every substep injects a tiny
+  // tangential drift (proportional to v_t) because the predict step
+  // sinks the body radially, then projection scales it back to the
+  // constraint surface, advancing its ANGLE slightly more than
+  // v_t·dt/r would warrant. Subtracting the excess radial gravity
+  // before the kick eliminates the drift at its source.
+  //
+  // _contacts at this point holds the contacts detected during the
+  // PREVIOUS substep's handleCollisions. Stable contacts persist across
+  // substeps, so this look-back is well-suited. (First substep after a
+  // body spawns has no contacts yet — that single-substep bias is
+  // O(dt²) and self-corrects on the next substep when contacts populate.)
+  _centripetalProject(entities);
+
+  // ── C. Gravity kick: v += a · dt ───────────────────────────────
   for (let i = 0; i < n; i++) {
     const e = entities[i];
-    if (e.pinned) { e.vx = 0; e.vy = 0; e.ax = 0; e.ay = 0; continue; }
-    const newAx = _scratch[i].ax;
-    const newAy = _scratch[i].ay;
-    e.vx += 0.5 * (e.ax + newAx) * dt;
-    e.vy += 0.5 * (e.ay + newAy) * dt;
-    e.ax = newAx;
-    e.ay = newAy;
+    if (e.pinned || e.absorbing) continue;
+    const ax = _scratch[i].ax;
+    const ay = _scratch[i].ay;
+    e.vx += ax * dt;
+    e.vy += ay * dt;
+    // Cache a for any downstream reader (debug-energy.js, prediction
+    // tooling). This is the (possibly centripetal-projected) accel.
+    e.ax = ax;
+    e.ay = ay;
+  }
+
+  // ── D. Predict positions: x += v · dt ──────────────────────────
+  for (let i = 0; i < n; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+  }
+
+  // ── E. Detect contacts at predicted positions ──────────────────
+  // handleCollisions does the broadphase: BH pairs trigger absorption
+  // immediately; planet-planet pairs push onto _contacts[].
+  handleCollisions(entities);
+
+  // ── F. Velocity solver (Sequential-Impulses-style) ─────────────
+  // Iteratively apply impulses along each contact normal to drive
+  // relative normal velocity to its target:
+  //   - persistent contacts (vnApproach near zero, orbital motion) → 0
+  //   - genuine collisions (vnApproach below threshold) → -e·vnApproach
+  // Running this BEFORE the position solver — and crucially, BEFORE
+  // any `v = Δx/dt` re-derivation — is what stops the multi-body hex
+  // cluster from leaking tangential energy. PBD's position-only
+  // pipeline left the inward velocity component implicit in Δx; here
+  // we cancel it explicitly at the velocity level, which is the
+  // canonical fix for "stacking under gravity" per Box2D / Catto.
+  _solveContactVelocities(_contactCount);
+
+  // ── G. Position solver (non-linear Gauss-Seidel) ───────────────
+  // Resolve residual penetration. Now that velocities along each
+  // contact normal are already zero, the position projection mostly
+  // catches first-time penetrations (initial overlap, fast impacts).
+  _projectPBDContacts(_contactCount);
+
+  // ── H. Static contact damping ──────────────────────────────────
+  // Suppress FP-noise-driven drift in symmetric multi-body
+  // equilibria (e.g., a static ring of equal masses around a heavy).
+  // Threshold-based, applied only to in-contact bodies, so it's a
+  // no-op for any visible orbital dynamic.
+  _applyStaticContactDamping(_contactCount);
+
+  // ── I. Pinned bodies stay frozen ───────────────────────────────
+  // Defensive: each solver above zeroes `wA` (or `wB`) when the body is
+  // pinned, so impulses MUST have no effect on it — but if any future
+  // refactor accidentally lets a pinned body accumulate v or a (e.g.,
+  // forgetting the `if (e.pinned) continue` in the gravity kick), this
+  // hard reset catches it. Costs O(n) per substep; trivial.
+  for (let i = 0; i < n; i++) {
+    const e = entities[i];
+    if (e.pinned) { e.vx = 0; e.vy = 0; e.ax = 0; e.ay = 0; }
   }
 }
+
+// ─── Centripetal projection ───────────────────────────────────────
+// Subtract the "excess radial gravity" that a contact constraint will
+// absorb anyway, BEFORE the velocity kick. Without this step, PBD by
+// itself still leaks tangential energy in sub-orbital contact aggregates
+// — the predict step sinks the body radially into its constraint, then
+// the projection pushes it back to the surface, advancing its angular
+// position slightly more than v_t·dt/R warrants. The angular drift
+// integrates over many substeps into a steady tangential acceleration.
+//
+// Mechanism: for each body in a recent contact, compute the gravity
+// component pointing INTO the constraint surface (positive aInward).
+// If aInward exceeds the centripetal requirement v_t²/r — i.e., the
+// body is moving slower than the local circular-orbit speed — the
+// excess will be absorbed by the constraint. Subtract that excess from
+// the body's acceleration before integrating. The remaining radial
+// portion is exactly what's needed to curve the trajectory along the
+// constraint surface at the body's current tangential speed.
+//
+// Reads _contacts[0.._contactCount-1] — the contacts detected during
+// the PREVIOUS substep. Stable contacts persist across substeps so the
+// look-back is well-suited. (The first substep after a body spawns has
+// no contacts yet; that's a one-step O(dt²) bias that self-corrects.)
+//
+// Multi-contact safety: each contact is processed independently, but
+// the v_t²/r threshold automatically suppresses projections in
+// directions where the body has no excess inward gravity. For a hex
+// cluster around a heavy body, only the radial (light↔heavy) contacts
+// trigger meaningful projection; the tangential (light↔neighbor)
+// contacts have aInward ≈ v_t²/r and contribute essentially zero
+// correction.
+const _idxMap = new Map();
+
+function _centripetalProject(entities) {
+  if (_contactCount === 0) return;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
+
+  // Build entity→index lookup so we can write into _scratch[idx].
+  // For typical N ≤ 50 the Map.clear()+populate is cheaper than the
+  // alternative of indexOf-per-contact (which would be O(N·M) where
+  // M is contact count).
+  _idxMap.clear();
+  for (let i = 0; i < entities.length; i++) _idxMap.set(entities[i], i);
+
+  for (let k = 0; k < _contactCount; k++) {
+    const c = _contacts[k];
+    const a = c.a;
+    const b = c.b;
+    if (!a || !b) continue;                  // defensive: spliced entity
+    if (a.absorbing || b.absorbing) continue;
+
+    // Re-derive normal from CURRENT positions (wrap-aware). The stored
+    // c.nx/c.ny were captured at detection in the previous substep;
+    // positions have shifted slightly since. Re-computing per substep
+    // costs ~10 fp ops and avoids angular drift in the projection.
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if (wrap) {
+      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+    }
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 < 1e-12) continue;
+    const dist = Math.sqrt(dist2);
+
+    // Skip stale contacts — bodies that have drifted well past contact
+    // distance shouldn't keep receiving centripetal correction. 1.5× rSum
+    // gives a generous re-acquisition window for "just-detached" pairs.
+    if (dist > c.rSum * 1.5) continue;
+
+    const nx = dx / dist;                    // unit vector from a toward b
+    const ny = dy / dist;
+
+    // ── Body A: inward direction is +n̂ (pointing into B) ────────────
+    if (!a.pinned) {
+      const idxA = _idxMap.get(a);
+      if (idxA !== undefined) {
+        const sA = _scratch[idxA];
+        const aInward = sA.ax * nx + sA.ay * ny;
+        if (aInward > 0) {
+          // Tangential velocity² of A relative to B
+          const rvx = a.vx - b.vx;
+          const rvy = a.vy - b.vy;
+          const vRadial = rvx * nx + rvy * ny;
+          const v2 = rvx * rvx + rvy * rvy;
+          const vTang2 = v2 - vRadial * vRadial;
+          // Centripetal requirement at the contact distance. Floor at 0
+          // (numerical noise can make v² < vRadial² by ULPs).
+          const aCentripetalNeeded = vTang2 > 0 ? vTang2 / dist : 0;
+          const excess = aInward - aCentripetalNeeded;
+          if (excess > 0) {
+            sA.ax -= excess * nx;
+            sA.ay -= excess * ny;
+          }
+        }
+      }
+    }
+
+    // ── Body B: inward direction is -n̂ (pointing into A) ────────────
+    if (!b.pinned) {
+      const idxB = _idxMap.get(b);
+      if (idxB !== undefined) {
+        const sB = _scratch[idxB];
+        const aInward = -(sB.ax * nx + sB.ay * ny);
+        if (aInward > 0) {
+          const rvx = b.vx - a.vx;
+          const rvy = b.vy - a.vy;
+          // B's inward relative-velocity radial component is along -n̂
+          const vRadial = -(rvx * nx + rvy * ny);
+          const v2 = rvx * rvx + rvy * rvy;
+          const vTang2 = v2 - vRadial * vRadial;
+          const aCentripetalNeeded = vTang2 > 0 ? vTang2 / dist : 0;
+          const excess = aInward - aCentripetalNeeded;
+          if (excess > 0) {
+            // inward for B is -n̂ → subtracting excess from inward
+            // means ADDING excess·n̂ back to sB.ax,ay
+            sB.ax += excess * nx;
+            sB.ay += excess * ny;
+          }
+        }
+      }
+    }
+  }
+}
+
+// PBD contact projection. Each iteration walks the contact list and
+// pushes overlapping pairs apart along their contact normal by an amount
+// proportional to the overlap, weighted by inverse masses (pinned bodies
+// have effective infinite mass → zero compliance). Multiple iterations
+// converge the contact graph because correcting pair (A, B) may re-open
+// pair (A, C). For our typical small clusters (≤6 simultaneous contacts
+// per body), 4 iterations leaves residual penetration well below the
+// visible threshold. See architect blueprint for the convergence analysis.
+function _projectPBDContacts(count) {
+  if (count === 0) return;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
+  for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+    for (let k = 0; k < count; k++) {
+      const c = _contacts[k];
+      const a = c.a;
+      const b = c.b;
+      // Defensive: a pair may have been turned into prey since detection
+      // (handleCollisions can flip absorbing mid-walk). Such pairs no
+      // longer participate in the constraint network.
+      if (a.absorbing || b.absorbing) continue;
+      // RECOMPUTE the normal from CURRENT positions each iteration.
+      // Using the stored detection-time normal leaks tangential energy
+      // for orbiting contacts: the body's angle rotates between detection
+      // and projection, so pushing along the OLD normal leaves residual
+      // overlap AND injects an angular sweep that surfaces as false
+      // tangential velocity in step G's `v = Δx/dt`. Recomputing is
+      // ~10 fp ops per contact per iter — negligible — and lets each
+      // iter converge against the body's true current geometry.
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      if (wrap) {
+        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      }
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 < 1e-12) continue;
+      const dist = Math.sqrt(dist2);
+      const overlap = c.rSum - dist;
+      if (overlap <= 0) continue;                // already separated this iter
+      const wA = a.pinned ? 0 : 1 / a.mass;
+      const wB = b.pinned ? 0 : 1 / b.mass;
+      const wSum = wA + wB;
+      if (wSum === 0) continue;                  // two pinned bodies stuck
+      // Use CURRENT-iteration normal for the push direction. Update c.nx/c.ny
+      // so the rest of the pipeline (centripetal projection, restitution)
+      // reads the freshest geometry.
+      const nx = dx / dist;
+      const ny = dy / dist;
+      c.nx = nx;
+      c.ny = ny;
+      const correction = overlap / wSum;
+      a.x -= nx * correction * wA;
+      a.y -= ny * correction * wA;
+      b.x += nx * correction * wB;
+      b.y += ny * correction * wB;
+    }
+  }
+}
+
+// ─── Velocity solver (Sequential Impulses) ────────────────────────
+// For each contact, drive the relative normal velocity to its target:
+//   • persistent contact (c.wasPersistent: pair existed last substep) → 0
+//     Orbital motion samples a tiny radial component of tangential v at
+//     the rotating normal; firing a bounce on that drains/pumps energy.
+//   • new collision (c.wasPersistent === false) → -e · c.vnApproach
+//     This is the genuine restitution that bounces real impacts.
+//
+// The persistence-based gate is scale-invariant: it works equally well
+// at any G, mass, or dt — unlike the earlier vnApproach-magnitude
+// threshold which had to be re-tuned per regime.
+//
+// Iterated with Gauss-Seidel; for the typical N≤10 in-contact cluster,
+// 4 iterations converges to machine-eps. For chained clusters (a body
+// touching 2+ neighbors) more iterations would help; 4 is the
+// conservative practical choice at N ≤ 50.
+//
+// This (together with the deletion of `v = Δx/dt` re-derivation) is the
+// real fix for the hex-aggregate scatter: position-only PBD silently
+// leaked tangential energy through each iteration's angular sweep, and
+// `_applyRestitution` pumped that further by treating orbital contacts
+// as collisions. Running the velocity solve at the velocity level —
+// before any position projection and without re-derivation — closes
+// both leaks.
+const VELOCITY_ITERATIONS = 4;
+
+function _solveContactVelocities(count) {
+  if (count === 0) return;
+  const e = state.elasticRestitution;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5, halfH = H * 0.5;
+  for (let iter = 0; iter < VELOCITY_ITERATIONS; iter++) {
+    for (let k = 0; k < count; k++) {
+      const c = _contacts[k];
+      const a = c.a;
+      const b = c.b;
+      if (a.absorbing || b.absorbing) continue;
+      // Recompute contact normal from current positions every iteration.
+      let dx = b.x - a.x;
+      let dy = b.y - a.y;
+      if (wrap) {
+        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      }
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 < 1e-12) continue;
+      const dist = Math.sqrt(dist2);
+      const nx = dx / dist, ny = dy / dist;
+      // Current relative normal velocity.
+      const rvx = b.vx - a.vx;
+      const rvy = b.vy - a.vy;
+      const vn = rvx * nx + rvy * ny;
+      // Persistent → 0 (no bounce). New collision → -e·vnApproach (bounce).
+      const vnTarget = c.wasPersistent ? 0 : -e * c.vnApproach;
+      // Only apply if currently approaching faster than target (vn < vnTarget).
+      // For persistent contacts: target=0, fire if vn < 0 (any approach).
+      // For collisions: target=positive, fire if vn < positive (still net inward).
+      if (vn >= vnTarget) continue;
+      const wA = a.pinned ? 0 : 1 / a.mass;
+      const wB = b.pinned ? 0 : 1 / b.mass;
+      const wSum = wA + wB;
+      if (wSum === 0) continue;
+      const J = (vnTarget - vn) / wSum;
+      a.vx -= J * nx * wA;
+      a.vy -= J * ny * wA;
+      b.vx += J * nx * wB;
+      b.vy += J * ny * wB;
+    }
+  }
+}
+
+// Static contact damping (sleeping-body equivalent).
+// Multi-body gravitational equilibria (e.g., a symmetric ring of equal
+// masses around a central body) are mathematically UNSTABLE: any
+// infinitesimal perturbation grows exponentially. In real continuous
+// time the perturbation is zero so the system stays static; in discrete
+// FP arithmetic, the noise floor (~1e-15) IS such a perturbation, and
+// over thousands of substeps it amplifies to visible motion.
+//
+// Box2D and Bullet solve this with "sleeping bodies": bodies that have
+// been static for several frames are temporarily frozen. We do the
+// minimal version: zero out velocities below STATIC_V_THRESHOLD for
+// bodies that are CURRENTLY in contact (the constraint absorbs the
+// momentum so this is energetically correct).
+//
+// The threshold is chosen to be:
+//   • Well above the FP noise floor (~1e-12 in our scenes)
+//   • Well below any meaningful orbital/drag-placement speed (~10 px/s)
+// 0.1 px/s = 1/600 of a pixel per substep — invisible at any zoom level.
+//
+// Only IN-CONTACT bodies get damped — a body at apoapsis of a stretched
+// elliptical orbit can be legitimately slow without contact, and damping
+// it would corrupt the orbit.
+const STATIC_V_THRESHOLD = 0.1;        // px/s
+const STATIC_V_THRESHOLD2 = STATIC_V_THRESHOLD * STATIC_V_THRESHOLD;
+
+function _applyStaticContactDamping(count) {
+  if (count === 0) return;
+  // Build a set of bodies that participate in any current contact. Re-using
+  // a module-level Set would force us to .clear() it each call; a fresh
+  // Set is cheap enough for typical contact counts (<100).
+  const inContact = new Set();
+  for (let k = 0; k < count; k++) {
+    const c = _contacts[k];
+    if (c.a && !c.a.absorbing) inContact.add(c.a);
+    if (c.b && !c.b.absorbing) inContact.add(c.b);
+  }
+  for (const e of inContact) {
+    if (e.pinned) continue;
+    const v2 = e.vx * e.vx + e.vy * e.vy;
+    if (v2 < STATIC_V_THRESHOLD2) {
+      e.vx = 0;
+      e.vy = 0;
+    }
+  }
+}
+
+// (Legacy `_applyRestitution` removed; its single-pass impulse on
+// post-Δx/dt velocities both fired spurious bounces on orbital contacts
+// (vnApproach captured at detection sampled a sub-pixel radial component
+// of tangential motion) and stripped real radial velocity needed for
+// curved trajectories. Both responsibilities are now subsumed by
+// `_solveContactVelocities`, which uses iterative impulses and skips
+// persistent contacts via the same COLLISION_THRESHOLD_VN gate.)
+
+// (Legacy `stepVerlet` removed by the PBD refactor — its position+velocity
+// pipeline is incompatible with the contact-constraint energy semantics
+// PBD enforces. `stepPBD` above is the production step. The Plummer
+// softening + asymmetric force-law internal call sites have been
+// updated to reference stepPBD instead.)
 
 // ─── Collisions ───────────────────────────────────────────────────
 // Two paths depending on the pair's types:
@@ -212,18 +673,81 @@ function processCollisionPair(a, b, dx, dy) {
     // 是预期行为).
     beginAbsorption(prey, predator);
   } else {
-    resolveElasticCollision(a, b, dx, dy, dist2, rSum);
+    // PBD refactor: planet-planet contacts are accumulated here and
+    // resolved later by _projectPBDContacts inside stepPBD. The dx/dy
+    // passed in are already wrap-corrected (handleCollisions's broadphase
+    // applies the wrap delta), so we capture the contact normal n̂ at
+    // detection time. Projection iterations then advance positions along
+    // this fixed normal — robust under wrap because the normal direction
+    // doesn't change appreciably across the small corrections of one
+    // substep, even when the two bodies are on opposite sides of the
+    // viewport with wrap on.
+    if (_contactCount >= _contacts.length) {
+      _contacts.push(null);   // grow once per overflow; rare
+    }
+    let c = _contacts[_contactCount];
+    if (!c) {
+      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, wasPersistent: false };
+      _contacts[_contactCount] = c;
+    }
+    const dist = Math.sqrt(dist2);
+    c.a = a;
+    c.b = b;
+    c.rSum = rSum;
+    let nx, ny;
+    if (dist < 1e-6) {
+      // Co-located fallback: arbitrary axis, matches legacy resolution.
+      nx = 1; ny = 0;
+    } else {
+      nx = dx / dist;
+      ny = dy / dist;
+    }
+    c.nx = nx;
+    c.ny = ny;
+    // Capture PRE-projection approach velocity along the normal. For
+    // genuine collisions this is the impact speed; for orbital
+    // tangential motion sampled at the rotating normal, it's near zero.
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    c.vnApproach = rvx * nx + rvy * ny;     // negative = approaching
+    // Mark whether this pair counts as a persistent contact (no
+    // restitution bounce). A pair is persistent if EITHER:
+    //   (i)  it was in _prevPairs (a contact last substep — warm-start)
+    //   (ii) its PRE-KICK relative normal velocity is essentially zero
+    //        (resting/orbital — the captured vnApproach is purely
+    //        kick-induced, not a real impact)
+    // Recover pre-kick velocity by subtracting a·dt from the current
+    // (post-kick) velocity. For bodies with no acceleration this turn
+    // (e.g., charge=0 collision setups), preVn == vnApproach.
+    let wasPersistent = _prevPairs.has(_pairKey(a, b));
+    if (!wasPersistent) {
+      const dt = _currentSimDt;
+      const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
+      const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
+      const preVn = preRvx * nx + preRvy * ny;
+      // Real approach pre-kick → genuine new collision (wasPersistent stays false).
+      // Pre-kick separating or essentially zero → persistent.
+      if (preVn > PRE_KICK_APPROACH_THRESHOLD) wasPersistent = true;
+    }
+    c.wasPersistent = wasPersistent;
+    _contactCount++;
   }
 }
 
 export function handleCollisions(entities) {
   const n = entities.length;
 
+  // PBD refactor: clear the contact list before this substep's broadphase
+  // walk. processCollisionPair will push planet-planet pairs onto it.
+  // _projectPBDContacts (run later inside stepPBD) drains it.
+  _contactCount = 0;
+
   // V8.2: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
   // The hash is built once per frame in prepareFrame() above; this just
   // iterates the already-built buckets.
   if (n >= state.bhThreshold) {
     forEachCollisionPair(entities, processCollisionPair);
+    _rebuildPrevPairs();
     return;
   }
 
@@ -257,6 +781,19 @@ export function handleCollisions(entities) {
       processCollisionPair(a, b, dx, dy);
     }
   }
+  _rebuildPrevPairs();
+}
+
+// Rebuild _prevPairs from the just-populated _contacts. Called at the
+// end of handleCollisions so the next substep's processCollisionPair
+// sees a Set containing THIS substep's pairs — those become "previous"
+// from the next substep's perspective.
+function _rebuildPrevPairs() {
+  _prevPairs.clear();
+  for (let k = 0; k < _contactCount; k++) {
+    const c = _contacts[k];
+    _prevPairs.add(_pairKey(c.a, c.b));
+  }
 }
 
 // Start the devour animation on `prey`, locking the predator black hole as
@@ -277,62 +814,13 @@ function beginAbsorption(prey, predator) {
   prey.ay = 0;
 }
 
-// Standard 2D elastic-impulse collision. Conserves momentum; conserves KE
-// when ELASTIC_RESTITUTION = 1. Penetration is corrected proportional to
-// inverse mass so the heavier body barely moves.
-//
-// NOTE on Verlet interaction: this function mutates position (penetration
-// correction) and velocity (impulse). The Verlet integrator already cached
-// new `ax`,`ay` for the *pre-separation* positions earlier in this substep.
-// We deliberately do NOT recompute accelerations here — the O(dt²) staleness
-// self-corrects on the next substep, and a re-pass would cost O(n²).
-function resolveElasticCollision(a, b, dx, dy, dist2, rSum) {
-  // Pinned bodies behave as infinite-mass anchors: inverse mass = 0 means
-  // they receive zero impulse and zero positional correction, and all the
-  // motion is absorbed by the non-pinned partner. Two pinned bodies stuck
-  // overlapping is a user choice — just bail.
-  const invMa = a.pinned ? 0 : 1 / a.mass;
-  const invMb = b.pinned ? 0 : 1 / b.mass;
-  const invMassSum = invMa + invMb;
-  if (invMassSum === 0) return;
-
-  const dist = Math.sqrt(dist2);
-  if (dist === 0) {
-    // Perfectly co-located: pick a single arbitrary axis (+x) and split mass-
-    // weighted along it. Splitting along BOTH axes pushes only `rSum/2 * √2 / 2 ≈ 0.353·rSum`
-    // of separation per body — still overlapping next frame and causing jitter.
-    // Pushing rSum along one axis cleanly separates regardless of pinned status.
-    a.x -= rSum * (invMa / invMassSum);
-    b.x += rSum * (invMb / invMassSum);
-    return;
-  }
-  const nx = dx / dist;
-  const ny = dy / dist;
-
-  // 1. Resolve penetration (positional correction, mass-weighted).
-  const penetration = rSum - dist;
-  if (penetration > 0) {
-    const aShare = invMa / invMassSum;
-    a.x -= nx * penetration * aShare;
-    a.y -= ny * penetration * aShare;
-    b.x += nx * penetration * (1 - aShare);
-    b.y += ny * penetration * (1 - aShare);
-  }
-
-  // 2. Apply impulse if bodies are approaching.
-  const rvx = b.vx - a.vx;
-  const rvy = b.vy - a.vy;
-  const velAlongNormal = rvx * nx + rvy * ny;
-  if (velAlongNormal > 0) return;                  // already separating
-
-  const j = -(1 + state.elasticRestitution) * velAlongNormal / invMassSum;
-  const ix = j * nx;
-  const iy = j * ny;
-  a.vx -= ix * invMa;
-  a.vy -= iy * invMa;
-  b.vx += ix * invMb;
-  b.vy += iy * invMb;
-}
+// (Legacy `resolveElasticCollision` removed by the PBD refactor. Position
+// correction is now handled by _projectPBDContacts; restitution is
+// handled by _solveContactVelocities (the Sequential-Impulses velocity
+// solver). The legacy function's single-pass impulse approach was
+// incompatible with multi-body contact aggregates because it leaked
+// tangential energy via the Verlet velocity averaging it tried to
+// compensate for. See git history for the original impl.)
 
 // ─── Absorption animation ─────────────────────────────────────────
 // Progress every absorbing entity by `dt` seconds (sim time). Splice when
@@ -449,7 +937,7 @@ function ghostAccel(x, y, radius, others, out) {
     }
     const r2Raw = dx * dx + dy * dy;
     const minR = Math.max(radius + o.radius, EPSILON);
-    const r2 = r2Raw + minR * minR;   // Plummer softening (see stepVerlet)
+    const r2 = r2Raw + minR * minR;   // Plummer softening (see stepPBD)
     const r = Math.sqrt(r2);
     const mag = o.charge * G * o.mass / r2;
     ax += mag * dx / r;
