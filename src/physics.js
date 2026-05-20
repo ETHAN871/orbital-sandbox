@@ -203,6 +203,9 @@ function ensureScratch(n) {
 //      Iterated 4× for Gauss-Seidel convergence in dense clusters.
 //   G. _projectPBDContacts: iterate PBD_ITERATIONS passes, each pushing
 //      overlapping pairs apart by mass-weighted normal correction.
+//   G'. _relaxContactVelocities: one no-bias pass at post-projection
+//       positions to cancel the residual inward velocity introduced when
+//       the position solver refreshes each contact's normal. Catto 2024.
 //   H. _applyStaticContactDamping: zero out velocities of in-contact
 //      bodies whose speed has decayed below STATIC_V_THRESHOLD.
 //
@@ -290,6 +293,33 @@ export function stepPBD(entities, dt) {
   // contact normal are already zero, the position projection mostly
   // catches first-time penetrations (initial overlap, fast impacts).
   _projectPBDContacts(_contactCount);
+
+  // ── G'. Relaxation pass (Catto 2024 Solver2D, no-bias second solve) ─
+  // After the position solver, each contact's normal has been refreshed
+  // to the post-projection geometry; in dense clusters that refreshed
+  // normal can differ slightly from what step F operated on, so a body's
+  // velocity — perfectly tangent to its OLD normal — picks up a small
+  // approach component along its NEW normal. Without this pass, that
+  // approach component is what your hypothesis identified as the
+  // "微小重叠再弹开 → 不对称 → 累积旋转" feedback path: each substep
+  // injects a sub-pixel-scale inward velocity that the velocity solver
+  // (which ran one step earlier in F) couldn't have seen.
+  //
+  // The relaxation pass re-solves the contact velocity constraints with
+  // vnTarget = 0 for ALL contacts (no restitution, no Baumgarte bias).
+  // It is ONE-SIDED — it only applies impulse if vn < 0 (still
+  // approaching), never to undo a separating velocity. So it preserves:
+  //   • elastic restitution from step F (vn > 0 → no-op here)
+  //   • orbital tangential motion (radial component is genuinely 0 → no-op)
+  // and only removes the small residual approach velocity that
+  // position-projection-induced normal rotation revealed.
+  //
+  // Catto 2024 reports relaxation "improves the simulation quality
+  // dramatically." In our split-impulse pipeline (no Baumgarte bias to
+  // remove) the gain is more modest, but it directly closes the
+  // user-identified amplification path. Iterating once is enough — the
+  // residuals after step F are already small.
+  _relaxContactVelocities(_contactCount);
 
   // ── H. Static contact damping ──────────────────────────────────
   // Suppress FP-noise-driven drift in symmetric multi-body
@@ -571,6 +601,79 @@ function _solveContactVelocities(count) {
       b.vx += J * nx * wB;
       b.vy += J * ny * wB;
     }
+  }
+}
+
+// ─── Relaxation pass (no-bias second velocity solve) ──────────────
+// Mirrors Catto 2024 Solver2D's "relaxation" step. Runs after the
+// position solver has refreshed contact normals to post-projection
+// geometry. For each contact, recomputes n̂ and the current relative
+// normal velocity vn — and if vn is still negative (approaching), applies
+// the minimum impulse to bring vn back to zero.
+//
+// Crucially this pass is ONE-SIDED: `if (vn >= 0) continue;` ensures we
+// NEVER apply a negative-direction impulse, so:
+//   • An elastic bounce from step F (vn now > 0, separating) is preserved
+//     untouched — relaxation cannot undo restitution.
+//   • A truly tangential orbital velocity (vn == 0 along the post-
+//     projection normal) is a no-op — relaxation does not drain energy
+//     from a healthy orbit.
+//   • The only velocities relaxation modifies are sub-pixel residual
+//     approach components, which represent the "post-projection normal
+//     rotated since step F" leak that the user identified as the
+//     amplification source.
+//
+// Single iteration is sufficient: step F already drove vn to its target
+// at the OLD normal, so the residual at the NEW normal is O((Δn̂)·|v|),
+// which for our scenes is well below mm/s — one Gauss-Seidel sweep
+// clears it.
+// Diagnostic: counts impulses applied by the relaxation pass per substep.
+// Read by debug tooling; safe to leave in (zero overhead beyond a counter
+// inc per contact that actually needed correction).
+export let _relaxImpulseCount = 0;
+export let _relaxImpulseMagSum = 0;
+
+function _relaxContactVelocities(count) {
+  if (count === 0) return;
+  _relaxImpulseCount = 0;
+  _relaxImpulseMagSum = 0;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5, halfH = H * 0.5;
+  for (let k = 0; k < count; k++) {
+    const c = _contacts[k];
+    const a = c.a;
+    const b = c.b;
+    if (a.absorbing || b.absorbing) continue;
+    // Recompute contact normal from POST-projection positions.
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if (wrap) {
+      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+    }
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 < 1e-12) continue;
+    const dist = Math.sqrt(dist2);
+    const nx = dx / dist, ny = dy / dist;
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    const vn = rvx * nx + rvy * ny;
+    // One-sided: only kill INWARD residual (vn < 0). Never undo a
+    // legitimate separating velocity (vn ≥ 0).
+    if (vn >= 0) continue;
+    const wA = a.pinned ? 0 : 1 / a.mass;
+    const wB = b.pinned ? 0 : 1 / b.mass;
+    const wSum = wA + wB;
+    if (wSum === 0) continue;
+    const J = -vn / wSum;       // bring vn → 0
+    _relaxImpulseCount++;
+    _relaxImpulseMagSum += Math.abs(J);
+    a.vx -= J * nx * wA;
+    a.vy -= J * ny * wA;
+    b.vx += J * nx * wB;
+    b.vy += J * ny * wB;
   }
 }
 
