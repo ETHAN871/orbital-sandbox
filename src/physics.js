@@ -172,20 +172,31 @@ function _pairKey(a, b) {
 // dispatch (forEachCollisionPair in physics-spatial-hash.js).
 let _currentSimDt = 0;
 
-// Refund grace period: when a real collision is detected (preVn ≪ 0),
-// the refund pass (G'') is disabled for the next REFUND_GRACE_FRAMES
-// substeps. Lets the velocity solver's impulse cascade settle the
-// post-collision cluster into stable motion without the refund
-// draining its momentum on intra-cluster sub-pixel corrections.
+// Per-body refund grace: when the velocity solver applied a meaningful
+// impulse to a body this substep (cascade member of a real collision),
+// the refund pass (G'') is skipped for that BODY for the next
+// REFUND_GRACE_FRAMES substeps. Lets the impulse cascade settle into
+// stable motion before refund re-engages.
 //
-// GRACE_TRIGGER_PRE_VN: only pre-kick approach speeds faster than 1
-// px/s trigger the grace. This excludes the 0.0001-0.1 px/s noise
-// floor of statically-placed clusters and slow-orbital warm-up
-// substeps where the contact is geometrically "new" only by
-// bookkeeping (_prevPairs empty on first substep).
+// Critical to be PER-BODY (not scene-global): the user reported that
+// in busy scenes with many simultaneous interactions, a global grace
+// counter is perpetually reset by any new contact anywhere, so refund
+// never fires and static configs lose their stability — visible as
+// dense clusters jittering and overlapping near wrap boundaries.
+// Per-body grace cleanly isolates the affected bodies; stable bodies
+// elsewhere keep getting refund every substep.
+//
+// SOLVER_DV_THRESHOLD: |Δv| from the velocity solver that marks a
+// body as "in transient". 5 px/s separates static gravity-kick |Δv|
+// (~1.5 px/s, refund stays active) from collision-cascade |Δv|
+// (~30-50 px/s on struck bodies, propagating into 5-15 px/s on
+// neighbors; refund pauses). After the cascade settles, individual
+// bodies' per-substep |Δv| drops below 5 — but their counter is
+// already set and continues to count down for ~0.33 s, covering the
+// full settling time.
 const REFUND_GRACE_FRAMES = 40;             // ~0.33 s at SIM_DT=1/120
-const GRACE_TRIGGER_PRE_VN = -1.0;          // px/s
-let _refundSkipCounter = 0;
+const SOLVER_DV_THRESHOLD = 5.0;            // px/s
+const SOLVER_DV_THRESHOLD2 = SOLVER_DV_THRESHOLD * SOLVER_DV_THRESHOLD;
 
 // Pre-kick approach-velocity threshold for "this is a real collision,
 // not a kick-induced spurious approach". A few ULPs above zero leaves
@@ -306,24 +317,53 @@ export function stepPBD(entities, dt) {
   // we cancel it explicitly at the velocity level, which is the
   // canonical fix for "stacking under gravity" per Box2D / Catto.
   //
-  // Detect REAL collisions this substep — pairs with a significant
-  // pre-kick approach velocity (much faster than the gravity kick
-  // could account for). If found, trigger a refund grace period so
-  // the impulse cascade can settle without G'' draining its momentum.
-  //
-  // Uses preVn (not wasPersistent) because wasPersistent's tighter
-  // threshold (-1e-6) classifies sub-mm/s numerical noise as "new
-  // collision" — fine for restitution gating (no-bounce-near-zero)
-  // but would spuriously trigger grace on the first substep of any
-  // statically-placed cluster. -1.0 px/s here cleanly separates
-  // user-shot bullets (preVn ≪ -10) from numerical noise (|preVn| ≪ 0.1).
-  for (let k = 0; k < _contactCount; k++) {
-    if (_contacts[k].preVn < GRACE_TRIGGER_PRE_VN) {
-      _refundSkipCounter = REFUND_GRACE_FRAMES;
-      break;
-    }
+  // Snapshot velocity before the solver. After the solver runs, any
+  // body whose |Δv| exceeds SOLVER_DV_THRESHOLD is part of a
+  // collision cascade and gets its PER-BODY refund grace counter set
+  // (see step G''). Decrement happens in G''.
+  for (let i = 0; i < n; i++) {
+    const e = entities[i];
+    e._vxPreSolver = e.vx;
+    e._vyPreSolver = e.vy;
   }
   _solveContactVelocities(_contactCount);
+  // Mark direct cascade members (bodies the solver applied a
+  // significant impulse to this substep), then propagate the grace
+  // flag through the contact graph: any body in contact with a
+  // grace-flagged body also enters grace. This catches far-cluster
+  // bodies whose per-substep impulse was small but who are still
+  // part of the transient post-collision cluster motion (the user
+  // observed bullet-impact CoM momentum decaying because such bodies
+  // didn't hit the |Δv| threshold and got refund-damped).
+  for (let i = 0; i < n; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    const dvx = e.vx - e._vxPreSolver;
+    const dvy = e.vy - e._vyPreSolver;
+    if (dvx * dvx + dvy * dvy > SOLVER_DV_THRESHOLD2) {
+      e._refundSkipCounter = REFUND_GRACE_FRAMES;
+    }
+  }
+  // Propagate through contact graph (3 passes; typical clusters
+  // fully reach all members within 3 hops).
+  for (let pass = 0; pass < 3; pass++) {
+    let changed = false;
+    for (let k = 0; k < _contactCount; k++) {
+      const c = _contacts[k];
+      const a = c.a, b = c.b;
+      if (a.absorbing || b.absorbing) continue;
+      const aMarked = a._refundSkipCounter > 0;
+      const bMarked = b._refundSkipCounter > 0;
+      if (aMarked && !bMarked && !b.pinned) {
+        b._refundSkipCounter = REFUND_GRACE_FRAMES;
+        changed = true;
+      } else if (bMarked && !aMarked && !a.pinned) {
+        a._refundSkipCounter = REFUND_GRACE_FRAMES;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
 
   // ── G. Position solver (non-linear Gauss-Seidel) ───────────────
   // Resolve residual penetration. Now that velocities along each
@@ -379,29 +419,23 @@ export function stepPBD(entities, dt) {
   // step C kicked with — physically consistent because it represents
   // the body's effective acceleration (gravity minus implicit
   // constraint absorption).
-  // Gate: skip refund entirely during a "grace period" after any new
-  // contact. The refund is mathematically right only when gravity
-  // is the dominant non-impulsive force doing work over the substep;
-  // post-collision cluster cascades have velocity-solver impulses
-  // (and their cascade aftermath) as the dominant force, and the
-  // refund's "subtract gravity work over Δx" double-discounts the
-  // cluster's CoM momentum that the impulse installed.
+  // Gate: skip refund for THIS body if it's in a transient (its
+  // velocity-solver impulse this substep was significant, or its
+  // PER-BODY grace counter is still ticking down from a recent
+  // impulse). Stable bodies elsewhere in the scene continue to
+  // benefit from the refund's static-stability properties.
   //
-  // Per-body Δv-magnitude gating was tried (5 px/s threshold) but
-  // failed: post-cascade individual body |Δv| drops to 0.5-1 px/s
-  // — indistinguishable from the gravity-kick |Δv| of stable configs
-  // — yet the cluster is still in transient settling motion. A
-  // simpler scene-wide grace-frame counter cleanly separates the
-  // two regimes: during the cascade and its settle-down, refund is
-  // off; once the cluster reaches stable motion (~40 substeps =
-  // 0.33 s), refund re-engages on a per-body basis (now finds
-  // Δx_proj ≈ 0 for rigid cluster translation, so naturally
-  // no-ops anyway).
-  if (_refundSkipCounter > 0) {
-    _refundSkipCounter--;
-  } else for (let i = 0; i < n; i++) {
+  // Per-body (not scene-global) because in busy scenes any new
+  // collision anywhere would reset a global counter and refund
+  // would NEVER fire, breaking static cluster stability — visible
+  // as dense aggregates jittering near wrap boundaries.
+  for (let i = 0; i < n; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
+    if (e._refundSkipCounter > 0) {
+      e._refundSkipCounter--;
+      continue;
+    }
     const dx = e.x - e._sxProj;
     const dy = e.y - e._syProj;
     const dx2 = dx * dx + dy * dy;
