@@ -408,11 +408,17 @@ export function stepPBD(entities, dt) {
   _relaxContactVelocities(_contactCount);
 
   // ── H. Static contact damping ──────────────────────────────────
-  // Suppress FP-noise-driven drift in symmetric multi-body
-  // equilibria (e.g., a static ring of equal masses around a heavy).
-  // Threshold-based, applied only to in-contact bodies, so it's a
-  // no-op for any visible orbital dynamic.
-  _applyStaticContactDamping(_contactCount);
+  // DISABLED 2026-05-20: the 0.1 px/s threshold was too aggressive —
+  // bodies in slow-moving multi-body clusters (under near-equilibrium
+  // mutual gravity) were being PINNED IN PLACE, producing the
+  // "dynamic sleep" failure the user observed where dense aggregates
+  // froze instead of evolving. The energy-refund pass (G'') and the
+  // relaxation pass (G') already provide enough stability for the
+  // statically-generated configurations (all-touching hex N=6 stays
+  // bounded at sub-μ-pixel for 5+ min), so the artificial sleep is
+  // no longer earning its cost. Keep the function defined below as
+  // dead code in case a future scene needs explicit sleeping.
+  // _applyStaticContactDamping(_contactCount);
 
   // ── I. Pinned bodies stay frozen ───────────────────────────────
   // Defensive: each solver above zeroes `wA` (or `wB`) when the body is
