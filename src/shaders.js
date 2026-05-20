@@ -323,7 +323,7 @@ void main() {
 // cost when the field overlay is hidden.
 
 // --- Equipotential contour lines ----------------------------------
-// Fragment shader sums `φ = Σ_i -G·q·m / max(r, ε)` per pixel over up to
+// Fragment shader sums φ = Σ_i -G·q·m / sqrt(r² + ε²) per pixel over up to
 // MAX_ENTITIES uniform-array entries (pre-multiplied G·q·m packed into
 // entity.z by the caller so the shader only carries one float multiply
 // per entity per pixel). Contour lines are derived via a derivative-aware
@@ -375,13 +375,17 @@ out vec4 outColor;
 
 float computePhi(vec2 p) {
   float phi = 0.0;
+  // Plummer softening: safeR = sqrt(r² + ε²). Smooth and bounded at
+  // r=0; gradient is well-defined everywhere → no contour-line kinks
+  // at body centers. Matches physics.js / potential.js exactly so the
+  // force the body feels and the field the viewer sees agree.
+  float eps2 = uEpsilon * uEpsilon;
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
     float dx = p.x - e.x;
     float dy = p.y - e.y;
-    float r = sqrt(dx * dx + dy * dy);
-    float safeR = max(r, uEpsilon);
+    float safeR = sqrt(dx * dx + dy * dy + eps2);
     phi += -e.z / safeR;
   }
   return phi;

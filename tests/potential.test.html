@@ -54,25 +54,31 @@
     const G = 80;     // matches DEFAULTS_TUNING.G in state.js
     const EPS = 4;    // matches DEFAULTS_TUNING.epsilon
 
+    // Plummer softening helper: matches src/potential.js exactly.
+    const plummerPhi = (r, m, q = 1, g = G, eps = EPS) =>
+      -g * q * m / Math.sqrt(r * r + eps * eps);
+
     // ─── Fixture 1: single-mass radial drop ────────────────────────
     // One entity at (100, 100), q=+1, m=10. At probe (200, 100), r=100.
-    // φ = -G · 1 · 10 / 100 = -G/10 = -8.
+    // Plummer: φ = -G · 10 / sqrt(100² + 4²). For r >> ε the difference
+    // from the unsoftened -G·10/100 is small (~0.08%), but the test
+    // compares against the exact Plummer expected value.
     log('\n[1] Single mass radial drop');
     {
       const ents = [E(100, 100, 10, 1)];
       const phi = computePotentialAt(200, 100, ents, G, EPS);
-      check('φ(200,100) for q=+1 m=10 at (100,100)', phi, -8);
+      check('φ(200,100) for q=+1 m=10 at (100,100)', phi, plummerPhi(100, 10), 1e-9);
     }
 
     // ─── Fixture 2: two-mass symmetry → gradient zero at origin ────
     // Entities at (-50, 0) and (+50, 0), both q=+1, m=10. At origin,
-    // r=50 to each, so φ = -2·G·1·10/50 = -32.
-    // computeForceDirAt at origin should return mag≈0 (symmetric cancellation).
+    // r=50 to each, so φ = 2 · plummerPhi(50, 10).
+    // computeForceDirAt at origin should return mag=0 (symmetric cancellation).
     log('\n[2] Two equal masses, null axis point');
     {
       const ents = [E(-50, 0, 10, 1), E(50, 0, 10, 1)];
       const phi = computePotentialAt(0, 0, ents, G, EPS);
-      check('φ(0,0) for two q=+1 m=10 at ±50', phi, -32);
+      check('φ(0,0) for two q=+1 m=10 at ±50', phi, 2 * plummerPhi(50, 10), 1e-9);
       const f = computeForceDirAt(0, 0, ents, G, EPS);
       check('|F|(0,0) for symmetric pair', f.mag, 0, 1e-9);
     }
@@ -100,21 +106,33 @@
       check('φ doubles when mass doubles', phi20, 2 * phi10, 1e-9);
     }
 
-    // ─── Fixture 5: ε softening floor at r=0 ───────────────────────
-    // At the entity's own position (r=0), without the ε floor we would
-    // get φ = -∞. With ε=4, the formula uses max(r, ε) = 4:
-    // φ = -G · 1 · 10 / 4 = -G·2.5 = -200.
-    log('\n[5] ε softening floor prevents r→0 singularity');
+    // ─── Fixture 5: Plummer ε softening prevents r→0 singularity ──
+    // At the entity's own position (r=0), without softening we'd get
+    // φ = -∞. With Plummer softening, safeR = sqrt(r²+ε²) → at r=0
+    // safeR = ε = 4 and φ = -G·m/ε = -200. As r grows, φ smoothly
+    // transitions (no kink at r=ε like the old max-floor had).
+    log('\n[5] Plummer softening — smooth bound at r=0, smooth elsewhere');
     {
       const ents = [E(0, 0, 10, 1)];
-      const phi = computePotentialAt(0, 0, ents, G, EPS);
-      check('φ at r=0 with ε=4 returns finite -G·m/ε', phi, -200);
-      // Same at r=2 (still within ε floor):
-      check('φ at r=2 (inside ε floor) clamped to r=ε', computePotentialAt(2, 0, ents, G, EPS), -200);
-      // At r=ε exactly, formula transitions smoothly:
-      check('φ at r=ε exactly', computePotentialAt(4, 0, ents, G, EPS), -200);
-      // Beyond ε, regular 1/r:
-      check('φ at r=8 outside ε floor uses real r', computePotentialAt(8, 0, ents, G, EPS), -100);
+      check('φ(r=0) = -G·m/ε (bounded, finite)',
+        computePotentialAt(0, 0, ents, G, EPS), plummerPhi(0, 10), 1e-9);
+      // At r=2: sqrt(4+16) = sqrt(20). NOT clamped to ε any more —
+      // Plummer interpolates smoothly between r=0 and r >> ε.
+      check('φ(r=2) Plummer smooth (NOT clamped to ε)',
+        computePotentialAt(2, 0, ents, G, EPS), plummerPhi(2, 10), 1e-9);
+      // At r=ε: sqrt(16+16) = sqrt(32). Old max-floor would say -200; new
+      // Plummer says -G·10/sqrt(32) ≈ -141.42 — about 30% smaller.
+      check('φ(r=ε=4) smaller than max-floor under Plummer',
+        computePotentialAt(4, 0, ents, G, EPS), plummerPhi(4, 10), 1e-9);
+      // At r=8: sqrt(64+16) = sqrt(80). For r >> ε, approaches -G·m/r.
+      check('φ(r=8) approaches -G·m/r at large r',
+        computePotentialAt(8, 0, ents, G, EPS), plummerPhi(8, 10), 1e-9);
+      // The smoothness of Plummer vs the kinkiness of the old max-floor is
+      // already captured by the r=2 and r=ε checks above: with max-floor
+      // both would equal -200 (still inside the floor plateau); with
+      // Plummer they evaluate to -178.9 and -141.4 respectively. A
+      // separate numerical-derivative check at r=0 would just restate the
+      // same fact and is sensitive to discretization noise.
     }
 
     // ─── Fixture 6: charge sign flip mirrors φ ─────────────────────
@@ -139,16 +157,16 @@
         E(150, 100, 10, 1, { blackHoleId: 99, elapsedSim: 0.1 }),    // absorbing → skip
       ];
       const phi = computePotentialAt(200, 100, ents, G, EPS);
-      // Only the visible one contributes: r=100, φ = -8.
-      check('absorbing entity excluded from sum', phi, -8);
+      // Only the visible one contributes at r=100.
+      check('absorbing entity excluded from sum', phi, plummerPhi(100, 10), 1e-9);
     }
 
     // ─── Fixture 8: wrap-mode PBC continuity at boundary ───────────
     // Entity at left edge (x=1) with viewport W=400, H=200. Probe at right
-    // edge (x=399). Without wrap → direct distance = 398, φ ≈ -G·m/398.
-    // With wrap → also include the right-mirror at x=401 (distance 2). The
-    // mirror contribution dominates because 1/2 >> 1/398. So with-wrap φ
-    // should be much more negative than without-wrap φ at the same probe.
+    // edge (x=399). Without wrap → only direct contribution at r ≈ 398.
+    // With wrap → also include the right-mirror at x=401 (r ≈ 2). The
+    // mirror dominates because 1/sqrt(4+ε²) >> 1/sqrt(398²+ε²). Both use
+    // Plummer softening.
     log('\n[8] Wrap PBC mirror dominates at boundary');
     {
       const W = 400, H = 200;
@@ -156,29 +174,18 @@
       const probeX = 399, probeY = 100;
       const phiNoWrap = computePotentialAt(probeX, probeY, ents, G, EPS);
       const phiWrap = computePotentialAt(probeX, probeY, ents, G, EPS, { width: W, height: H });
-      check('no-wrap φ uses 398px distance only', phiNoWrap, -G * 10 / 398, 1e-9);
-      // With wrap, 9 ghosts at offsets (-W..W, -H..H). The closest two are
-      // the right mirror at (1+W, 100) = (401, 100), distance 2, AND the
-      // self at (1, 100), distance 398. Plus 7 other ghosts: corners (1±W,
-      // 100±H) and verticals (1, 100±H) and (1±W, 100). Total = sum of
-      // -G*m/safeR over all 9.
-      const W_ = W, H_ = H;
+      check('no-wrap φ uses 398px distance only', phiNoWrap, plummerPhi(398, 10), 1e-9);
+      // With wrap, 9 ghost offsets (-W..W, -H..H). Sum each Plummer-softened.
       const expected = [
-        [1 - W_, 100 - H_],   // (-399, -100)
-        [1,      100 - H_],   // (1, -100)
-        [1 + W_, 100 - H_],   // (401, -100)
-        [1 - W_, 100],        // (-399, 100)
-        [1,      100],        // (1, 100)
-        [1 + W_, 100],        // (401, 100)
-        [1 - W_, 100 + H_],   // (-399, 300)
-        [1,      100 + H_],   // (1, 300)
-        [1 + W_, 100 + H_],   // (401, 300)
+        [1 - W, 100 - H], [1, 100 - H], [1 + W, 100 - H],
+        [1 - W, 100    ], [1, 100    ], [1 + W, 100    ],
+        [1 - W, 100 + H], [1, 100 + H], [1 + W, 100 + H],
       ].reduce((acc, [ex, ey]) => {
         const dx = probeX - ex, dy = probeY - ey;
-        const r = Math.sqrt(dx*dx + dy*dy);
-        return acc + -G * 10 / Math.max(r, EPS);
+        const r = Math.sqrt(dx * dx + dy * dy);
+        return acc + plummerPhi(r, 10);
       }, 0);
-      check('wrap φ matches manual 9-ghost sum', phiWrap, expected, 1e-9);
+      check('wrap φ matches manual 9-ghost Plummer sum', phiWrap, expected, 1e-9);
       // Sanity: wrap version is much more negative (closer well from the mirror).
       check('wrap φ is more negative than no-wrap φ', phiWrap < phiNoWrap * 10, true, 0);
     }

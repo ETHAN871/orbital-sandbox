@@ -160,6 +160,14 @@ let _streamlineInstanceData = new Float32Array(0);
 // Wall-clock anchor for the synchronized pulse (ms). Pulse phase derives
 // from (now - _pulseStartMs) % UI_PULSE_PERIOD_MS.
 let _pulseStartMs = 0;
+// V9.x: exponential moving average of the contour band spacing. The
+// (φmax-φmin)/numBands estimate jitters frame-to-frame as entities move
+// — even small shifts make every contour line slide one or two pixels
+// every frame, producing a visible "wobble". Low-pass-filter the spacing
+// with an EMA so it tracks gross changes in ~12 frames (~200 ms at 60Hz)
+// but ignores per-frame noise. Reset to the latest sample when zero
+// (first frame after init or scene clear) so we don't start at zero.
+let _smoothedContourSpacing = 0;
 
 // Shader source strings live in src/shaders.js. Each program exports a
 // `{ VS, FS }` pair. See that file for per-program attribute layouts and
@@ -732,6 +740,11 @@ function _hslToRgb(h, s, l) {
 // ─── Public: reset trail ──────────────────────────────────────────
 
 export function resetTrailCanvas() {
+  // Also resets the V9.1 contour-spacing EMA. Called from the "Clear
+  // Sandbox" button → if we kept the EMA across a scene clear, the next
+  // (typically smaller) scene would rebuild its contour spacing slowly
+  // over ~12 frames, showing visibly wrong spacing during that ramp.
+  _smoothedContourSpacing = 0;
   if (_disabled || !_gl) return;
   if (!_fboA || !_fboB) return;
   const gl = _gl;
@@ -1246,7 +1259,7 @@ function _buildSelectionRing() {
 // ─── V9.1 field visualization (drawField) ─────────────────────────
 // Two passes, both gated by state.showField:
 //   1. Equipotential contour lines — fullscreen quad fragment shader
-//      sums φ = Σ -G·q·m/max(r, ε) per pixel and draws contour rings
+//      sums φ = Σ -G·q·m / sqrt(r²+ε²) per pixel and draws contour rings
 //      where |∇φ| × derivative-aware-mask ≤ 0.5 px.
 //   2. Pulsing streamlines — instanced quad per grid seed; each seed
 //      points along the local force direction (computed on CPU via
@@ -1378,7 +1391,17 @@ function _drawEquipotential() {
   // If all samples collapse to the same value (no field variation visible),
   // skip the pass entirely — there's nothing to draw.
   if (!isFinite(phiRange) || phiRange <= 1e-6) return;
-  const spacing = phiRange / UI_CONTOUR_NUM_BANDS;
+  const instantSpacing = phiRange / UI_CONTOUR_NUM_BANDS;
+  // EMA-smooth the spacing across frames to eliminate per-frame jitter.
+  // α=0.08 gives a 1/α ≈ 12-frame time constant (≈ 200ms at 60Hz). The
+  // first frame after init / a long pause snaps to the instant value to
+  // avoid a slow ramp-up from zero.
+  if (_smoothedContourSpacing <= 1e-6) {
+    _smoothedContourSpacing = instantSpacing;
+  } else {
+    _smoothedContourSpacing = 0.92 * _smoothedContourSpacing + 0.08 * instantSpacing;
+  }
+  const spacing = _smoothedContourSpacing;
 
   // Theme-aware contour color: light gray on dark bg, dark gray on light bg.
   const bgRgb = _colorToRgbNorm(state.bgColor);

@@ -92,7 +92,16 @@ export function computeAccelerations(entities, accels) {
       }
       const r2Raw = dx * dx + dy * dy;
       const minR = Math.max(a.radius + b.radius, EPSILON);
-      const r2 = Math.max(r2Raw, minR * minR);
+      // Plummer softening: r²_soft = r² + minR² (smoothly damps force to
+      // zero as r → 0). Was max(r², minR²) which gave a hard kink at
+      // r=minR — force and potential disagreed inside the kink (force
+      // stayed constant, potential gradient went to zero), causing
+      // energy non-conservation in close approaches and contour-line
+      // jitter near body centers in the V9.1 field visualization. The
+      // single-line change `max(...)` → `+` propagates Plummer through
+      // the existing `mag = q·G·m/r² · dx/r` form: mag/r becomes
+      // q·G·m·dx/(r²+minR²)^(3/2) which is exactly Plummer's force.
+      const r2 = r2Raw + minR * minR;
       const r = Math.sqrt(r2);
       const nx = dx / r;
       const ny = dy / r;
@@ -440,7 +449,7 @@ function ghostAccel(x, y, radius, others, out) {
     }
     const r2Raw = dx * dx + dy * dy;
     const minR = Math.max(radius + o.radius, EPSILON);
-    const r2 = Math.max(r2Raw, minR * minR);
+    const r2 = r2Raw + minR * minR;   // Plummer softening (see stepVerlet)
     const r = Math.sqrt(r2);
     const mag = o.charge * G * o.mass / r2;
     ax += mag * dx / r;
