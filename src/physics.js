@@ -137,7 +137,6 @@ const _scratch = [];   // reused acceleration accumulator
 // every handleCollisions call so a substep never sees stale entries from
 // the previous frame. Pre-allocated to a generous capacity for the
 // typical N ≤ 50 scene; grown if a larger cluster appears.
-const PBD_ITERATIONS = 4;
 let _contacts = new Array(256);
 let _contactCount = 0;
 
@@ -244,7 +243,11 @@ export function stepPBD(entities, dt) {
   // (used by the wasPersistent gate, NOT by any deleted refund code).
   _currentSimDt = dt;
 
-  // (Sprint 3 will add: A. Reset pseudo-velocity accumulator here.)
+  // ── A. Reset pseudo-velocity accumulator (for step G) ──────────
+  for (let i = 0; i < n; i++) {
+    entities[i]._pvx = 0;
+    entities[i]._pvy = 0;
+  }
 
   // ── B. Compute accelerations at current positions ──────────────
   computeAccelerations(entities, _scratch);
@@ -284,11 +287,14 @@ export function stepPBD(entities, dt) {
   // ── F'. Persist this substep's impulses for next substep's warm-start
   _rebuildPrevPairImpulses();
 
-  // ── G. Position projection ─────────────────────────────────────
-  // (Sprint 1: still the direct PBD positional correction. Sprint 3
-  // will replace with pseudo-velocity NGS that doesn't write to real
-  // positions — uses _pvx, _pvy accumulators integrated at the end.)
-  _projectPBDContacts(_contactCount);
+  // ── G. Pseudo-velocity NGS position solver (Box2D-style) ───────
+  // 3-iter Gauss-Seidel with Baumgarte slop + maxCorrection cap.
+  // Writes to body._pvx/_pvy; integrates into body.x/y at the end
+  // without touching real velocity. This is the key "split impulses"
+  // pattern that prevents position correction from injecting phantom
+  // PE into the gravity field — the failure mode the old _dxGrav
+  // energy-refund pass was patching after the fact.
+  _solvePositionConstraints(_contactCount, entities, dt);
 
   // ── I. Pinned bodies hard-reset ────────────────────────────────
   for (let i = 0; i < n; i++) {
@@ -297,35 +303,58 @@ export function stepPBD(entities, dt) {
   }
 }
 
-// PBD contact projection. Each iteration walks the contact list and
-// pushes overlapping pairs apart along their contact normal by an amount
-// proportional to the overlap, weighted by inverse masses (pinned bodies
-// have effective infinite mass → zero compliance). Multiple iterations
-// converge the contact graph because correcting pair (A, B) may re-open
-// pair (A, C). For our typical small clusters (≤6 simultaneous contacts
-// per body), 4 iterations leaves residual penetration well below the
-// visible threshold. See architect blueprint for the convergence analysis.
-// Position projection. (TEMPORARY: this is the pre-Box2D-refactor
-// position solver. Sprint 3 of the Box2D refactor will replace it with
-// a pseudo-velocity NGS that doesn't write directly to e.x/e.y,
-// preserving real velocity. For now it's a plain PBD positional
-// constraint solver: push overlapping pairs apart along the contact
-// normal, weighted by inverse mass.)
-function _projectPBDContacts(count) {
+// ─── Position solver (Box2D-style pseudo-velocity NGS) ────────────
+// Splits position correction from real-velocity dynamics. Instead of
+// writing penetration corrections directly to body positions (which
+// would inject phantom PE into the gravity field), we accumulate them
+// into a per-body pseudo-velocity (_pvx, _pvy) and integrate that
+// into position at the end. Real velocity vx/vy is NEVER touched by
+// this pass — that's the key Box2D 2.x design choice that prevents
+// "position correction pumps KE into gravity orbit" failure mode the
+// old _dxGrav refund pass was trying to compensate for.
+//
+// Baumgarte slop: don't push to zero overlap. Leave a tiny gap
+// (LINEAR_SLOP_FRAC × rSum) so resting contacts under continuous
+// gravity don't oscillate around exact-touch (which produces jitter
+// near machine ε).
+//
+// maxCorrection: cap each iteration's per-contact correction to a
+// fraction of rSum. Prevents teleporting when a fast-moving body
+// penetrates deeply — corrections spread over multiple frames instead.
+//
+// Reference: Catto's "Iterative Dynamics with Temporal Coherence"
+// (GDC 2005); Planck.js b2ContactSolver::SolvePositionConstraints.
+const POS_ITERATIONS = 3;
+const LINEAR_SLOP_FRAC = 0.005;       // unitless × rSum
+const MAX_CORRECTION_FRAC = 0.2;      // unitless × rSum
+
+function _solvePositionConstraints(count, entities, dt) {
   if (count === 0) return;
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width : 0;
   const H = wrap ? state.viewport.height : 0;
   const halfW = W * 0.5;
   const halfH = H * 0.5;
-  for (let iter = 0; iter < PBD_ITERATIONS; iter++) {
+  const invDt = 1 / dt;
+
+  for (let iter = 0; iter < POS_ITERATIONS; iter++) {
     for (let k = 0; k < count; k++) {
       const c = _contacts[k];
       const a = c.a;
       const b = c.b;
       if (a.absorbing || b.absorbing) continue;
-      let dx = b.x - a.x;
-      let dy = b.y - a.y;
+
+      // Effective positions = current real x + accumulated pseudo
+      // displacement (pvx*dt). Recompute geometry against the
+      // effective positions so iterations converge against what the
+      // pseudo-velocity has "already done".
+      const axEff = a.x + a._pvx * dt;
+      const ayEff = a.y + a._pvy * dt;
+      const bxEff = b.x + b._pvx * dt;
+      const byEff = b.y + b._pvy * dt;
+
+      let dx = bxEff - axEff;
+      let dy = byEff - ayEff;
       if (wrap) {
         if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
         if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
@@ -334,21 +363,40 @@ function _projectPBDContacts(count) {
       if (dist2 < 1e-12) continue;
       const dist = Math.sqrt(dist2);
       const overlap = c.rSum - dist;
-      if (overlap <= 0) continue;
+      const linearSlop = LINEAR_SLOP_FRAC * c.rSum;
+      // Apply Baumgarte slop: only correct overlap that exceeds slop.
+      // Negative result = no correction needed (already separated, or
+      // separated within the slop tolerance).
+      const want = overlap - linearSlop;
+      if (want <= 0) continue;
+      const maxCorrection = MAX_CORRECTION_FRAC * c.rSum;
+      const correction = want > maxCorrection ? maxCorrection : want;
       const wA = a.pinned ? 0 : 1 / a.mass;
       const wB = b.pinned ? 0 : 1 / b.mass;
       const wSum = wA + wB;
       if (wSum === 0) continue;
       const nx = dx / dist;
       const ny = dy / dist;
-      c.nx = nx;
-      c.ny = ny;
-      const correction = overlap / wSum;
-      a.x -= nx * correction * wA;
-      a.y -= ny * correction * wA;
-      b.x += nx * correction * wB;
-      b.y += ny * correction * wB;
+      // Convert positional correction to pseudo-velocity by dividing
+      // by dt. End-of-pass integration `x += _pvx * dt` then turns it
+      // back into the same position delta — but real velocity is
+      // never read or written. The split keeps KE/PE bookkeeping
+      // honest in the gravity field.
+      const lambdaOverDt = correction / wSum * invDt;
+      a._pvx -= lambdaOverDt * nx * wA;
+      a._pvy -= lambdaOverDt * ny * wA;
+      b._pvx += lambdaOverDt * nx * wB;
+      b._pvy += lambdaOverDt * ny * wB;
     }
+  }
+
+  // Integrate pseudo-velocity into real position. Real velocity is
+  // untouched — this is the whole point of split impulses.
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    e.x += e._pvx * dt;
+    e.y += e._pvy * dt;
   }
 }
 
