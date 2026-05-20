@@ -8,7 +8,16 @@
 </head>
 <body>
   <div id="app">
-    <canvas id="stage" aria-label="重力场沙盒画布"></canvas>
+    <div id="stage-wrap">
+      <!-- WebGL 2 hot path: background, trail FBO, entity sprites + wrap mirrors. -->
+      <canvas id="stage" aria-label="重力场沙盒画布"></canvas>
+      <!-- V9.0a transitional Canvas2D overlay for UI lines (hover ghost, drag
+           preview, prediction line, selection ring, absorbing fallback). Will
+           be deleted in V9.0b once those layers migrate to WebGL. -->
+      <canvas id="overlay" aria-hidden="true"></canvas>
+      <!-- Shown if WebGL 2 is unavailable; renderer-webgl.js sets text + un-hides. -->
+      <div id="webgl-error" role="alert" hidden></div>
+    </div>
 
     <aside id="panel" aria-label="控制面板">
       <header class="panel-header">
