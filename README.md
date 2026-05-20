@@ -56,12 +56,15 @@ orbital-sandbox/
 ├── index.html
 ├── styles.css
 ├── src/
-│   ├── main.js          # RAF 主循环 + 启动
-│   ├── state.js         # 全局状态 + 物理/UI 常量
-│   ├── entities.js      # 实体工厂、颜色规则
-│   ├── physics.js       # 力计算、Verlet 积分、碰撞、预测
-│   ├── renderer.js      # Canvas 渲染层
-│   ├── input.js         # 鼠标交互（放置 / 编辑）
-│   └── ui.js            # 滑条 + 按钮绑定
+│   ├── main.js                  # RAF 主循环 + 启动
+│   ├── state.js                 # 全局状态 + 物理/UI 常量
+│   ├── entities.js              # 实体工厂、颜色规则
+│   ├── physics.js               # 力计算、Verlet 积分、碰撞、预测
+│   ├── physics-barneshut.js     # Barnes-Hut 引力（大 N 路径）
+│   ├── physics-spatial-hash.js  # 碰撞宽相空间哈希
+│   ├── sprite-cache.js          # 实体 sprite 离屏 canvas 缓存（→ GPU 纹理）
+│   ├── renderer-webgl.js        # WebGL 2 渲染全栈（背景/轨迹/实体/UI）
+│   ├── input.js                 # 鼠标交互（放置 / 编辑）
+│   └── ui.js                    # 滑条 + 按钮绑定
 └── .github/workflows/deploy.yml
 ```

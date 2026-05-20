@@ -1,15 +1,31 @@
-// renderer-webgl.js — V9.0a WebGL 2 hot-path renderer.
+// renderer-webgl.js — V9.0b WebGL 2 renderer (full pipeline).
 //
-// Replaces the Canvas2D background, trail-FBO, and entity-sprite rendering
-// from renderer.js. UI lines (selection ring, drag preview, hover ghost,
-// prediction line, absorbing fallback) remain on the overlay Canvas2D in
-// V9.0a — they will migrate to WebGL in V9.0b.
+// V9.0b is the final state of the "all rendering on GPU" migration. The
+// Canvas2D overlay (`#overlay` canvas + renderer.js) is gone; every visible
+// pixel is produced by a WebGL 2 shader.
 //
 // Layer order (back to front):
-//   1. clear with state.bgColor
-//   2. trail FBO blit (composited with straight-alpha blend)
-//   3. entity sprite instanced draw (with 9-ghost wrap mirrors)
-//   --- WebGL ends here; Canvas2D overlay layers above ---
+//   1. clear with state.bgColor                              (drawScene)
+//   2. trail FBO blit (straight-alpha blend)                 (drawScene)
+//   3. entity sprite instanced draw + 9-ghost wrap mirrors   (drawScene)
+//   --- UI overlay layers below run via drawUI() ---
+//   4. hover ghost (placement preview)                       (drawUI)
+//   5. drag preview ghost circle + rubber band + handle ring (drawUI)
+//   6. prediction path (dashed, faded-along-arc, wrap-aware) (drawUI)
+//   7. absorbing entities (fading circle + optional ring)    (drawUI)
+//   8. selection ring (edit mode)                            (drawUI)
+//
+// V9.0b new shader programs (vs V9.0a):
+//   - _progCircleFill: instanced filled disks with 1-px AA edge. Used for
+//     hover/drag ghost fill and the absorbing-entity fading body.
+//   - _progCircleRing: instanced ring strokes (solid or dashed) with AA on
+//     both edges. Used for hover ghost outline (dashed 3-3), drag ghost
+//     outline (solid), handle ring (solid), selection ring (dashed 4-4),
+//     black-hole absorbing edge (solid).
+//   - _progLineSeg: instanced line-segment quads (solid or dashed, with
+//     per-instance arc-length offset for continuous dash phase across a
+//     polyline). Used for the drag rubber band (dashed 5-4) and the
+//     prediction path (dashed 6-6 with per-batch alpha fade).
 //
 // Trail FBO design:
 //   - Two RGBA8 textures at viewport CSS-pixel resolution (no DPR upscale,
@@ -43,6 +59,7 @@
 
 import { state } from './state.js';
 import { ensureEntitySprite } from './sprite-cache.js';
+import { resolveDisplayColor } from './entities.js';
 
 // ─── Module state ─────────────────────────────────────────────────
 let _gl = null;
@@ -60,6 +77,10 @@ let _progTrailDecay = null;
 let _progTrailDot = null;
 let _progTrailBlit = null;
 let _progEntity = null;
+// V9.0b UI shaders:
+let _progCircleFill = null;
+let _progCircleRing = null;
+let _progLineSeg = null;
 
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
@@ -67,11 +88,18 @@ let _bufUnitQuad = null;        // unit quad centered (vec2 in [-1,+1]) for trai
 let _bufEntityCornerQuad = null; // entity per-vertex (vec2 in [0,1])
 let _bufInstanceTrail = null;   // dynamic per-instance VBO for trail dots
 let _bufInstanceEntity = null;  // dynamic per-instance VBO for entity sprites
+// V9.0b UI buffers:
+let _bufInstanceCircleFill = null; // dynamic per-instance VBO for filled disks
+let _bufInstanceCircleRing = null; // dynamic per-instance VBO for ring strokes
+let _bufInstanceLineSeg = null;    // dynamic per-instance VBO for line segments
 
 // VAOs (cached attrib+vbo state)
 let _vaoFsQuad = null;
 let _vaoTrailDot = null;
 let _vaoEntity = null;
+let _vaoCircleFill = null;
+let _vaoCircleRing = null;
+let _vaoLineSeg = null;
 
 // Trail ping-pong FBOs/textures
 let _fboA = null, _fboB = null;
@@ -85,6 +113,19 @@ const _spriteTexMap = new Map();
 // Reusable scratch arrays sized once; grown as needed.
 let _trailInstanceData = new Float32Array(0);  // (cx, cy, r, g, b) × N
 let _entityInstanceData = new Float32Array(0); // (cx, cy, w, h, ox, oy, alpha) × N
+// V9.0b UI scratch arrays. Each frame drawUI() pushes layer data into these
+// then issues one instanced draw per shader. Layout per element:
+//   circleFill: (cx, cy, radius, r, g, b, a)               × 7 floats
+//   circleRing: (cx, cy, radius, r, g, b, a, lineW, dashOn, dashPeriod)
+//                                                          × 10 floats
+//   lineSeg:    (x0, y0, x1, y1, r, g, b, a, arcStart, lineW, dashOn,
+//                dashPeriod)                               × 12 floats
+let _circleFillData = new Float32Array(0);
+let _circleFillCount = 0;
+let _circleRingData = new Float32Array(0);
+let _circleRingCount = 0;
+let _lineSegData = new Float32Array(0);
+let _lineSegCount = 0;
 
 // ─── Shader source ────────────────────────────────────────────────
 
@@ -180,6 +221,183 @@ void main() {
   outColor = vec4(t.rgb, t.a * vAlpha);
 }`;
 
+// ─── V9.0b UI shaders ─────────────────────────────────────────────
+// Common pattern: per-instance attribs carry primitive params + color;
+// per-vertex attrib aCorner is the unit quad in [-1,+1]² (filled circle,
+// ring) or [0,1]² (line seg). VS scales the corner to the primitive's
+// bounding extent in px and transforms via uOrtho; FS uses the per-pixel
+// local coords (passed as a varying) to compute alpha and discard outside.
+
+// --- Filled circle (hover ghost fill, drag ghost fill, absorbing body) ---
+// Per-instance: iCenter(vec2 px), iRadius(float px), iColor(vec4).
+// AA edge ramp = 1 px (matches V9.0a trail dot edge handling).
+const VS_CIRCLE_FILL = `#version 300 es
+in vec2 aCorner;
+in vec2 iCenter;
+in float iRadius;
+in vec4 iColor;
+uniform mat4 uOrtho;
+out vec2 vLocal;
+out vec4 vColor;
+out float vRadius;
+void main() {
+  float pad = iRadius + 1.0;          // +1 px for AA ramp
+  vec2 worldPx = iCenter + aCorner * pad;
+  vLocal = aCorner * pad;
+  vColor = iColor;
+  vRadius = iRadius;
+  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+}`;
+
+const FS_CIRCLE_FILL = `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in vec4 vColor;
+in float vRadius;
+out vec4 outColor;
+void main() {
+  float d = length(vLocal);
+  if (d > vRadius + 0.5) discard;
+  // Solid interior + 1-px AA ramp at the edge (alpha 1 → 0 across 1 px).
+  float a = (d <= vRadius - 0.5) ? 1.0 : (vRadius + 0.5 - d);
+  outColor = vec4(vColor.rgb, vColor.a * a);
+}`;
+
+// --- Ring stroke (hover outline, drag outline, handle, selection, BH edge) ---
+// Per-instance: iCenter, iRadius, iColor, iLineW (px, full stroke width),
+// iDashOn (px; 0 → solid), iDashPeriod (px; 0 → solid).
+// FS draws |d - iRadius| < iLineW/2 with 1-px AA on both edges. If
+// iDashPeriod > 0, masks by arc-length: arc = (atan2(y,x) wrapped to
+// [0, 2π) by adding 2π if negative) × iRadius, range [0, 2π·R); visible
+// if mod(arc, iDashPeriod) < iDashOn. The +2π wrap puts the dash seam
+// at the +X axis (3 o'clock) to match V8.1c Canvas2D's `arc(c,c,r,0,2π)`
+// + setLineDash start angle.
+const VS_CIRCLE_RING = `#version 300 es
+in vec2 aCorner;
+in vec2 iCenter;
+in float iRadius;
+in vec4 iColor;
+in float iLineW;
+in float iDashOn;
+in float iDashPeriod;
+uniform mat4 uOrtho;
+out vec2 vLocal;
+out vec4 vColor;
+out float vRadius;
+out float vLineW;
+out float vDashOn;
+out float vDashPeriod;
+void main() {
+  float pad = iRadius + iLineW * 0.5 + 1.0;   // +1 px AA ramp
+  vec2 worldPx = iCenter + aCorner * pad;
+  vLocal = aCorner * pad;
+  vColor = iColor;
+  vRadius = iRadius;
+  vLineW = iLineW;
+  vDashOn = iDashOn;
+  vDashPeriod = iDashPeriod;
+  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+}`;
+
+const FS_CIRCLE_RING = `#version 300 es
+precision highp float;
+#define PI 3.14159265359
+in vec2 vLocal;
+in vec4 vColor;
+in float vRadius;
+in float vLineW;
+in float vDashOn;
+in float vDashPeriod;
+out vec4 outColor;
+void main() {
+  float d = length(vLocal);
+  float half = vLineW * 0.5;
+  float distToRing = abs(d - vRadius);
+  if (distToRing > half + 0.5) discard;
+  // 1-px AA ramp on each edge of the ring.
+  float a = (distToRing <= half - 0.5) ? 1.0 : (half + 0.5 - distToRing);
+  if (vDashPeriod > 0.0) {
+    // Arc-length measured from the +X axis (3 o'clock), increasing in the
+    // direction atan2 grows (clockwise in screen space since Y is flipped
+    // by uOrtho). This matches V8.1c Canvas2D `arc(cx, cy, r, 0, 2π)` +
+    // setLineDash, which began the dash sequence at angle=0. Without the
+    // +2π wrap, atan2's (-π, π] range would put the seam at 9 o'clock.
+    float ang = atan(vLocal.y, vLocal.x);
+    if (ang < 0.0) ang += 2.0 * PI;
+    float arc = ang * vRadius;
+    float phase = mod(arc, vDashPeriod);
+    if (phase >= vDashOn) discard;
+  }
+  outColor = vec4(vColor.rgb, vColor.a * a);
+}`;
+
+// --- Line segment (rubber band, prediction path) ---
+// Each segment = one instance. Per-vertex aCorner ∈ {0,1}² where x is
+// "along" (0=start, 1=end) and y is "perp" (0=−lineW/2, 1=+lineW/2).
+// Per-instance: iP0, iP1 (vec2 px), iColor, iArcStart (px; cumulative
+// arc-length for dash phase continuity across a polyline), iLineW (px),
+// iDashOn, iDashPeriod (0 → solid).
+const VS_LINE_SEG = `#version 300 es
+in vec2 aCorner;
+in vec2 iP0;
+in vec2 iP1;
+in vec4 iColor;
+in float iArcStart;
+in float iLineW;
+in float iDashOn;
+in float iDashPeriod;
+uniform mat4 uOrtho;
+out vec4 vColor;
+out float vT;             // perp param (-half..+half px)
+out float vArc;           // arc-length at this fragment, px
+out float vLineW;
+out float vDashOn;
+out float vDashPeriod;
+void main() {
+  vec2 dir = iP1 - iP0;
+  float segLen = length(dir);
+  vec2 along = (segLen > 0.0) ? dir / segLen : vec2(1.0, 0.0);
+  vec2 perp = vec2(-along.y, along.x);
+  // Pad +0.5 px in the perpendicular direction so the FS AA ramp at the
+  // long edges of the quad isn't clipped. The along-axis extent stays
+  // exactly [iP0, iP1] — for a polyline that's correct because consecutive
+  // segments share endpoints; standalone segments (rubber band) have no
+  // visible end-caps but the dash mask hides truncation.
+  float s = aCorner.x;
+  float halfW = iLineW * 0.5 + 0.5;
+  vec2 worldPx = iP0
+               + along * (s * segLen)
+               + perp  * ((aCorner.y - 0.5) * 2.0 * halfW);
+  vT = (aCorner.y - 0.5) * 2.0 * halfW;
+  vArc = iArcStart + s * segLen;
+  vColor = iColor;
+  vLineW = iLineW;
+  vDashOn = iDashOn;
+  vDashPeriod = iDashPeriod;
+  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+}`;
+
+const FS_LINE_SEG = `#version 300 es
+precision highp float;
+in vec4 vColor;
+in float vT;
+in float vArc;
+in float vLineW;
+in float vDashOn;
+in float vDashPeriod;
+out vec4 outColor;
+void main() {
+  float half = vLineW * 0.5;
+  float absT = abs(vT);
+  if (absT > half + 0.5) discard;
+  float a = (absT <= half - 0.5) ? 1.0 : (half + 0.5 - absT);
+  if (vDashPeriod > 0.0) {
+    float phase = mod(vArc, vDashPeriod);
+    if (phase >= vDashOn) discard;
+  }
+  outColor = vec4(vColor.rgb, vColor.a * a);
+}`;
+
 // ─── Init ─────────────────────────────────────────────────────────
 
 export function initWebGL(canvas) {
@@ -216,9 +434,12 @@ export function initWebGL(canvas) {
     // out, _initBuffers would call gl.bindVertexArray(_vaoTrailDot) where
     // _vaoTrailDot is a stale handle, triggering an INVALID_OPERATION error.
     _progTrailDecay = _progTrailBlit = _progTrailDot = _progEntity = null;
+    _progCircleFill = _progCircleRing = _progLineSeg = null;
     _bufFsQuad = _bufUnitQuad = _bufEntityCornerQuad = null;
     _bufInstanceTrail = _bufInstanceEntity = null;
+    _bufInstanceCircleFill = _bufInstanceCircleRing = _bufInstanceLineSeg = null;
     _vaoFsQuad = _vaoTrailDot = _vaoEntity = null;
+    _vaoCircleFill = _vaoCircleRing = _vaoLineSeg = null;
     _fboA = _fboB = _texA = _texB = null;
     try {
       _initPrograms();
@@ -282,6 +503,36 @@ function _initPrograms() {
   _progEntity.iAlpha    = gl.getAttribLocation(_progEntity.prog, 'iAlpha');
   _progEntity.uOrtho    = gl.getUniformLocation(_progEntity.prog, 'uOrtho');
   _progEntity.uTex      = gl.getUniformLocation(_progEntity.prog, 'uTex');
+
+  // V9.0b UI programs
+  _progCircleFill = _makeProgram(VS_CIRCLE_FILL, FS_CIRCLE_FILL);
+  _progCircleRing = _makeProgram(VS_CIRCLE_RING, FS_CIRCLE_RING);
+  _progLineSeg    = _makeProgram(VS_LINE_SEG,    FS_LINE_SEG);
+
+  _progCircleFill.aCorner = gl.getAttribLocation(_progCircleFill.prog, 'aCorner');
+  _progCircleFill.iCenter = gl.getAttribLocation(_progCircleFill.prog, 'iCenter');
+  _progCircleFill.iRadius = gl.getAttribLocation(_progCircleFill.prog, 'iRadius');
+  _progCircleFill.iColor  = gl.getAttribLocation(_progCircleFill.prog, 'iColor');
+  _progCircleFill.uOrtho  = gl.getUniformLocation(_progCircleFill.prog, 'uOrtho');
+
+  _progCircleRing.aCorner     = gl.getAttribLocation(_progCircleRing.prog, 'aCorner');
+  _progCircleRing.iCenter     = gl.getAttribLocation(_progCircleRing.prog, 'iCenter');
+  _progCircleRing.iRadius     = gl.getAttribLocation(_progCircleRing.prog, 'iRadius');
+  _progCircleRing.iColor      = gl.getAttribLocation(_progCircleRing.prog, 'iColor');
+  _progCircleRing.iLineW      = gl.getAttribLocation(_progCircleRing.prog, 'iLineW');
+  _progCircleRing.iDashOn     = gl.getAttribLocation(_progCircleRing.prog, 'iDashOn');
+  _progCircleRing.iDashPeriod = gl.getAttribLocation(_progCircleRing.prog, 'iDashPeriod');
+  _progCircleRing.uOrtho      = gl.getUniformLocation(_progCircleRing.prog, 'uOrtho');
+
+  _progLineSeg.aCorner     = gl.getAttribLocation(_progLineSeg.prog, 'aCorner');
+  _progLineSeg.iP0         = gl.getAttribLocation(_progLineSeg.prog, 'iP0');
+  _progLineSeg.iP1         = gl.getAttribLocation(_progLineSeg.prog, 'iP1');
+  _progLineSeg.iColor      = gl.getAttribLocation(_progLineSeg.prog, 'iColor');
+  _progLineSeg.iArcStart   = gl.getAttribLocation(_progLineSeg.prog, 'iArcStart');
+  _progLineSeg.iLineW      = gl.getAttribLocation(_progLineSeg.prog, 'iLineW');
+  _progLineSeg.iDashOn     = gl.getAttribLocation(_progLineSeg.prog, 'iDashOn');
+  _progLineSeg.iDashPeriod = gl.getAttribLocation(_progLineSeg.prog, 'iDashPeriod');
+  _progLineSeg.uOrtho      = gl.getUniformLocation(_progLineSeg.prog, 'uOrtho');
 }
 
 function _initBuffers() {
@@ -314,6 +565,9 @@ function _initBuffers() {
   // Per-instance buffers (filled per frame)
   _bufInstanceTrail = gl.createBuffer();
   _bufInstanceEntity = gl.createBuffer();
+  _bufInstanceCircleFill = gl.createBuffer();
+  _bufInstanceCircleRing = gl.createBuffer();
+  _bufInstanceLineSeg    = gl.createBuffer();
 
   // Fullscreen quad VAO — shared by decay + blit passes. Both their shader
   // programs use VS_FULLSCREEN with `aPos` at location 0 (enforced via
@@ -370,6 +624,89 @@ function _initBuffers() {
   gl.vertexAttribPointer(_progEntity.iAlpha, 1, gl.FLOAT, false, 28, 24);
   gl.vertexAttribDivisor(_progEntity.iAlpha, 1);
 
+  gl.bindVertexArray(null);
+
+  // V9.0b: circle-fill VAO (uses centered _bufUnitQuad for aCorner ∈ [-1,+1])
+  // Per-instance: (cx, cy, radius, r, g, b, a) = 7 floats = 28 bytes
+  _vaoCircleFill = gl.createVertexArray();
+  gl.bindVertexArray(_vaoCircleFill);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufUnitQuad);
+  gl.enableVertexAttribArray(_progCircleFill.aCorner);
+  gl.vertexAttribPointer(_progCircleFill.aCorner, 2, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(_progCircleFill.aCorner, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleFill);
+  gl.enableVertexAttribArray(_progCircleFill.iCenter);
+  gl.vertexAttribPointer(_progCircleFill.iCenter, 2, gl.FLOAT, false, 28, 0);
+  gl.vertexAttribDivisor(_progCircleFill.iCenter, 1);
+  gl.enableVertexAttribArray(_progCircleFill.iRadius);
+  gl.vertexAttribPointer(_progCircleFill.iRadius, 1, gl.FLOAT, false, 28, 8);
+  gl.vertexAttribDivisor(_progCircleFill.iRadius, 1);
+  gl.enableVertexAttribArray(_progCircleFill.iColor);
+  gl.vertexAttribPointer(_progCircleFill.iColor, 4, gl.FLOAT, false, 28, 12);
+  gl.vertexAttribDivisor(_progCircleFill.iColor, 1);
+  gl.bindVertexArray(null);
+
+  // V9.0b: circle-ring VAO (uses _bufUnitQuad)
+  // Per-instance: (cx, cy, radius, r, g, b, a, lineW, dashOn, dashPeriod)
+  // = 10 floats = 40 bytes
+  _vaoCircleRing = gl.createVertexArray();
+  gl.bindVertexArray(_vaoCircleRing);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufUnitQuad);
+  gl.enableVertexAttribArray(_progCircleRing.aCorner);
+  gl.vertexAttribPointer(_progCircleRing.aCorner, 2, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(_progCircleRing.aCorner, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleRing);
+  gl.enableVertexAttribArray(_progCircleRing.iCenter);
+  gl.vertexAttribPointer(_progCircleRing.iCenter, 2, gl.FLOAT, false, 40, 0);
+  gl.vertexAttribDivisor(_progCircleRing.iCenter, 1);
+  gl.enableVertexAttribArray(_progCircleRing.iRadius);
+  gl.vertexAttribPointer(_progCircleRing.iRadius, 1, gl.FLOAT, false, 40, 8);
+  gl.vertexAttribDivisor(_progCircleRing.iRadius, 1);
+  gl.enableVertexAttribArray(_progCircleRing.iColor);
+  gl.vertexAttribPointer(_progCircleRing.iColor, 4, gl.FLOAT, false, 40, 12);
+  gl.vertexAttribDivisor(_progCircleRing.iColor, 1);
+  gl.enableVertexAttribArray(_progCircleRing.iLineW);
+  gl.vertexAttribPointer(_progCircleRing.iLineW, 1, gl.FLOAT, false, 40, 28);
+  gl.vertexAttribDivisor(_progCircleRing.iLineW, 1);
+  gl.enableVertexAttribArray(_progCircleRing.iDashOn);
+  gl.vertexAttribPointer(_progCircleRing.iDashOn, 1, gl.FLOAT, false, 40, 32);
+  gl.vertexAttribDivisor(_progCircleRing.iDashOn, 1);
+  gl.enableVertexAttribArray(_progCircleRing.iDashPeriod);
+  gl.vertexAttribPointer(_progCircleRing.iDashPeriod, 1, gl.FLOAT, false, 40, 36);
+  gl.vertexAttribDivisor(_progCircleRing.iDashPeriod, 1);
+  gl.bindVertexArray(null);
+
+  // V9.0b: line-segment VAO (uses _bufEntityCornerQuad [0,1] for aCorner)
+  // Per-instance: (x0, y0, x1, y1, r, g, b, a, arcStart, lineW, dashOn,
+  // dashPeriod) = 12 floats = 48 bytes
+  _vaoLineSeg = gl.createVertexArray();
+  gl.bindVertexArray(_vaoLineSeg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufEntityCornerQuad);
+  gl.enableVertexAttribArray(_progLineSeg.aCorner);
+  gl.vertexAttribPointer(_progLineSeg.aCorner, 2, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(_progLineSeg.aCorner, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
+  gl.enableVertexAttribArray(_progLineSeg.iP0);
+  gl.vertexAttribPointer(_progLineSeg.iP0, 2, gl.FLOAT, false, 48, 0);
+  gl.vertexAttribDivisor(_progLineSeg.iP0, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iP1);
+  gl.vertexAttribPointer(_progLineSeg.iP1, 2, gl.FLOAT, false, 48, 8);
+  gl.vertexAttribDivisor(_progLineSeg.iP1, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iColor);
+  gl.vertexAttribPointer(_progLineSeg.iColor, 4, gl.FLOAT, false, 48, 16);
+  gl.vertexAttribDivisor(_progLineSeg.iColor, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iArcStart);
+  gl.vertexAttribPointer(_progLineSeg.iArcStart, 1, gl.FLOAT, false, 48, 32);
+  gl.vertexAttribDivisor(_progLineSeg.iArcStart, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iLineW);
+  gl.vertexAttribPointer(_progLineSeg.iLineW, 1, gl.FLOAT, false, 48, 36);
+  gl.vertexAttribDivisor(_progLineSeg.iLineW, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iDashOn);
+  gl.vertexAttribPointer(_progLineSeg.iDashOn, 1, gl.FLOAT, false, 48, 40);
+  gl.vertexAttribDivisor(_progLineSeg.iDashOn, 1);
+  gl.enableVertexAttribArray(_progLineSeg.iDashPeriod);
+  gl.vertexAttribPointer(_progLineSeg.iDashPeriod, 1, gl.FLOAT, false, 48, 44);
+  gl.vertexAttribDivisor(_progLineSeg.iDashPeriod, 1);
   gl.bindVertexArray(null);
 }
 
@@ -691,8 +1028,8 @@ function _drawEntities() {
   const W = _vpW;
   const H = _vpH;
 
-  // Bucket entities by their sprite canvas. Skip absorbing entities (they
-  // render on the overlay 2D canvas via renderer.js).
+  // Bucket entities by their sprite canvas. Skip absorbing entities — their
+  // per-frame alpha varies so they're drawn by drawUI() via _progCircleFill.
   const buckets = new Map(); // canvas → flat array of (x, y, alpha) per instance
   const ents = state.entities;
 
@@ -768,4 +1105,289 @@ function _drawEntities() {
   }
 
   gl.bindVertexArray(null);
+  // Match the cleanup discipline of updateTrailCanvas: leave BLEND in a
+  // known-disabled state so any future pass that fails to re-enable it
+  // (or a debug-time injected pass) starts from a deterministic baseline.
+  gl.disable(gl.BLEND);
+}
+
+// ─── V9.0b UI overlay layers (WebGL) ──────────────────────────────
+// drawUI() is called per frame from main.js after drawScene(). It populates
+// the three UI scratch arrays from state.drag / state.hoverPos /
+// state.selectedId / absorbing entities, then issues one instanced draw per
+// shader program (or zero if a program has no work this frame).
+
+// Visual constants (mirror V8.1c renderer.js to keep visuals identical).
+const UI_SELECT_RING_COLOR = [0x6b / 255, 0x8c / 255, 0xff / 255]; // #6b8cff
+const UI_GHOST_FILL_ALPHA = 0.18;
+const UI_PREDICTION_BATCHES = 8;
+const UI_PREDICTION_DASH_ON = 6;     // px (V8.1c [6, 6])
+const UI_PREDICTION_DASH_OFF = 6;
+const UI_RUBBER_BAND_DASH_ON = 5;    // px (V8.1c [5, 4])
+const UI_RUBBER_BAND_DASH_OFF = 4;
+const UI_HOVER_DASH_ON = 3;          // px (V8.1c [3, 3])
+const UI_HOVER_DASH_OFF = 3;
+const UI_SELECT_DASH_ON = 4;         // px (V8.1c [4, 4])
+const UI_SELECT_DASH_OFF = 4;
+
+function _pushCircleFill(cx, cy, radius, r, g, b, a) {
+  const need = (_circleFillCount + 1) * 7;
+  if (_circleFillData.length < need) {
+    _circleFillData = _grow(_circleFillData, need);
+  }
+  const o = _circleFillCount * 7;
+  _circleFillData[o]     = cx;
+  _circleFillData[o + 1] = cy;
+  _circleFillData[o + 2] = radius;
+  _circleFillData[o + 3] = r;
+  _circleFillData[o + 4] = g;
+  _circleFillData[o + 5] = b;
+  _circleFillData[o + 6] = a;
+  _circleFillCount++;
+}
+
+function _pushCircleRing(cx, cy, radius, r, g, b, a, lineW, dashOn, dashPeriod) {
+  const need = (_circleRingCount + 1) * 10;
+  if (_circleRingData.length < need) {
+    _circleRingData = _grow(_circleRingData, need);
+  }
+  const o = _circleRingCount * 10;
+  _circleRingData[o]     = cx;
+  _circleRingData[o + 1] = cy;
+  _circleRingData[o + 2] = radius;
+  _circleRingData[o + 3] = r;
+  _circleRingData[o + 4] = g;
+  _circleRingData[o + 5] = b;
+  _circleRingData[o + 6] = a;
+  _circleRingData[o + 7] = lineW;
+  _circleRingData[o + 8] = dashOn;
+  _circleRingData[o + 9] = dashPeriod;
+  _circleRingCount++;
+}
+
+function _pushLineSeg(x0, y0, x1, y1, r, g, b, a, arcStart, lineW, dashOn, dashPeriod) {
+  const need = (_lineSegCount + 1) * 12;
+  if (_lineSegData.length < need) {
+    _lineSegData = _grow(_lineSegData, need);
+  }
+  const o = _lineSegCount * 12;
+  _lineSegData[o]      = x0;
+  _lineSegData[o + 1]  = y0;
+  _lineSegData[o + 2]  = x1;
+  _lineSegData[o + 3]  = y1;
+  _lineSegData[o + 4]  = r;
+  _lineSegData[o + 5]  = g;
+  _lineSegData[o + 6]  = b;
+  _lineSegData[o + 7]  = a;
+  _lineSegData[o + 8]  = arcStart;
+  _lineSegData[o + 9]  = lineW;
+  _lineSegData[o + 10] = dashOn;
+  _lineSegData[o + 11] = dashPeriod;
+  _lineSegCount++;
+}
+
+function _grow(arr, neededLen) {
+  let newLen = arr.length || 64;
+  while (newLen < neededLen) newLen *= 2;
+  // CRITICAL: copy existing data, otherwise every entry pushed before the
+  // resize point is zeroed out. The push functions write element N into
+  // the array, then the next push for element N+1 may trigger _grow —
+  // without next.set(arr) the previously-written element N becomes 0 and
+  // its instance renders at (0,0) with zero radius, vanishing from the
+  // output. Caught by V9.0b reviewer.
+  const next = new Float32Array(newLen);
+  next.set(arr);
+  return next;
+}
+
+export function drawUI() {
+  if (_disabled || !_gl) return;
+  if (_vpW <= 0 || _vpH <= 0) return;
+  _circleFillCount = 0;
+  _circleRingCount = 0;
+  _lineSegCount = 0;
+
+  _buildHoverGhost();
+  _buildDragPreview();   // includes prediction path
+  _buildAbsorbing();
+  _buildSelectionRing();
+
+  if (_circleFillCount === 0 && _circleRingCount === 0 && _lineSegCount === 0) return;
+
+  const gl = _gl;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, Math.round(_vpW * _dpr), Math.round(_vpH * _dpr));
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  // Draw filled circles first (under outlines / lines).
+  if (_circleFillCount > 0) {
+    gl.useProgram(_progCircleFill.prog);
+    gl.uniformMatrix4fv(_progCircleFill.uOrtho, false, _orthoMat);
+    gl.bindVertexArray(_vaoCircleFill);
+    gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleFill);
+    gl.bufferData(gl.ARRAY_BUFFER, _circleFillData.subarray(0, _circleFillCount * 7), gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, _circleFillCount);
+  }
+
+  // Lines (rubber band + prediction path) above fills.
+  if (_lineSegCount > 0) {
+    gl.useProgram(_progLineSeg.prog);
+    gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
+    gl.bindVertexArray(_vaoLineSeg);
+    gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
+    gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, _lineSegCount);
+  }
+
+  // Ring strokes on top (outline of ghosts, handle, selection ring, BH edge).
+  if (_circleRingCount > 0) {
+    gl.useProgram(_progCircleRing.prog);
+    gl.uniformMatrix4fv(_progCircleRing.uOrtho, false, _orthoMat);
+    gl.bindVertexArray(_vaoCircleRing);
+    gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleRing);
+    gl.bufferData(gl.ARRAY_BUFFER, _circleRingData.subarray(0, _circleRingCount * 10), gl.DYNAMIC_DRAW);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, _circleRingCount);
+  }
+
+  gl.bindVertexArray(null);
+}
+
+// hover ghost: filled translucent disk + 1-px dashed ring outline.
+function _buildHoverGhost() {
+  if (state.isEditMode) return;
+  if (state.drag) return;
+  if (!state.hoverPos) return;
+  const colorStr = resolveDisplayColor(
+    state.pending.type, state.pending.charge,
+    state.pending.type === 'planet' ? '#ffffff' : '#000000',
+  );
+  const c = _colorToRgbNorm(colorStr);
+  const r = state.pending.radius;
+  const { x, y } = state.hoverPos;
+  _pushCircleFill(x, y, r, c[0], c[1], c[2], UI_GHOST_FILL_ALPHA);
+  _pushCircleRing(
+    x, y, r, c[0], c[1], c[2], 1.0,
+    1.0, UI_HOVER_DASH_ON, UI_HOVER_DASH_ON + UI_HOVER_DASH_OFF,
+  );
+}
+
+// drag preview: ghost fill + solid outline at placement; dashed rubber-
+// band line to cursor; hollow handle ring at cursor; dashed faded-along-
+// arc prediction polyline (wrap-aware).
+function _buildDragPreview() {
+  const drag = state.drag;
+  if (!drag) return;
+  const colorStr = resolveDisplayColor(
+    state.pending.type, state.pending.charge, drag.previewBaseColor,
+  );
+  const c = _colorToRgbNorm(colorStr);
+  const radius = state.pending.radius;
+
+  // 1. Ghost fill at placement.
+  _pushCircleFill(drag.startX, drag.startY, radius, c[0], c[1], c[2], UI_GHOST_FILL_ALPHA);
+  // 2. Solid 1-px outline.
+  _pushCircleRing(drag.startX, drag.startY, radius, c[0], c[1], c[2], 1.0, 1.0, 0.0, 0.0);
+
+  // 3. Dashed rubber band to cursor.
+  _pushLineSeg(
+    drag.startX, drag.startY, drag.currentX, drag.currentY,
+    c[0], c[1], c[2], 1.0, 0.0, 1.5,
+    UI_RUBBER_BAND_DASH_ON, UI_RUBBER_BAND_DASH_ON + UI_RUBBER_BAND_DASH_OFF,
+  );
+
+  // 4. Hollow handle ring at cursor.
+  const dx = drag.currentX - drag.startX;
+  const dy = drag.currentY - drag.startY;
+  const dragDist = Math.hypot(dx, dy);
+  const handleR = Math.max(6, Math.min(14, dragDist * 0.08 + 6));
+  _pushCircleRing(drag.currentX, drag.currentY, handleR, c[0], c[1], c[2], 1.0, 2.0, 0.0, 0.0);
+
+  // 5. Prediction path: dashed polyline with per-batch alpha fade.
+  const path = drag.predictionPath;
+  if (!path || path.length < 2) return;
+  const data = path.data;
+  const n = path.length;
+  const batchSize = Math.max(2, Math.ceil(n / UI_PREDICTION_BATCHES));
+  const wrap = state.boundaryMode === 'wrap';
+  const wrapX = wrap ? _vpW * 0.5 : Infinity;
+  const wrapY = wrap ? _vpH * 0.5 : Infinity;
+  const dashPeriod = UI_PREDICTION_DASH_ON + UI_PREDICTION_DASH_OFF;
+
+  // Walk the path segment by segment. Accumulate arcStart (running cum
+  // length) so dash phase is continuous across the polyline. Reset arc
+  // on a wrap-jump (the segment is skipped — no draw — so phase reset
+  // there is invisible). Within each batch, alpha = (1 - b/N) * 0.85.
+  // prevX/prevY carry forward across batch boundaries (the path is one
+  // continuous polyline visually; batches only stagger alpha).
+  let arc = 0;
+  let prevX = data[0];
+  let prevY = data[1];
+  for (let b = 0; b < UI_PREDICTION_BATCHES; b++) {
+    const start = b * batchSize;
+    if (start >= n - 1) break;
+    const end = Math.min(n - 1, start + batchSize);
+    const alpha = (1 - b / UI_PREDICTION_BATCHES) * 0.85;
+    for (let i = start + 1; i <= end; i++) {
+      const x = data[i * 2];
+      const y = data[i * 2 + 1];
+      const adx = Math.abs(x - prevX);
+      const ady = Math.abs(y - prevY);
+      if (adx > wrapX || ady > wrapY) {
+        // wrap-jump: skip drawing this segment; reset phase.
+        prevX = x; prevY = y;
+        arc = 0;
+        continue;
+      }
+      const segLen = Math.hypot(x - prevX, y - prevY);
+      if (segLen > 0) {
+        _pushLineSeg(
+          prevX, prevY, x, y,
+          c[0], c[1], c[2], alpha, arc, 1.5,
+          UI_PREDICTION_DASH_ON, dashPeriod,
+        );
+        arc += segLen;
+      }
+      prevX = x; prevY = y;
+    }
+  }
+}
+
+// absorbing entities: per-frame variable alpha, can't be sprite-cached.
+// Fading filled disk; optionally a thin outline for black holes.
+function _buildAbsorbing() {
+  const ents = state.entities;
+  for (let i = 0; i < ents.length; i++) {
+    const e = ents[i];
+    if (!e.absorbing) continue;
+    const t = Math.min(1, e.absorbing.elapsedSim / state.absorptionDuration);
+    const fade = Math.max(0, 1 - t);
+    if (fade <= 0) continue;
+    const r = Math.max(0, e.radius);
+    const col = _colorToRgbNorm(e.color);
+    _pushCircleFill(e.x, e.y, r, col[0], col[1], col[2], fade);
+
+    if (e.type === 'black_hole') {
+      // V8.1c: charge -1 (white BH) → rgba(0,0,0,0.55); else rgba(120,180,255,0.75).
+      let er, eg, eb, ea;
+      if (e.charge === -1) {
+        er = 0; eg = 0; eb = 0; ea = 0.55;
+      } else {
+        er = 120 / 255; eg = 180 / 255; eb = 255 / 255; ea = 0.75;
+      }
+      _pushCircleRing(e.x, e.y, r, er, eg, eb, ea * fade, 1.5, 0.0, 0.0);
+    }
+  }
+}
+
+function _buildSelectionRing() {
+  if (state.selectedId === null) return;
+  const sel = state.entities.find(e => e.id === state.selectedId);
+  if (!sel) return;
+  _pushCircleRing(
+    sel.x, sel.y, sel.radius + 6,
+    UI_SELECT_RING_COLOR[0], UI_SELECT_RING_COLOR[1], UI_SELECT_RING_COLOR[2], 1.0,
+    2.0, UI_SELECT_DASH_ON, UI_SELECT_DASH_ON + UI_SELECT_DASH_OFF,
+  );
 }

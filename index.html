@@ -9,12 +9,11 @@
 <body>
   <div id="app">
     <div id="stage-wrap">
-      <!-- WebGL 2 hot path: background, trail FBO, entity sprites + wrap mirrors. -->
+      <!-- V9.0b: single WebGL 2 canvas. renderer-webgl.js draws background,
+           trail FBO, entity sprites + 9-ghost wrap mirrors (drawScene), and
+           the UI overlay layers — hover ghost, drag preview, prediction
+           line, selection ring, absorbing fallback (drawUI). -->
       <canvas id="stage" aria-label="重力场沙盒画布"></canvas>
-      <!-- V9.0a transitional Canvas2D overlay for UI lines (hover ghost, drag
-           preview, prediction line, selection ring, absorbing fallback). Will
-           be deleted in V9.0b once those layers migrate to WebGL. -->
-      <canvas id="overlay" aria-hidden="true"></canvas>
       <!-- Shown if WebGL 2 is unavailable; renderer-webgl.js sets text + un-hides. -->
       <div id="webgl-error" role="alert" hidden></div>
     </div>

@@ -1,28 +1,28 @@
-// main.js — Entry point. Wires canvases (WebGL stage + Canvas2D overlay),
-// input, UI, and the simulation loop.
+// main.js — Entry point. Wires the WebGL stage canvas, input, UI, and the
+// simulation loop.
 //
-// Time stepping uses a fixed physics dt (SIM_DT) with an accumulator
-// scaled by `state.timeScale`. This decouples physics stability from frame
-// rate and lets the user slow/speed/pause time without affecting accuracy.
+// Time stepping uses a fixed physics dt (SIM_DT) with an accumulator scaled
+// by `state.timeScale`. This decouples physics stability from frame rate
+// and lets the user slow/speed/pause time without affecting accuracy.
 //
-// V9.0a rendering split:
-//   - `#stage` canvas → WebGL 2 hot path (background, trail FBO, entity
-//     sprites with 9-ghost wrap mirrors). See renderer-webgl.js.
-//   - `#overlay` canvas → Canvas2D UI lines (hover ghost, drag preview,
-//     prediction line, selection ring, absorbing fallback). See renderer.js.
-//   Both canvases share the same CSS-pixel coordinate space (DPR is applied
-//   to each backing store independently). Pointer events go to #stage only;
-//   #overlay has pointer-events:none.
+// V9.0b rendering pipeline (single canvas, all WebGL):
+//   - `#stage` canvas → WebGL 2. renderer-webgl.js exports drawScene
+//     (background + trail FBO + entity sprites + 9-ghost wrap mirrors) and
+//     drawUI (hover ghost + drag preview + prediction line + selection
+//     ring + absorbing fallback). Both write to the same default framebuffer
+//     in CSS-pixel logical coords via a shared ortho matrix.
+//   - Pointer events go straight to #stage (no separate overlay canvas to
+//     intercept them).
 
 import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
 import { stepVerlet, handleCollisions, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
 import {
   initWebGL,
   drawScene as drawSceneGL,
+  drawUI,
   updateTrailCanvas,
   resizeRenderer,
 } from './renderer-webgl.js';
-import { drawOverlay } from './renderer.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 
@@ -30,15 +30,13 @@ const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a s
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
 
 const stageCanvas = document.getElementById('stage');
-const overlayCanvas = document.getElementById('overlay');
-const overlayCtx = overlayCanvas.getContext('2d');
 
 // Initialize WebGL 2 on the stage canvas. On failure renderer-webgl.js
-// surfaces the error UX and disables itself; we let the loop still tick so
-// the (now-static) overlay still renders and panel sliders remain reactive.
+// surfaces the error UX (#webgl-error overlay) and disables itself; the
+// loop still ticks so panel sliders remain reactive even with no rendering.
 const webglOk = initWebGL(stageCanvas);
 if (!webglOk) {
-  console.error('[main] WebGL 2 unavailable — UI overlay still active, but no stage rendering.');
+  console.error('[main] WebGL 2 unavailable — stage cannot render.');
 }
 
 setupCanvas();
@@ -92,11 +90,11 @@ function frame(now) {
     }
   }
 
-  // V9.0a: render WebGL first (clears stage to bgColor and draws trails +
-  // entities), then clear+draw overlay 2D on top.
+  // V9.0b: WebGL draws everything. drawScene clears, blits trail, draws
+  // entity sprites; drawUI then overlays hover/drag/prediction/selection/
+  // absorbing on the same framebuffer with standard alpha blending.
   drawSceneGL();
-  overlayCtx.clearRect(0, 0, state.viewport.width, state.viewport.height);
-  drawOverlay(overlayCtx);
+  drawUI();
 
   updateEntityCount();
   requestAnimationFrame(frame);
@@ -104,9 +102,9 @@ function frame(now) {
 
 // ─── Canvas / DPR ──────────────────────────────────────────────────
 // We render in CSS-pixel units so input coordinates (from clientX/Y minus
-// bounding rect) match the physics coord space 1:1. Each canvas backing
-// store is DPR-scaled; the overlay's 2D ctx transform compensates, while
-// the WebGL stage handles DPR internally via its ortho matrix + viewport.
+// bounding rect) match the physics coord space 1:1. The canvas backing
+// store is DPR-scaled; the WebGL stage handles DPR via gl.viewport +
+// an ortho matrix that maps CSS-px → NDC.
 function setupCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = stageCanvas.getBoundingClientRect();
@@ -115,9 +113,6 @@ function setupCanvas() {
 
   stageCanvas.width  = w * dpr;
   stageCanvas.height = h * dpr;
-  overlayCanvas.width  = w * dpr;
-  overlayCanvas.height = h * dpr;
-  overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   state.viewport.width = w;
   state.viewport.height = h;
