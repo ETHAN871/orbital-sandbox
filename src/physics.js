@@ -141,24 +141,16 @@ const PBD_ITERATIONS = 4;
 let _contacts = new Array(256);
 let _contactCount = 0;
 
-// Contact-persistence tracking. A pair is "persistent" (no bounce) if
-// EITHER it was a contact last substep OR its PRE-KICK relative normal
-// velocity is essentially zero (orbital tangential motion / resting).
-// A pair is "new" (apply restitution) only when both gates fail — i.e.
-// the bodies were genuinely approaching BEFORE this substep's gravity
-// kick.
+// Contact-persistence tracking. A pair is "persistent" if EITHER it
+// was a contact last substep OR its PRE-KICK relative normal velocity
+// is essentially zero (orbital tangential motion / resting). Persistent
+// contacts skip restitution bounce; "new" contacts (genuine impact at
+// non-zero approach speed) get the standard -e·vnApproach treatment.
 //
-// The pre-kick check is the principled, scale-invariant alternative to
-// the earlier `vnApproach < -5 px/s` threshold: the kick-induced
-// approach velocity is exactly `a·dt·n̂`, so by subtracting it from the
-// detection-time vnApproach we recover the body's TRUE approach speed
-// (zero for resting / orbital contacts; the actual impact velocity for
-// genuine collisions, even slow ones). Works at any G / mass / dt.
-//
-// _prevPairs is rebuilt at the END of handleCollisions from the
-// current substep's _contacts, so the next substep's broadphase sees
-// "previous". The Set catches warm-started orbital contacts where one
-// substep's bookkeeping bridges into the next.
+// Sprint 2 of the Box2D refactor will REPLACE this Set with a
+// Map<pairKey, normalImpulse> for warm-starting the velocity solver
+// across substeps. For now keep the Set; only `.has()` semantics are
+// used downstream.
 const _prevPairs = new Set();
 function _pairKey(a, b) {
   // Symmetric key — order of arguments doesn't matter.
@@ -171,30 +163,6 @@ function _pairKey(a, b) {
 // because processCollisionPair signature is fixed by the broadphase
 // dispatch (forEachCollisionPair in physics-spatial-hash.js).
 let _currentSimDt = 0;
-
-// Per-body refund grace: when the velocity solver applied a meaningful
-// impulse to a body this substep (cascade member of a real collision),
-// the refund pass (G'') is skipped for that BODY for the next
-// REFUND_GRACE_FRAMES substeps. Lets the impulse cascade settle into
-// stable motion before refund re-engages.
-//
-// Critical to be PER-BODY (not scene-global): the user reported that
-// in busy scenes with many simultaneous interactions, a global grace
-// counter is perpetually reset by any new contact anywhere, so refund
-// never fires and static configs lose their stability — visible as
-// dense clusters jittering and overlapping near wrap boundaries.
-// Per-body grace cleanly isolates the affected bodies; stable bodies
-// elsewhere keep getting refund every substep.
-//
-// COLLISION_IMPULSE_THRESHOLD: cumulative |J| (across velocity-solver
-// iterations) per contact that marks it as collision-cascade rather
-// than gravity-induced. Static / orbital contacts: solver applies
-// small impulse each substep just to zero the kick-induced inward
-// velocity component (~150 per contact for typical G=500 dt=1/120
-// mass=100). Collision-cascade contacts: solver applies impulse
-// proportional to the cascade's velocity transmission (~3000+).
-// 500 cleanly separates them.
-const COLLISION_IMPULSE_THRESHOLD = 500;
 
 // Pre-kick approach-velocity threshold for "this is a real collision,
 // not a kick-induced spurious approach". A few ULPs above zero leaves
@@ -211,70 +179,67 @@ function ensureScratch(n) {
   }
 }
 
-// Position-Based Dynamics step. Replaces the legacy Velocity Verlet +
-// impulse pipeline. Pipeline per substep:
+// Physics step — Box2D-style Sequential-Impulses + pseudo-velocity NGS.
 //
-//   A. Save x_prev (so velocity can be derived post-projection).
-//   B. Compute accelerations at current positions.
-//   C. Symplectic Euler gravity kick:    v += a · dt
-//   D. Predict positions:                x += v · dt
-//   E. handleCollisions: broadphase at PREDICTED positions. For BH pairs,
-//      runs beginAbsorption immediately. For planet-planet pairs, pushes
-//      onto _contacts[] (no immediate impulse — PBD resolves later).
-//   F. _solveContactVelocities (Sequential-Impulses-style velocity solver):
-//      For each contact, drive relative normal velocity to a target
-//      (-e·vnApproach for genuine collisions, 0 for persistent contacts).
-//      Iterated 4× for Gauss-Seidel convergence in dense clusters.
-//   G. _projectPBDContacts: iterate PBD_ITERATIONS passes, each pushing
-//      overlapping pairs apart by mass-weighted normal correction.
-//   G''. Energy refund: scale each body's v² by 2·(a·Δx) to repay the
-//        PE the position solver injected when it moved bodies up the
-//        gravity gradient. Closes the secular-breathing-oscillation
-//        leak that experiments traced to projection's non-physicality.
-//   G'. _relaxContactVelocities: one no-bias pass at post-projection
-//       positions to cancel the residual inward velocity introduced when
-//       the position solver refreshes each contact's normal. Catto 2024.
-//   H. _applyStaticContactDamping: zero out velocities of in-contact
-//      bodies whose speed has decayed below STATIC_V_THRESHOLD.
+// Pipeline per substep:
+//   A. Reset per-body pseudo-velocity (_pvx, _pvy ← 0).
+//   B. Compute accelerations at current positions (charge-asymmetric
+//      gravity + Plummer softening). Already wraps via minimum-image
+//      convention in computeAccelerations.
+//   C. Gravity kick: v += a · dt   (symplectic Euler).
+//   D. Predict positions: x += v · dt.
+//   E. handleCollisions broadphase at predicted positions. For black-
+//      hole pairs, beginAbsorption fires immediately. For planet-planet
+//      pairs, push onto _contacts[] with c.vnApproach + c.wasPersistent
+//      captured. Warm-start lookup populates c.normalImpulse from the
+//      previous substep's value in _prevPairImpulses.
+//   F. _solveContactVelocities: Box2D-style Sequential Impulses with
+//      warm-starting and accumulated-impulse clamping ≥ 0. 8 iterations.
+//   F'. Persist this substep's accumulated normal impulses into
+//      _prevPairImpulses for next substep's warm-start.
+//   G. _solvePositionConstraints: pseudo-velocity Non-linear Gauss-
+//      Seidel. 3 iterations. Pseudo-velocity integrates into position
+//      at the end without touching real velocity. Uses Baumgarte slop
+//      to avoid jitter on resting contacts and a maxCorrection cap to
+//      avoid teleporting on penetration spikes.
+//   I. Pinned bodies hard-reset to v=0 (defensive — wA=0 in solvers
+//      should already prevent any change but a stray write elsewhere
+//      would compound).
 //
-// Why this fixes the bug: in Velocity Verlet's velocity update
-// `v += 0.5 * (a_old + a_new) * dt`, the cached a_old at a body's
-// PRE-step position has a tangential component when viewed from the
-// body's POST-step rotated position. In a free orbit this is the natural
-// centripetal redirection. In a contact-constrained orbit the inward
-// radial portion is killed by the collision impulse but the tangential
-// portion leaks through (Δv_t ≈ 0.5·|a|·v_t·dt²/r per step), accumulating
-// linearly. PBD's velocity derivation (v = Δx/dt) recovers velocity from
-// the net position change after constraint projection; the tangential
-// bias never enters the equation.
+// What was removed (and why) in the 2026-05-20 Box2D refactor:
+//   • Centripetal projection (B'): bandaid for an orbital-drift bug
+//     that the proper position-solver pseudo-velocity split makes
+//     unnecessary — real velocity is never polluted by position
+//     correction so the drift source it patched doesn't exist.
+//   • Energy refund (G''): attempted to compensate the PE injected
+//     when the kinematic position projection moved bodies up the
+//     gravity gradient. With pseudo-velocity NGS, the position pass
+//     doesn't write to real position from gravity terms — it only
+//     applies the constraint normal — so no PE is "injected" that
+//     needs refunding.
+//   • Relaxation pass (G'): Catto-style relaxation specifically
+//     removes the bias term that soft constraints inject. We use
+//     hard constraints with a separate position pass, no bias to
+//     relax against.
+//   • Static contact damping (H): the artificial sleep was too
+//     aggressive in busy multi-body scenes (pinned slow-moving
+//     bodies that should continue evolving). Warm-starting the
+//     velocity solver now does the job naturally — resting contacts
+//     converge to their equilibrium impulse in 1–2 iterations when
+//     seeded from the previous substep's converged value.
 export function stepPBD(entities, dt) {
   const n = entities.length;
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
 
-  // Cache dt for processCollisionPair's pre-kick velocity calculation.
+  // Cache dt for processCollisionPair's pre-kick velocity calculation
+  // (used by the wasPersistent gate, NOT by any deleted refund code).
   _currentSimDt = dt;
+
+  // (Sprint 3 will add: A. Reset pseudo-velocity accumulator here.)
 
   // ── B. Compute accelerations at current positions ──────────────
   computeAccelerations(entities, _scratch);
-
-  // ── B'. Centripetal projection for bodies in stable contact ────
-  // For a body resting on (or orbiting in contact with) another, the
-  // inward portion of gravity that EXCEEDS the centripetal requirement
-  // is absorbed by the constraint — it must not contribute to velocity
-  // changes. Without this projection, every substep injects a tiny
-  // tangential drift (proportional to v_t) because the predict step
-  // sinks the body radially, then projection scales it back to the
-  // constraint surface, advancing its ANGLE slightly more than
-  // v_t·dt/r would warrant. Subtracting the excess radial gravity
-  // before the kick eliminates the drift at its source.
-  //
-  // _contacts at this point holds the contacts detected during the
-  // PREVIOUS substep's handleCollisions. Stable contacts persist across
-  // substeps, so this look-back is well-suited. (First substep after a
-  // body spawns has no contacts yet — that single-substep bias is
-  // O(dt²) and self-corrects on the next substep when contacts populate.)
-  _centripetalProject(entities);
 
   // ── C. Gravity kick: v += a · dt ───────────────────────────────
   for (let i = 0; i < n; i++) {
@@ -284,8 +249,7 @@ export function stepPBD(entities, dt) {
     const ay = _scratch[i].ay;
     e.vx += ax * dt;
     e.vy += ay * dt;
-    // Cache a for any downstream reader (debug-energy.js, prediction
-    // tooling). This is the (possibly centripetal-projected) accel.
+    // Cache a for downstream readers (debug-energy.js, prediction tooling).
     e.ax = ax;
     e.ay = ay;
   }
@@ -299,305 +263,26 @@ export function stepPBD(entities, dt) {
   }
 
   // ── E. Detect contacts at predicted positions ──────────────────
-  // handleCollisions does the broadphase: BH pairs trigger absorption
-  // immediately; planet-planet pairs push onto _contacts[].
+  // handleCollisions: BH pairs → beginAbsorption immediately.
+  // planet-planet pairs → push onto _contacts[] with warm-start lookup.
   handleCollisions(entities);
 
-  // ── F. Velocity solver (Sequential-Impulses-style) ─────────────
-  // Iteratively apply impulses along each contact normal to drive
-  // relative normal velocity to its target:
-  //   - persistent contacts (vnApproach near zero, orbital motion) → 0
-  //   - genuine collisions (vnApproach below threshold) → -e·vnApproach
-  // Running this BEFORE the position solver — and crucially, BEFORE
-  // any `v = Δx/dt` re-derivation — is what stops the multi-body hex
-  // cluster from leaking tangential energy. PBD's position-only
-  // pipeline left the inward velocity component implicit in Δx; here
-  // we cancel it explicitly at the velocity level, which is the
-  // canonical fix for "stacking under gravity" per Box2D / Catto.
-  //
+  // ── F. Sequential-Impulses velocity solver ─────────────────────
+  // (Sprint 1: 4 iter, no warm-starting. Sprint 2 will upgrade to
+  // 8 iter + accumulated impulse clamp + warm-start from _prevPairs
+  // turned into _prevPairImpulses Map.)
   _solveContactVelocities(_contactCount);
 
-  // ── G. Position solver (non-linear Gauss-Seidel) ───────────────
-  // Resolve residual penetration. Now that velocities along each
-  // contact normal are already zero, the position projection mostly
-  // catches first-time penetrations (initial overlap, fast impacts).
-  //
-  // Reset each body's GRAVITY-only Δx accumulator before the position
-  // solver. _projectPBDContacts will accumulate displacement
-  // contributions from gravity-induced contacts only (per-contact
-  // classification via c.preVn vs COLLISION_PREVN_THRESHOLD). The
-  // energy refund (G'') uses this gravity-only Δx so collision-cascade
-  // displacements don't get refunded (which would drain the
-  // momentum the impact installed in the cluster).
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    e._dxGrav = 0;
-    e._dyGrav = 0;
-  }
+  // ── G. Position projection ─────────────────────────────────────
+  // (Sprint 1: still the direct PBD positional correction. Sprint 3
+  // will replace with pseudo-velocity NGS that doesn't write to real
+  // positions — uses _pvx, _pvy accumulators integrated at the end.)
   _projectPBDContacts(_contactCount);
 
-  // ── G''. Energy-conserving position projection refund ──────────
-  // PBD's position solver is a KINEMATIC correction — it moves bodies
-  // along the contact normal to undo overlap without accounting for
-  // the work the constraint "should have done" against gravity over
-  // that displacement. Net effect: each substep every body the
-  // projection pushes gains a tiny amount of phantom PE without a
-  // matching KE decrease. The experiments traced this to the secular
-  // breathing-oscillation source.
-  //
-  // Refund (work-energy theorem applied as a scalar KE adjustment):
-  //   • Δx_i = body i's net displacement from the position solver
-  //   • Work done by net force on body over Δx_i (per unit mass):
-  //         w = a_i · Δx_i        ⇒    ΔKE/m = w
-  //   • New |v|² = |v|² + 2·w; rescale v by sqrt(new/old).
-  //
-  // Two implementations were tried:
-  //   (a) Radial-only refund (apply Δv only along Δx̂). Mathematically
-  //       cleaner — only the component of v along the displacement
-  //       should be touched. BUT: in the orbital regime v_along is
-  //       tiny (mostly tangential motion) while |a·Δx| can exceed
-  //       v_along², triggering the clamp and zeroing v_along. That
-  //       breaks the discrete-orbit centripetal velocity component,
-  //       cascading into massive r oscillation (ΔE −47 % at v=77).
-  //   (b) Scalar |v|² rescale (this version). Slightly less
-  //       physically precise (touches tangential KE proportionally),
-  //       but BOUNDED — never zeros a velocity component. For the
-  //       orbital case the scale factor is ~1±1e-5 per substep, so
-  //       the tangential bleed is negligible. ΔE at v=77 ≈ +0.02 %.
-  //
-  // (b) is the practical choice for our scene mix. The slight
-  // tangential bleed at deep sub-orbital initial conditions
-  // (v=30 → ~10 % KE loss / 60 s) is a known trade-off; those
-  // configurations are not user-reachable through the UI and benefit
-  // from the much-improved r-range stability they get in exchange
-  // (v=30 r-range 20.3 → 0.46).
-  //
-  // a_i used here is the post-centripetal-projection net acceleration
-  // step C kicked with — physically consistent because it represents
-  // the body's effective acceleration (gravity minus implicit
-  // constraint absorption).
-  // Refund uses each body's GRAVITY-only Δx accumulator (set by the
-  // position solver during step G; only gravity-induced contacts
-  // contributed). This per-contact classification cleanly separates:
-  //   - Stable clusters (all contacts gravity-induced) — refund
-  //     fires fully on every body each substep, suppressing the
-  //     FP-noise amplification that otherwise jitters dense piles.
-  //   - Collision cascades — contacts with high pre-kick approach
-  //     velocity are excluded from refund accumulator, so the
-  //     cluster's impact-given momentum is preserved. As the
-  //     impulse propagates through the cluster across substeps,
-  //     subsequent contacts get marked collision-induced by their
-  //     pre-kick relative velocity automatically.
-  //
-  // Replaces the earlier per-body grace counter, which had to
-  // choose between (a) too-narrow gating that left collision
-  // cascades refund-damped or (b) propagation through the contact
-  // graph that disabled refund scene-wide in dense aggregates.
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    const dx = e._dxGrav;
-    const dy = e._dyGrav;
-    const dx2 = dx * dx + dy * dy;
-    if (dx2 < 1e-12) continue;                  // no gravity-induced motion
-    const adx = e.ax * dx + e.ay * dy;
-    const v2 = e.vx * e.vx + e.vy * e.vy;
-    const v2New = v2 + 2 * adx;
-    if (v2New <= 0) {
-      e.vx = 0;
-      e.vy = 0;
-      continue;
-    }
-    if (v2 < 1e-12) {
-      const mag = Math.sqrt(v2New);
-      const invDxLen = 1 / Math.sqrt(dx2);
-      const sign = adx > 0 ? 1 : -1;
-      e.vx = sign * mag * dx * invDxLen;
-      e.vy = sign * mag * dy * invDxLen;
-      continue;
-    }
-    const scale = Math.sqrt(v2New / v2);
-    e.vx *= scale;
-    e.vy *= scale;
-  }
-
-  // ── G'. Relaxation pass (Catto 2024 Solver2D, no-bias second solve) ─
-  // After the position solver, each contact's normal has been refreshed
-  // to the post-projection geometry; in dense clusters that refreshed
-  // normal can differ slightly from what step F operated on, so a body's
-  // velocity — perfectly tangent to its OLD normal — picks up a small
-  // approach component along its NEW normal. Without this pass, that
-  // approach component is what your hypothesis identified as the
-  // "微小重叠再弹开 → 不对称 → 累积旋转" feedback path: each substep
-  // injects a sub-pixel-scale inward velocity that the velocity solver
-  // (which ran one step earlier in F) couldn't have seen.
-  //
-  // The relaxation pass re-solves the contact velocity constraints with
-  // vnTarget = 0 for ALL contacts (no restitution, no Baumgarte bias).
-  // It is ONE-SIDED — it only applies impulse if vn < 0 (still
-  // approaching), never to undo a separating velocity. So it preserves:
-  //   • elastic restitution from step F (vn > 0 → no-op here)
-  //   • orbital tangential motion (radial component is genuinely 0 → no-op)
-  // and only removes the small residual approach velocity that
-  // position-projection-induced normal rotation revealed.
-  //
-  // Catto 2024 reports relaxation "improves the simulation quality
-  // dramatically." In our split-impulse pipeline (no Baumgarte bias to
-  // remove) the gain is more modest, but it directly closes the
-  // user-identified amplification path. Iterating once is enough — the
-  // residuals after step F are already small.
-  _relaxContactVelocities(_contactCount);
-
-  // ── H. Static contact damping ──────────────────────────────────
-  // DISABLED 2026-05-20: the 0.1 px/s threshold was too aggressive —
-  // bodies in slow-moving multi-body clusters (under near-equilibrium
-  // mutual gravity) were being PINNED IN PLACE, producing the
-  // "dynamic sleep" failure the user observed where dense aggregates
-  // froze instead of evolving. The energy-refund pass (G'') and the
-  // relaxation pass (G') already provide enough stability for the
-  // statically-generated configurations (all-touching hex N=6 stays
-  // bounded at sub-μ-pixel for 5+ min), so the artificial sleep is
-  // no longer earning its cost. Keep the function defined below as
-  // dead code in case a future scene needs explicit sleeping.
-  // _applyStaticContactDamping(_contactCount);
-
-  // ── I. Pinned bodies stay frozen ───────────────────────────────
-  // Defensive: each solver above zeroes `wA` (or `wB`) when the body is
-  // pinned, so impulses MUST have no effect on it — but if any future
-  // refactor accidentally lets a pinned body accumulate v or a (e.g.,
-  // forgetting the `if (e.pinned) continue` in the gravity kick), this
-  // hard reset catches it. Costs O(n) per substep; trivial.
+  // ── I. Pinned bodies hard-reset ────────────────────────────────
   for (let i = 0; i < n; i++) {
     const e = entities[i];
     if (e.pinned) { e.vx = 0; e.vy = 0; e.ax = 0; e.ay = 0; }
-  }
-}
-
-// ─── Centripetal projection ───────────────────────────────────────
-// Subtract the "excess radial gravity" that a contact constraint will
-// absorb anyway, BEFORE the velocity kick. Without this step, PBD by
-// itself still leaks tangential energy in sub-orbital contact aggregates
-// — the predict step sinks the body radially into its constraint, then
-// the projection pushes it back to the surface, advancing its angular
-// position slightly more than v_t·dt/R warrants. The angular drift
-// integrates over many substeps into a steady tangential acceleration.
-//
-// Mechanism: for each body in a recent contact, compute the gravity
-// component pointing INTO the constraint surface (positive aInward).
-// If aInward exceeds the centripetal requirement v_t²/r — i.e., the
-// body is moving slower than the local circular-orbit speed — the
-// excess will be absorbed by the constraint. Subtract that excess from
-// the body's acceleration before integrating. The remaining radial
-// portion is exactly what's needed to curve the trajectory along the
-// constraint surface at the body's current tangential speed.
-//
-// Reads _contacts[0.._contactCount-1] — the contacts detected during
-// the PREVIOUS substep. Stable contacts persist across substeps so the
-// look-back is well-suited. (The first substep after a body spawns has
-// no contacts yet; that's a one-step O(dt²) bias that self-corrects.)
-//
-// Multi-contact safety: each contact is processed independently, but
-// the v_t²/r threshold automatically suppresses projections in
-// directions where the body has no excess inward gravity. For a hex
-// cluster around a heavy body, only the radial (light↔heavy) contacts
-// trigger meaningful projection; the tangential (light↔neighbor)
-// contacts have aInward ≈ v_t²/r and contribute essentially zero
-// correction.
-const _idxMap = new Map();
-
-function _centripetalProject(entities) {
-  if (_contactCount === 0) return;
-  const wrap = state.boundaryMode === 'wrap';
-  const W = wrap ? state.viewport.width : 0;
-  const H = wrap ? state.viewport.height : 0;
-  const halfW = W * 0.5;
-  const halfH = H * 0.5;
-
-  // Build entity→index lookup so we can write into _scratch[idx].
-  // For typical N ≤ 50 the Map.clear()+populate is cheaper than the
-  // alternative of indexOf-per-contact (which would be O(N·M) where
-  // M is contact count).
-  _idxMap.clear();
-  for (let i = 0; i < entities.length; i++) _idxMap.set(entities[i], i);
-
-  for (let k = 0; k < _contactCount; k++) {
-    const c = _contacts[k];
-    const a = c.a;
-    const b = c.b;
-    if (!a || !b) continue;                  // defensive: spliced entity
-    if (a.absorbing || b.absorbing) continue;
-
-    // Re-derive normal from CURRENT positions (wrap-aware). The stored
-    // c.nx/c.ny were captured at detection in the previous substep;
-    // positions have shifted slightly since. Re-computing per substep
-    // costs ~10 fp ops and avoids angular drift in the projection.
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    if (wrap) {
-      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
-    }
-    const dist2 = dx * dx + dy * dy;
-    if (dist2 < 1e-12) continue;
-    const dist = Math.sqrt(dist2);
-
-    // Skip stale contacts — bodies that have drifted well past contact
-    // distance shouldn't keep receiving centripetal correction. 1.5× rSum
-    // gives a generous re-acquisition window for "just-detached" pairs.
-    if (dist > c.rSum * 1.5) continue;
-
-    const nx = dx / dist;                    // unit vector from a toward b
-    const ny = dy / dist;
-
-    // ── Body A: inward direction is +n̂ (pointing into B) ────────────
-    if (!a.pinned) {
-      const idxA = _idxMap.get(a);
-      if (idxA !== undefined) {
-        const sA = _scratch[idxA];
-        const aInward = sA.ax * nx + sA.ay * ny;
-        if (aInward > 0) {
-          // Tangential velocity² of A relative to B
-          const rvx = a.vx - b.vx;
-          const rvy = a.vy - b.vy;
-          const vRadial = rvx * nx + rvy * ny;
-          const v2 = rvx * rvx + rvy * rvy;
-          const vTang2 = v2 - vRadial * vRadial;
-          // Centripetal requirement at the contact distance. Floor at 0
-          // (numerical noise can make v² < vRadial² by ULPs).
-          const aCentripetalNeeded = vTang2 > 0 ? vTang2 / dist : 0;
-          const excess = aInward - aCentripetalNeeded;
-          if (excess > 0) {
-            sA.ax -= excess * nx;
-            sA.ay -= excess * ny;
-          }
-        }
-      }
-    }
-
-    // ── Body B: inward direction is -n̂ (pointing into A) ────────────
-    if (!b.pinned) {
-      const idxB = _idxMap.get(b);
-      if (idxB !== undefined) {
-        const sB = _scratch[idxB];
-        const aInward = -(sB.ax * nx + sB.ay * ny);
-        if (aInward > 0) {
-          const rvx = b.vx - a.vx;
-          const rvy = b.vy - a.vy;
-          // B's inward relative-velocity radial component is along -n̂
-          const vRadial = -(rvx * nx + rvy * ny);
-          const v2 = rvx * rvx + rvy * rvy;
-          const vTang2 = v2 - vRadial * vRadial;
-          const aCentripetalNeeded = vTang2 > 0 ? vTang2 / dist : 0;
-          const excess = aInward - aCentripetalNeeded;
-          if (excess > 0) {
-            // inward for B is -n̂ → subtracting excess from inward
-            // means ADDING excess·n̂ back to sB.ax,ay
-            sB.ax += excess * nx;
-            sB.ay += excess * ny;
-          }
-        }
-      }
-    }
   }
 }
 
@@ -609,15 +294,12 @@ function _centripetalProject(entities) {
 // pair (A, C). For our typical small clusters (≤6 simultaneous contacts
 // per body), 4 iterations leaves residual penetration well below the
 // visible threshold. See architect blueprint for the convergence analysis.
-// Threshold for classifying a contact as "gravity-induced" (where
-// position projection's displacement should be refunded as gravity-
-// against-constraint work) vs "collision-induced" (where the
-// displacement is part of a real impulse cascade and should NOT be
-// refunded — otherwise the cluster's impact-given momentum gets
-// drained). Pre-kick approach velocity > -1 px/s is essentially
-// "static or slowly drifting" = gravity-induced; below = collision.
-const COLLISION_PREVN_THRESHOLD = -1.0;       // px/s
-
+// Position projection. (TEMPORARY: this is the pre-Box2D-refactor
+// position solver. Sprint 3 of the Box2D refactor will replace it with
+// a pseudo-velocity NGS that doesn't write directly to e.x/e.y,
+// preserving real velocity. For now it's a plain PBD positional
+// constraint solver: push overlapping pairs apart along the contact
+// normal, weighted by inverse mass.)
 function _projectPBDContacts(count) {
   if (count === 0) return;
   const wrap = state.boundaryMode === 'wrap';
@@ -651,75 +333,29 @@ function _projectPBDContacts(count) {
       c.nx = nx;
       c.ny = ny;
       const correction = overlap / wSum;
-      const dax = nx * correction * wA;
-      const day = ny * correction * wA;
-      const dbx = nx * correction * wB;
-      const dby = ny * correction * wB;
-      a.x -= dax;
-      a.y -= day;
-      b.x += dbx;
-      b.y += dby;
-      // Per-contact classification: this contact is gravity-induced
-      // (and contributes to the refund accumulator) only if BOTH:
-      //   (a) preVn > threshold — bodies weren't approaching pre-kick
-      //   (b) solverImpulseMag below threshold — the velocity solver
-      //       did NOT apply a large impulse to this contact (which
-      //       would indicate collision-cascade impulse transmission)
-      //
-      // Per-contact classification (instead of per-body grace) lets
-      // the cascade auto-propagate: in the impact substep the
-      // bullet-light contact has huge impulse, while light-heavy
-      // and light-neighbor contacts ALSO have huge impulse because
-      // the solver transmitted the cascade through them — so all
-      // are marked collision and excluded from refund. In subsequent
-      // substeps the cascade naturally continues via preVn (bodies'
-      // pre-kick velocity reflects the just-installed momentum).
-      const isGravity = c.preVn > COLLISION_PREVN_THRESHOLD
-                     && c.solverImpulseMag < COLLISION_IMPULSE_THRESHOLD;
-      if (isGravity) {
-        a._dxGrav -= dax;
-        a._dyGrav -= day;
-        b._dxGrav += dbx;
-        b._dyGrav += dby;
-      }
+      a.x -= nx * correction * wA;
+      a.y -= ny * correction * wA;
+      b.x += nx * correction * wB;
+      b.y += ny * correction * wB;
     }
   }
 }
 
-// ─── Velocity solver (Sequential Impulses) ────────────────────────
-// For each contact, drive the relative normal velocity to its target:
-//   • persistent contact (c.wasPersistent: pair existed last substep) → 0
-//     Orbital motion samples a tiny radial component of tangential v at
-//     the rotating normal; firing a bounce on that drains/pumps energy.
-//   • new collision (c.wasPersistent === false) → -e · c.vnApproach
-//     This is the genuine restitution that bounces real impacts.
+// ─── Velocity solver (Sequential Impulses, pre-Box2D baseline) ────
+// Drives each contact's relative normal velocity to its target:
+//   • persistent contact (c.wasPersistent) → 0 (no bounce on resting)
+//   • new collision → -e · c.vnApproach (true restitution)
 //
-// The persistence-based gate is scale-invariant: it works equally well
-// at any G, mass, or dt — unlike the earlier vnApproach-magnitude
-// threshold which had to be re-tuned per regime.
-//
-// Iterated with Gauss-Seidel; for the typical N≤10 in-contact cluster,
-// 4 iterations converges to machine-eps. For chained clusters (a body
-// touching 2+ neighbors) more iterations would help; 4 is the
-// conservative practical choice at N ≤ 50.
-//
-// This (together with the deletion of `v = Δx/dt` re-derivation) is the
-// real fix for the hex-aggregate scatter: position-only PBD silently
-// leaked tangential energy through each iteration's angular sweep, and
-// `_applyRestitution` pumped that further by treating orbital contacts
-// as collisions. Running the velocity solve at the velocity level —
-// before any position projection and without re-derivation — closes
-// both leaks.
+// This is the 4-iter Gauss-Seidel WITHOUT warm-starting or
+// accumulated-impulse clamping — the standard Box2D additions are
+// planned for the next refactor sprint and will replace this body.
+// For now keep as-is; the next sprint upgrades iteration count to 8
+// and adds the c.normalImpulse accumulation with [0, +∞) clamp plus a
+// pre-iteration warm-start pass from _prevPairImpulses.
 const VELOCITY_ITERATIONS = 4;
 
 function _solveContactVelocities(count) {
   if (count === 0) return;
-  // Reset per-contact impulse accumulators. Used by the position
-  // solver to classify each contact as gravity-induced vs
-  // collision-cascade (large cumulative impulse → collision, excluded
-  // from the energy-refund accumulator so the cluster's
-  // impulse-given momentum is preserved).
-  for (let k = 0; k < count; k++) _contacts[k].solverImpulseMag = 0;
   const e = state.elasticRestitution;
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width : 0;
@@ -755,127 +391,6 @@ function _solveContactVelocities(count) {
       a.vy -= J * ny * wA;
       b.vx += J * nx * wB;
       b.vy += J * ny * wB;
-      // Accumulate |J| per contact for downstream classification.
-      c.solverImpulseMag += J >= 0 ? J : -J;
-    }
-  }
-}
-
-// ─── Relaxation pass (no-bias second velocity solve) ──────────────
-// Mirrors Catto 2024 Solver2D's "relaxation" step. Runs after the
-// position solver has refreshed contact normals to post-projection
-// geometry. For each contact, recomputes n̂ and the current relative
-// normal velocity vn — and if vn is still negative (approaching), applies
-// the minimum impulse to bring vn back to zero.
-//
-// Crucially this pass is ONE-SIDED: `if (vn >= 0) continue;` ensures we
-// NEVER apply a negative-direction impulse, so:
-//   • An elastic bounce from step F (vn now > 0, separating) is preserved
-//     untouched — relaxation cannot undo restitution.
-//   • A truly tangential orbital velocity (vn == 0 along the post-
-//     projection normal) is a no-op — relaxation does not drain energy
-//     from a healthy orbit.
-//   • The only velocities relaxation modifies are sub-pixel residual
-//     approach components, which represent the "post-projection normal
-//     rotated since step F" leak that the user identified as the
-//     amplification source.
-//
-// Single iteration is sufficient: step F already drove vn to its target
-// at the OLD normal, so the residual at the NEW normal is O((Δn̂)·|v|),
-// which for our scenes is well below mm/s — one Gauss-Seidel sweep
-// clears it.
-// Diagnostic: counts impulses applied by the relaxation pass per substep.
-// Read by debug tooling; safe to leave in (zero overhead beyond a counter
-// inc per contact that actually needed correction).
-export let _relaxImpulseCount = 0;
-export let _relaxImpulseMagSum = 0;
-
-function _relaxContactVelocities(count) {
-  if (count === 0) return;
-  _relaxImpulseCount = 0;
-  _relaxImpulseMagSum = 0;
-  const wrap = state.boundaryMode === 'wrap';
-  const W = wrap ? state.viewport.width : 0;
-  const H = wrap ? state.viewport.height : 0;
-  const halfW = W * 0.5, halfH = H * 0.5;
-  for (let k = 0; k < count; k++) {
-    const c = _contacts[k];
-    const a = c.a;
-    const b = c.b;
-    if (a.absorbing || b.absorbing) continue;
-    // Recompute contact normal from POST-projection positions.
-    let dx = b.x - a.x;
-    let dy = b.y - a.y;
-    if (wrap) {
-      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
-    }
-    const dist2 = dx * dx + dy * dy;
-    if (dist2 < 1e-12) continue;
-    const dist = Math.sqrt(dist2);
-    const nx = dx / dist, ny = dy / dist;
-    const rvx = b.vx - a.vx;
-    const rvy = b.vy - a.vy;
-    const vn = rvx * nx + rvy * ny;
-    // One-sided: only kill INWARD residual (vn < 0). Never undo a
-    // legitimate separating velocity (vn ≥ 0).
-    if (vn >= 0) continue;
-    const wA = a.pinned ? 0 : 1 / a.mass;
-    const wB = b.pinned ? 0 : 1 / b.mass;
-    const wSum = wA + wB;
-    if (wSum === 0) continue;
-    const J = -vn / wSum;       // bring vn → 0
-    _relaxImpulseCount++;
-    _relaxImpulseMagSum += Math.abs(J);
-    a.vx -= J * nx * wA;
-    a.vy -= J * ny * wA;
-    b.vx += J * nx * wB;
-    b.vy += J * ny * wB;
-  }
-}
-
-// Static contact damping (sleeping-body equivalent).
-// Multi-body gravitational equilibria (e.g., a symmetric ring of equal
-// masses around a central body) are mathematically UNSTABLE: any
-// infinitesimal perturbation grows exponentially. In real continuous
-// time the perturbation is zero so the system stays static; in discrete
-// FP arithmetic, the noise floor (~1e-15) IS such a perturbation, and
-// over thousands of substeps it amplifies to visible motion.
-//
-// Box2D and Bullet solve this with "sleeping bodies": bodies that have
-// been static for several frames are temporarily frozen. We do the
-// minimal version: zero out velocities below STATIC_V_THRESHOLD for
-// bodies that are CURRENTLY in contact (the constraint absorbs the
-// momentum so this is energetically correct).
-//
-// The threshold is chosen to be:
-//   • Well above the FP noise floor (~1e-12 in our scenes)
-//   • Well below any meaningful orbital/drag-placement speed (~10 px/s)
-// 0.1 px/s = 1/600 of a pixel per substep — invisible at any zoom level.
-//
-// Only IN-CONTACT bodies get damped — a body at apoapsis of a stretched
-// elliptical orbit can be legitimately slow without contact, and damping
-// it would corrupt the orbit.
-const STATIC_V_THRESHOLD = 0.1;        // px/s
-const STATIC_V_THRESHOLD2 = STATIC_V_THRESHOLD * STATIC_V_THRESHOLD;
-
-function _applyStaticContactDamping(count) {
-  if (count === 0) return;
-  // Build a set of bodies that participate in any current contact. Re-using
-  // a module-level Set would force us to .clear() it each call; a fresh
-  // Set is cheap enough for typical contact counts (<100).
-  const inContact = new Set();
-  for (let k = 0; k < count; k++) {
-    const c = _contacts[k];
-    if (c.a && !c.a.absorbing) inContact.add(c.a);
-    if (c.b && !c.b.absorbing) inContact.add(c.b);
-  }
-  for (const e of inContact) {
-    if (e.pinned) continue;
-    const v2 = e.vx * e.vx + e.vy * e.vy;
-    if (v2 < STATIC_V_THRESHOLD2) {
-      e.vx = 0;
-      e.vy = 0;
     }
   }
 }
@@ -947,7 +462,8 @@ function processCollisionPair(a, b, dx, dy) {
     }
     let c = _contacts[_contactCount];
     if (!c) {
-      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, preVn: 0, wasPersistent: false, solverImpulseMag: 0 };
+      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0,
+            vnApproach: 0, wasPersistent: false, normalImpulse: 0 };
       _contacts[_contactCount] = c;
     }
     const dist = Math.sqrt(dist2);
@@ -970,31 +486,26 @@ function processCollisionPair(a, b, dx, dy) {
     const rvx = b.vx - a.vx;
     const rvy = b.vy - a.vy;
     c.vnApproach = rvx * nx + rvy * ny;     // negative = approaching
-    // Mark whether this pair counts as a persistent contact (no
-    // restitution bounce). A pair is persistent if EITHER:
-    //   (i)  it was in _prevPairs (a contact last substep — warm-start)
-    //   (ii) its PRE-KICK relative normal velocity is essentially zero
-    //        (resting/orbital — the captured vnApproach is purely
-    //        kick-induced, not a real impact)
-    // Recover pre-kick velocity by subtracting a·dt from the current
-    // (post-kick) velocity. For bodies with no acceleration this turn
-    // (e.g., charge=0 collision setups), preVn == vnApproach.
+    // Persistent contact (skip restitution bounce) iff:
+    //   (i)  pair was in _prevPairs (warm-start) OR
+    //   (ii) PRE-KICK relative normal velocity is essentially zero
+    //        (resting / orbital — captured vnApproach is purely
+    //        kick-induced and shouldn't bounce).
+    // Recover pre-kick v_rel by subtracting a·dt from the post-kick
+    // velocities. For charge=0 bodies (no kick), preVn == vnApproach.
     let wasPersistent = _prevPairs.has(_pairKey(a, b));
-    // Always compute preVn — needed by the refund grace gate to
-    // distinguish real impacts (large negative preVn) from contacts
-    // that were "new" only by bookkeeping (e.g., first substep of a
-    // statically-placed cluster where _prevPairs is still empty).
-    const dt = _currentSimDt;
-    const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
-    const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
-    const preVn = preRvx * nx + preRvy * ny;
-    c.preVn = preVn;
     if (!wasPersistent) {
-      // Real approach pre-kick → genuine new collision (wasPersistent stays false).
-      // Pre-kick separating or essentially zero → persistent.
+      const dt = _currentSimDt;
+      const preRvx = (b.vx - b.ax * dt) - (a.vx - a.ax * dt);
+      const preRvy = (b.vy - b.ay * dt) - (a.vy - a.ay * dt);
+      const preVn = preRvx * nx + preRvy * ny;
       if (preVn > PRE_KICK_APPROACH_THRESHOLD) wasPersistent = true;
     }
     c.wasPersistent = wasPersistent;
+    // Sprint 2 of the Box2D refactor will look up the previous
+    // substep's c.normalImpulse here (warm-start). For now reset to
+    // 0 — the velocity solver doesn't accumulate across substeps yet.
+    c.normalImpulse = 0;
     _contactCount++;
   }
 }
