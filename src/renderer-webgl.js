@@ -44,7 +44,9 @@
 //   - sprite-cache.js continues to produce HTMLCanvasElement sprites.
 //   - First time we see a unique canvas, lazily upload to a GL texture
 //     (kept in _spriteTexMap). Sprite cache caps at 200 → ≤200 textures,
-//     ~16MB total VRAM upper bound. No explicit eviction in V9.0a (TODO V9.0b).
+//     ~16MB total VRAM upper bound. No explicit GPU-texture eviction (the
+//     sprite-cache.js LRU caps CPU-side canvases; stale GL textures linger
+//     until context loss or page reload).
 //   - Per frame: bucket non-absorbing entities by their sprite canvas;
 //     build a per-instance VBO of [x, y, w, h, ox, oy, alpha]; issue one
 //     instanced draw per bucket; if wrap mode is on and the entity
@@ -191,7 +193,7 @@ void main() {
 
 // Per-instance: iCenter (vec2 px), iSize (vec2 px = sprite w,h), iOffset
 // (vec2 px = sprite ox, oy from top-left of sprite to entity center),
-// iAlpha (float; always 1 in V9.0a).
+// iAlpha (float; always 1.0 — absorbing entities are skipped in _drawEntities).
 // Per-vertex: aCorner ∈ {0,1}² unit quad (0=top-left, 1=bottom-right).
 const VS_ENTITY = `#version 300 es
 in vec2 aCorner;
@@ -230,7 +232,7 @@ void main() {
 
 // --- Filled circle (hover ghost fill, drag ghost fill, absorbing body) ---
 // Per-instance: iCenter(vec2 px), iRadius(float px), iColor(vec4).
-// AA edge ramp = 1 px (matches V9.0a trail dot edge handling).
+// AA edge ramp = 1 px (same formula as the trail-dot shader above).
 const VS_CIRCLE_FILL = `#version 300 es
 in vec2 aCorner;
 in vec2 iCenter;
@@ -833,7 +835,7 @@ function _ensureSpriteTexture(canvas) {
   return info;
 }
 
-// ─── Color parsing (matches V8.1c renderer.js) ────────────────────
+// ─── Color parsing ────────────────────────────────────────────────
 
 const _colorRgbCache = new Map();
 
@@ -1117,7 +1119,7 @@ function _drawEntities() {
 // state.selectedId / absorbing entities, then issues one instanced draw per
 // shader program (or zero if a program has no work this frame).
 
-// Visual constants (mirror V8.1c renderer.js to keep visuals identical).
+// Visual constants (matched to V8.1c values to keep visuals identical across the migration).
 const UI_SELECT_RING_COLOR = [0x6b / 255, 0x8c / 255, 0xff / 255]; // #6b8cff
 const UI_GHOST_FILL_ALPHA = 0.18;
 const UI_PREDICTION_BATCHES = 8;

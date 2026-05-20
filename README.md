@@ -45,7 +45,7 @@ workflow 已包含在 `.github/workflows/deploy.yml`。
 
 ## 技术栈
 
-- HTML5 Canvas 2D
+- WebGL 2 (single `#stage` canvas — background, trail FBO, entity sprites, and all UI layers)
 - 原生 ES Modules（无构建工具，无依赖）
 - Velocity Verlet 数值积分（轨道稳定性优于显式 Euler）
 

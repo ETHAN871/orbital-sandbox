@@ -3,9 +3,9 @@
 // V8.1: instead of redrawing each entity's body + edge + glyph + pinned ring
 // via per-call Canvas2D state changes (slow when × 9 mirror copies near a
 // boundary corner), we bake each unique (type, color, radius, charge, pinned)
-// combination into a small off-screen canvas once and render the live frame
-// with `ctx.drawImage(sprite, x - r, y - r)`. drawImage is hardware-accelerated
-// and ~5-10× cheaper than a fresh arc + fillStyle + setLineDash sequence.
+// combination into a small off-screen canvas once. renderer-webgl.js lazily
+// uploads each canvas to a GL texture (_spriteTexMap) and draws instances
+// via VS_ENTITY / FS_ENTITY — far cheaper than re-issuing arc+fillStyle calls.
 //
 // Cache strategy: ordered Map (insertion order = LRU). On get-hit, the entry
 // is moved to the end (most recent). When the cache exceeds SPRITE_CACHE_MAX
@@ -113,8 +113,8 @@ function renderSprite(type, color, radius, charge, pinned) {
   }
 
   // Offset = where the entity's logical (x, y) sits within the sprite. With
-  // centered geometry, ox/oy = half of canvas size. Renderer uses these via
-  // drawImage(sprite, entityX - sprite._ox, entityY - sprite._oy).
+  // centered geometry, ox/oy = half of canvas size. renderer-webgl.js reads
+  // these as `iOffset` per-instance to position the sprite quad correctly.
   canvas._ox = cx;
   canvas._oy = cy;
   return canvas;

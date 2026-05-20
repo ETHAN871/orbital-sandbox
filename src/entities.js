@@ -39,8 +39,8 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge, pinned 
     baseColor,                 // stable random color for planets
     color: resolveDisplayColor(type, charge, baseColor), // derived; refresh on edit
     // V8.1: per-entity trail history removed. Trails now render as a
-    // global phosphor-decay canvas (renderer.js); each frame draws one
-    // dot at the entity's current position and a fade overlay handles
+    // global phosphor-decay FBO (renderer-webgl.js); each frame plots one
+    // dot at the entity's current position and a decay pass handles
     // history.
     // Verlet uses last acceleration; cached so we don't recompute mid-step.
     ax: 0,
