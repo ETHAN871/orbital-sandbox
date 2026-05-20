@@ -312,3 +312,179 @@ void main() {
   outColor = vec4(vColor.rgb, vColor.a * a);
 }`,
 };
+
+// ─── V9.1 field visualization shaders ─────────────────────────────
+// Two programs, both gated by `state.showField` so they incur zero GPU
+// cost when the field overlay is hidden.
+
+// --- Equipotential contour lines ----------------------------------
+// Fragment shader sums `φ = Σ_i -G·q·m / max(r, ε)` per pixel over up to
+// MAX_ENTITIES uniform-array entries (pre-multiplied G·q·m packed into
+// entity.z by the caller so the shader only carries one float multiply
+// per entity per pixel). Contour lines are derived via a derivative-aware
+// mask: `dPx = |mod(φ - spacing/2, spacing) - spacing/2| / |∇φ|`. Where
+// `dPx ≤ lineWidth/2 + 0.5` the pixel is on a contour line; an additional
+// 1-px AA ramp on the outer edge keeps the line crisp at all scales.
+// The derivative `|∇φ|` rises sharply near masses, which is exactly why
+// the contours crowd there (matching real topographic-map intuition: more
+// lines per unit distance == steeper gradient).
+//
+// Per-instance: none (one fullscreen quad).
+// Per-vertex: aPos (NDC), shared with VS_FULLSCREEN.
+// Uniforms:
+//   uViewport      vec2  CSS-px viewport (W, H) for vUv → world conversion
+//   uEntities      vec4[MAX_ENTITIES]  per-entity (x, y, G·q·m, _unused_)
+//   uEntityCount   int   real count (≤ MAX_ENTITIES); loop early-exit
+//   uEpsilon       float softening floor for r
+//   uContourSpacing float  Δφ between adjacent contour lines (set by CPU
+//                          to (φmax - φmin) / numBands each frame)
+//   uContourLineW  float target line width in px (typically 1.0)
+//   uColor         vec4  contour color (theme-dependent: light gray on
+//                        dark bg, dark gray on light bg)
+//
+// MAX_ENTITIES = 128 sits well under the WebGL 2 minimum-spec
+// MAX_FRAGMENT_UNIFORM_VECTORS = 224; with one vec4 per entity that's
+// 128 uniform vectors. If a user spawns >128 entities the renderer will
+// cap the array at 128 with no error (just visually approximate field).
+export const EQUIPOTENTIAL = {
+  VS: `#version 300 es
+in vec2 aPos;
+out vec2 vUv;
+void main() {
+  vUv = aPos * 0.5 + 0.5;
+  gl_Position = vec4(aPos, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+#define MAX_ENTITIES 128
+in vec2 vUv;
+uniform vec2 uViewport;
+uniform vec4 uEntities[MAX_ENTITIES];
+uniform int uEntityCount;
+uniform float uEpsilon;
+uniform float uContourSpacing;
+uniform float uContourLineW;
+uniform float uDpr;                  // device pixel ratio: 1 CSS-px = DPR fragments
+uniform vec4 uColor;
+out vec4 outColor;
+
+float computePhi(vec2 p) {
+  float phi = 0.0;
+  for (int i = 0; i < MAX_ENTITIES; i++) {
+    if (i >= uEntityCount) break;
+    vec4 e = uEntities[i];
+    float dx = p.x - e.x;
+    float dy = p.y - e.y;
+    float r = sqrt(dx * dx + dy * dy);
+    float safeR = max(r, uEpsilon);
+    phi += -e.z / safeR;
+  }
+  return phi;
+}
+
+void main() {
+  // vUv comes from VS_FULLSCREEN's `aPos * 0.5 + 0.5`. aPos is in NDC where
+  // the default framebuffer has y=+1 at the top. CSS-px entity coords have
+  // y=0 at the top instead. Flip vUv.y so `p` is in the same CSS-px space
+  // the entity positions were uploaded in.
+  vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
+  float phi = computePhi(p);
+  // Skip blank-field zones (numerically — if everything is zero, no lines).
+  if (uContourSpacing <= 0.0) discard;
+  // Derivative magnitude in screen pixels (dFdx/dFdy step ≈ 1 px each).
+  float gx = dFdx(phi);
+  float gy = dFdy(phi);
+  float gradMag = sqrt(gx * gx + gy * gy);
+  if (gradMag < 1e-6) discard;
+  // Distance from nearest contour line, measured in φ units centered.
+  float half_spacing = uContourSpacing * 0.5;
+  float dPhi = abs(mod(phi + half_spacing, uContourSpacing) - half_spacing);
+  // gradMag is Δφ per fragment (dFdx/dFdy step = 1 fragment). dPhi / gradMag
+  // gives distance in fragments; divide by DPR to get CSS-px so the line
+  // width threshold (uContourLineW, in CSS-px) is correctly compared. At
+  // DPR=1 this collapses to the naive dPhi/gradMag. At HiDPI DPR>1 the
+  // line would otherwise appear DPR× narrower than intended.
+  float dPxFrag = dPhi / gradMag;
+  float dPxCss  = dPxFrag / max(uDpr, 1.0);
+  float halfW = uContourLineW * 0.5;
+  if (dPxCss > halfW + 0.5) discard;
+  float alpha = (dPxCss <= halfW - 0.5) ? 1.0 : (halfW + 0.5 - dPxCss);
+  outColor = vec4(uColor.rgb, uColor.a * alpha);
+}`,
+};
+
+// --- Pulsing streamlines ("灯带" light strips) --------------------
+// Each streamline is one short straight segment in the direction of the
+// local force at its grid-seed origin. The CPU computes the seed force
+// direction once per frame (via computeForceDirAt in potential.js) and
+// pushes per-instance (seedX, seedY, dirX, dirY). The shader animates a
+// "head" of bright color sliding from along=0 to along=1 over a shared
+// uniform `uPulseHead ∈ [0..1]`, with a trailing fade of length
+// `uPulseTailFrac` so the strip looks like a comet of light.
+//
+// Per-vertex aCorner ∈ {0,1}²: x = along (0=seed, 1=tip), y = perp.
+// Per-instance: iSeed (vec2 px), iDir (vec2 unit), iAlpha (float).
+// Uniforms:
+//   uOrtho           mat4   CSS-px → NDC matrix (shared with other UI)
+//   uLength          float  streamline length in px (~50)
+//   uLineW           float  half-width × 2 in px (~3)
+//   uPulseHead       float  head position [0..1] along the strip
+//   uPulseTailFrac   float  trail length as fraction of strip (~0.25)
+//   uColor           vec4   light-strip base color (cool blue-white)
+//
+// iAlpha modulates per-instance brightness — used to fade low-magnitude
+// field zones so the field intensity is also visually encoded.
+export const STREAMLINE = {
+  VS: `#version 300 es
+in vec2 aCorner;
+in vec2 iSeed;
+in vec2 iDir;
+in float iAlpha;
+uniform mat4 uOrtho;
+uniform float uLength;
+uniform float uLineW;
+out vec2 vAlongPerp;
+out float vAlpha;
+void main() {
+  vec2 along = iDir;
+  vec2 perp = vec2(-along.y, along.x);
+  float s = aCorner.x;               // 0..1 along the strip
+  float halfW = uLineW * 0.5 + 0.5;  // +0.5 px for AA ramp
+  float t = (aCorner.y - 0.5) * 2.0 * halfW;
+  vec2 worldPx = iSeed + along * (s * uLength) + perp * t;
+  vAlongPerp = vec2(s, t);
+  vAlpha = iAlpha;
+  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+in vec2 vAlongPerp;
+in float vAlpha;
+uniform float uLineW;
+uniform float uPulseHead;
+uniform float uPulseTailFrac;
+uniform vec4 uColor;
+out vec4 outColor;
+void main() {
+  float along = vAlongPerp.x;      // 0..1 from seed to tip
+  float perp = vAlongPerp.y;
+  float halfW = uLineW * 0.5;
+  float absT = abs(perp);
+  if (absT > halfW + 0.5) discard;
+  float aaPerp = (absT <= halfW - 0.5) ? 1.0 : (halfW + 0.5 - absT);
+  // Light strip occupies (uPulseHead - tailFrac) .. uPulseHead along [0..1].
+  // Clamp tailStart to 0 so during the first uPulseTailFrac of the cycle the
+  // strip emerges *growing* from the seed point rather than rendering its
+  // full length immediately (which would look like a glitch flash on every
+  // pulse-cycle reset).
+  float tailStart = max(0.0, uPulseHead - uPulseTailFrac);
+  if (along > uPulseHead) discard;
+  if (along < tailStart) discard;
+  // Brightness ramps from 0 at tailStart to 1 at uPulseHead (head bright).
+  // Use the *actual* strip length (uPulseHead - tailStart) so the gradient
+  // remains correctly normalized even when the start was clamped to 0.
+  float stripLen = max(uPulseHead - tailStart, 1e-6);
+  float aTrail = (along - tailStart) / stripLen;
+  outColor = vec4(uColor.rgb, uColor.a * aaPerp * aTrail * vAlpha);
+}`,
+};

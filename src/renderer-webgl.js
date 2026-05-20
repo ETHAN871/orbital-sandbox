@@ -65,7 +65,9 @@ import { resolveDisplayColor } from './entities.js';
 import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
+  EQUIPOTENTIAL, STREAMLINE,
 } from './shaders.js';
+import { computePotentialAt, computeForceDirAt } from './potential.js';
 
 // ─── Module state ─────────────────────────────────────────────────
 let _gl = null;
@@ -87,6 +89,9 @@ let _progEntity = null;
 let _progCircleFill = null;
 let _progCircleRing = null;
 let _progLineSeg = null;
+// V9.1 field-visualization shaders:
+let _progEquipotential = null;
+let _progStreamline = null;
 
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
@@ -98,6 +103,8 @@ let _bufInstanceEntity = null;  // dynamic per-instance VBO for entity sprites
 let _bufInstanceCircleFill = null; // dynamic per-instance VBO for filled disks
 let _bufInstanceCircleRing = null; // dynamic per-instance VBO for ring strokes
 let _bufInstanceLineSeg = null;    // dynamic per-instance VBO for line segments
+// V9.1 streamline buffer (one instance per seed; rebuilt per frame).
+let _bufInstanceStreamline = null;
 
 // VAOs (cached attrib+vbo state)
 let _vaoFsQuad = null;
@@ -106,6 +113,7 @@ let _vaoEntity = null;
 let _vaoCircleFill = null;
 let _vaoCircleRing = null;
 let _vaoLineSeg = null;
+let _vaoStreamline = null;
 
 // Trail ping-pong FBOs/textures
 let _fboA = null, _fboB = null;
@@ -132,6 +140,26 @@ let _circleRingData = new Float32Array(0);
 let _circleRingCount = 0;
 let _lineSegData = new Float32Array(0);
 let _lineSegCount = 0;
+
+// V9.1 field-visualization state.
+// MAX_FIELD_ENTITIES must match the `#define MAX_ENTITIES` in
+// EQUIPOTENTIAL.FS — see shaders.js. Entities beyond this cap are dropped
+// from the field calculation (the field becomes visually approximate, but
+// the rendered entities themselves still draw normally via _drawEntities).
+const MAX_FIELD_ENTITIES = 128;
+// Packed entity data uploaded to EQUIPOTENTIAL.FS uEntities[] each frame.
+// Layout per slot: (x, y, G·q·m, 0) = 4 floats (vec4 alignment).
+const _fieldEntityData = new Float32Array(MAX_FIELD_ENTITIES * 4);
+let _fieldEntityCount = 0;
+// Grid of streamline seeds — recomputed on resizeRenderer. Each seed is
+// (x, y) in CSS px; the force direction is computed per frame.
+let _streamlineSeeds = new Float32Array(0); // (x, y) × N
+let _streamlineSeedCount = 0;
+// Per-instance VBO scratch: (seedX, seedY, dirX, dirY, alpha) = 5 floats.
+let _streamlineInstanceData = new Float32Array(0);
+// Wall-clock anchor for the synchronized pulse (ms). Pulse phase derives
+// from (now - _pulseStartMs) % UI_PULSE_PERIOD_MS.
+let _pulseStartMs = 0;
 
 // Shader source strings live in src/shaders.js. Each program exports a
 // `{ VS, FS }` pair. See that file for per-program attribute layouts and
@@ -176,16 +204,20 @@ export function initWebGL(canvas) {
     // _vaoTrailDot is a stale handle, triggering an INVALID_OPERATION error.
     _progTrailDecay = _progTrailBlit = _progTrailDot = _progEntity = null;
     _progCircleFill = _progCircleRing = _progLineSeg = null;
+    _progEquipotential = _progStreamline = null;
     _bufFsQuad = _bufUnitQuad = _bufEntityCornerQuad = null;
     _bufInstanceTrail = _bufInstanceEntity = null;
     _bufInstanceCircleFill = _bufInstanceCircleRing = _bufInstanceLineSeg = null;
+    _bufInstanceStreamline = null;
     _vaoFsQuad = _vaoTrailDot = _vaoEntity = null;
     _vaoCircleFill = _vaoCircleRing = _vaoLineSeg = null;
+    _vaoStreamline = null;
     _fboA = _fboB = _texA = _texB = null;
     try {
       _initPrograms();
       _initBuffers();
       _initFbos(_vpW, _vpH);
+      _rebuildStreamlineSeeds();
     } catch (err) {
       _showError('WebGL 上下文恢复失败：' + (err && err.message ? err.message : err));
       console.error('[renderer-webgl] restore failed', err);
@@ -274,6 +306,31 @@ function _initPrograms() {
   _progLineSeg.iDashOn     = gl.getAttribLocation(_progLineSeg.prog, 'iDashOn');
   _progLineSeg.iDashPeriod = gl.getAttribLocation(_progLineSeg.prog, 'iDashPeriod');
   _progLineSeg.uOrtho      = gl.getUniformLocation(_progLineSeg.prog, 'uOrtho');
+
+  // V9.1 field-visualization programs.
+  _progEquipotential = _makeProgram(EQUIPOTENTIAL.VS, EQUIPOTENTIAL.FS);
+  _progStreamline    = _makeProgram(STREAMLINE.VS,    STREAMLINE.FS);
+
+  _progEquipotential.aPos             = gl.getAttribLocation(_progEquipotential.prog, 'aPos');
+  _progEquipotential.uViewport        = gl.getUniformLocation(_progEquipotential.prog, 'uViewport');
+  _progEquipotential.uEntities        = gl.getUniformLocation(_progEquipotential.prog, 'uEntities[0]');
+  _progEquipotential.uEntityCount     = gl.getUniformLocation(_progEquipotential.prog, 'uEntityCount');
+  _progEquipotential.uEpsilon         = gl.getUniformLocation(_progEquipotential.prog, 'uEpsilon');
+  _progEquipotential.uContourSpacing  = gl.getUniformLocation(_progEquipotential.prog, 'uContourSpacing');
+  _progEquipotential.uContourLineW    = gl.getUniformLocation(_progEquipotential.prog, 'uContourLineW');
+  _progEquipotential.uDpr             = gl.getUniformLocation(_progEquipotential.prog, 'uDpr');
+  _progEquipotential.uColor           = gl.getUniformLocation(_progEquipotential.prog, 'uColor');
+
+  _progStreamline.aCorner       = gl.getAttribLocation(_progStreamline.prog, 'aCorner');
+  _progStreamline.iSeed         = gl.getAttribLocation(_progStreamline.prog, 'iSeed');
+  _progStreamline.iDir          = gl.getAttribLocation(_progStreamline.prog, 'iDir');
+  _progStreamline.iAlpha        = gl.getAttribLocation(_progStreamline.prog, 'iAlpha');
+  _progStreamline.uOrtho        = gl.getUniformLocation(_progStreamline.prog, 'uOrtho');
+  _progStreamline.uLength       = gl.getUniformLocation(_progStreamline.prog, 'uLength');
+  _progStreamline.uLineW        = gl.getUniformLocation(_progStreamline.prog, 'uLineW');
+  _progStreamline.uPulseHead    = gl.getUniformLocation(_progStreamline.prog, 'uPulseHead');
+  _progStreamline.uPulseTailFrac = gl.getUniformLocation(_progStreamline.prog, 'uPulseTailFrac');
+  _progStreamline.uColor        = gl.getUniformLocation(_progStreamline.prog, 'uColor');
 }
 
 function _initBuffers() {
@@ -309,6 +366,7 @@ function _initBuffers() {
   _bufInstanceCircleFill = gl.createBuffer();
   _bufInstanceCircleRing = gl.createBuffer();
   _bufInstanceLineSeg    = gl.createBuffer();
+  _bufInstanceStreamline = gl.createBuffer();
 
   // Fullscreen quad VAO — shared by decay + blit passes. Both their shader
   // programs use the same fullscreen VS (TRAIL_DECAY.VS === TRAIL_BLIT.VS,
@@ -450,6 +508,27 @@ function _initBuffers() {
   gl.vertexAttribPointer(_progLineSeg.iDashPeriod, 1, gl.FLOAT, false, 48, 44);
   gl.vertexAttribDivisor(_progLineSeg.iDashPeriod, 1);
   gl.bindVertexArray(null);
+
+  // V9.1: streamline VAO. Per-vertex aCorner ∈ [0,1]² via _bufEntityCornerQuad
+  // (x = along, y = perp). Per-instance: (seedX, seedY, dirX, dirY, alpha) =
+  // 5 floats = 20 bytes stride.
+  _vaoStreamline = gl.createVertexArray();
+  gl.bindVertexArray(_vaoStreamline);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufEntityCornerQuad);
+  gl.enableVertexAttribArray(_progStreamline.aCorner);
+  gl.vertexAttribPointer(_progStreamline.aCorner, 2, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(_progStreamline.aCorner, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceStreamline);
+  gl.enableVertexAttribArray(_progStreamline.iSeed);
+  gl.vertexAttribPointer(_progStreamline.iSeed, 2, gl.FLOAT, false, 20, 0);
+  gl.vertexAttribDivisor(_progStreamline.iSeed, 1);
+  gl.enableVertexAttribArray(_progStreamline.iDir);
+  gl.vertexAttribPointer(_progStreamline.iDir, 2, gl.FLOAT, false, 20, 8);
+  gl.vertexAttribDivisor(_progStreamline.iDir, 1);
+  gl.enableVertexAttribArray(_progStreamline.iAlpha);
+  gl.vertexAttribPointer(_progStreamline.iAlpha, 1, gl.FLOAT, false, 20, 16);
+  gl.vertexAttribDivisor(_progStreamline.iAlpha, 1);
+  gl.bindVertexArray(null);
 }
 
 function _initFbos(w, h) {
@@ -495,6 +574,36 @@ export function resizeRenderer(w, h, dpr) {
   _dpr = dpr || 1;
   _updateOrthoMat();
   _initFbos(_vpW, _vpH);
+  _rebuildStreamlineSeeds();
+}
+
+// V9.1: build a (cols × rows) grid of streamline seed positions covering
+// the viewport with margins. Target seed count is ~96 (per user choice);
+// we resolve to the integer (cols, rows) closest to that target that
+// matches the viewport aspect ratio. Recomputed only on viewport change.
+function _rebuildStreamlineSeeds() {
+  const targetCount = 96;
+  const aspect = _vpW / Math.max(1, _vpH);
+  // cols * rows ≈ targetCount; cols / rows ≈ aspect → cols = sqrt(target*aspect).
+  let cols = Math.max(2, Math.round(Math.sqrt(targetCount * aspect)));
+  let rows = Math.max(2, Math.round(targetCount / cols));
+  const total = cols * rows;
+  _streamlineSeedCount = total;
+  if (_streamlineSeeds.length < total * 2) {
+    _streamlineSeeds = new Float32Array(total * 2);
+  }
+  // Inset by half a cell so seeds sit at cell centers, not on the edge.
+  const cellW = _vpW / cols;
+  const cellH = _vpH / rows;
+  let idx = 0;
+  for (let r = 0; r < rows; r++) {
+    const y = (r + 0.5) * cellH;
+    for (let c = 0; c < cols; c++) {
+      const x = (c + 0.5) * cellW;
+      _streamlineSeeds[idx++] = x;
+      _streamlineSeeds[idx++] = y;
+    }
+  }
 }
 
 function _updateOrthoMat() {
@@ -1132,4 +1241,198 @@ function _buildSelectionRing() {
     UI_SELECT_RING_COLOR[0], UI_SELECT_RING_COLOR[1], UI_SELECT_RING_COLOR[2], 1.0,
     2.0, UI_SELECT_DASH_ON, UI_SELECT_DASH_ON + UI_SELECT_DASH_OFF,
   );
+}
+
+// ─── V9.1 field visualization (drawField) ─────────────────────────
+// Two passes, both gated by state.showField:
+//   1. Equipotential contour lines — fullscreen quad fragment shader
+//      sums φ = Σ -G·q·m/max(r, ε) per pixel and draws contour rings
+//      where |∇φ| × derivative-aware-mask ≤ 0.5 px.
+//   2. Pulsing streamlines — instanced quad per grid seed; each seed
+//      points along the local force direction (computed on CPU via
+//      computeForceDirAt); the shader animates a "light strip" sliding
+//      from seed to tip in sync across all seeds.
+//
+// Performance: with showField OFF the entire function early-exits before
+// any GL state changes — zero overhead. With showField ON the cost is:
+//   - 1 fullscreen FS pass with O(viewport_px × N) per-pixel work, where
+//     N is min(entity count, MAX_FIELD_ENTITIES).
+//   - 1 instanced draw with up to ~96 instances + 96 × N CPU force evals.
+
+const UI_PULSE_PERIOD_MS = 1500;     // total cycle period (flight + pause)
+const UI_PULSE_FLIGHT_MS = 1300;     // active flight; remainder is pause
+const UI_PULSE_TAIL_FRAC = 0.25;     // trail length as fraction of streamline
+const UI_STREAMLINE_LENGTH_PX = 50;
+const UI_STREAMLINE_WIDTH_PX = 3;
+const UI_CONTOUR_NUM_BANDS = 12;     // target visible bands across dominant scale
+const UI_CONTOUR_LINE_W_PX = 1.0;
+// Light-blue-white pulse strip; lighter alpha so it doesn't dominate the
+// scene at peak.
+const UI_STREAMLINE_COLOR = [180 / 255, 210 / 255, 255 / 255, 0.65];
+
+export function drawField() {
+  if (_disabled || !_gl) return;
+  if (!state.showField) return;
+  if (_vpW <= 0 || _vpH <= 0) return;
+  const gl = _gl;
+
+  // Pack entity data: only first MAX_FIELD_ENTITIES non-absorbing,
+  // non-neutral entries make it into the GPU uniform array. (Neutral q=0
+  // entities contribute nothing to φ, so dropping them saves a few
+  // shader iterations per pixel.)
+  _fieldEntityCount = 0;
+  const ents = state.entities;
+  for (let i = 0; i < ents.length && _fieldEntityCount < MAX_FIELD_ENTITIES; i++) {
+    const e = ents[i];
+    if (e.absorbing) continue;
+    const Gqm = state.G * e.charge * e.mass;
+    if (Gqm === 0) continue;
+    const o = _fieldEntityCount * 4;
+    _fieldEntityData[o]     = e.x;
+    _fieldEntityData[o + 1] = e.y;
+    _fieldEntityData[o + 2] = Gqm;
+    _fieldEntityData[o + 3] = 0;
+    _fieldEntityCount++;
+  }
+  if (_fieldEntityCount === 0) return;       // empty scene → nothing to draw
+
+  // Common GL state for both passes.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, Math.round(_vpW * _dpr), Math.round(_vpH * _dpr));
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  _drawEquipotential();
+  _drawStreamlines();
+
+  gl.disable(gl.BLEND);
+}
+
+// Sample points (in CSS-px, viewport-relative fractions) used by
+// _estimatePhiRange to derive a contour-spacing matched to the actual
+// φ-range visible on screen this frame. Corners + center + edge midpoints
+// (9 samples) catch both far-field zero and any near-field extremes the
+// user can see.
+const _PHI_SAMPLE_FRACS = [
+  [0.0, 0.0], [0.5, 0.0], [1.0, 0.0],
+  [0.0, 0.5], [0.5, 0.5], [1.0, 0.5],
+  [0.0, 1.0], [0.5, 1.0], [1.0, 1.0],
+];
+
+function _drawEquipotential() {
+  const gl = _gl;
+
+  // Adaptive contour spacing: sample φ at 9 viewport reference points
+  // PLUS each visible entity's position (where φ-extremes always live —
+  // near ε floor depth). Spacing = (φmax − φmin) / numBands puts roughly
+  // numBands visible contour lines across the actual rendered φ-range,
+  // regardless of how strong or weak the dominant entity is. The fallback
+  // characteristicPhi heuristic stays as a floor in case no samples vary
+  // (e.g., single neutral entity sitting alone — no field at all).
+  let phiMin = +Infinity;
+  let phiMax = -Infinity;
+  for (let i = 0; i < _PHI_SAMPLE_FRACS.length; i++) {
+    const sx = _PHI_SAMPLE_FRACS[i][0] * _vpW;
+    const sy = _PHI_SAMPLE_FRACS[i][1] * _vpH;
+    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon);
+    if (phi < phiMin) phiMin = phi;
+    if (phi > phiMax) phiMax = phi;
+  }
+  // Sample at each packed-entity position too (the deepest wells / highest
+  // peaks of φ).
+  for (let i = 0; i < _fieldEntityCount; i++) {
+    const sx = _fieldEntityData[i * 4];
+    const sy = _fieldEntityData[i * 4 + 1];
+    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon);
+    if (phi < phiMin) phiMin = phi;
+    if (phi > phiMax) phiMax = phi;
+  }
+  const phiRange = phiMax - phiMin;
+  // If all samples collapse to the same value (no field variation visible),
+  // skip the pass entirely — there's nothing to draw.
+  if (!isFinite(phiRange) || phiRange <= 1e-6) return;
+  const spacing = phiRange / UI_CONTOUR_NUM_BANDS;
+
+  // Theme-aware contour color: light gray on dark bg, dark gray on light bg.
+  const bgRgb = _colorToRgbNorm(state.bgColor);
+  const bgIsLight = (bgRgb[0] + bgRgb[1] + bgRgb[2]) > 1.5;
+  const cR = bgIsLight ? 0.16 : 0.86;
+  const cG = bgIsLight ? 0.16 : 0.86;
+  const cB = bgIsLight ? 0.20 : 0.90;
+  const cA = bgIsLight ? 0.45 : 0.35;
+
+  gl.useProgram(_progEquipotential.prog);
+  gl.uniform2f(_progEquipotential.uViewport, _vpW, _vpH);
+  // _fieldEntityData is preallocated to MAX_FIELD_ENTITIES * 4 floats. We
+  // could pass a subarray of just `_fieldEntityCount * 4` here, but the GLSL
+  // `if (i >= uEntityCount) break;` stops reads at uEntityCount, so the
+  // tail bytes are inert. Uploading the full buffer is one less subarray
+  // allocation per frame and the bandwidth (~2 KB) is negligible.
+  gl.uniform4fv(_progEquipotential.uEntities, _fieldEntityData);
+  gl.uniform1i(_progEquipotential.uEntityCount, _fieldEntityCount);
+  gl.uniform1f(_progEquipotential.uEpsilon, state.epsilon);
+  gl.uniform1f(_progEquipotential.uContourSpacing, spacing);
+  gl.uniform1f(_progEquipotential.uContourLineW, UI_CONTOUR_LINE_W_PX);
+  gl.uniform1f(_progEquipotential.uDpr, _dpr);
+  gl.uniform4f(_progEquipotential.uColor, cR, cG, cB, cA);
+  gl.bindVertexArray(_vaoFsQuad);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindVertexArray(null);
+}
+
+function _drawStreamlines() {
+  const gl = _gl;
+  if (_streamlineSeedCount === 0) return;
+
+  // Synchronized pulse phase. uPulseHead ∈ [0, 1] during flight; we skip
+  // the draw call entirely during the 0.2 s pause window between cycles.
+  const now = performance.now();
+  if (_pulseStartMs === 0) _pulseStartMs = now;
+  const phaseMs = (now - _pulseStartMs) % UI_PULSE_PERIOD_MS;
+  if (phaseMs >= UI_PULSE_FLIGHT_MS) return;  // pause window — no strips visible
+  const pulseHead = phaseMs / UI_PULSE_FLIGHT_MS;
+
+  // Build per-instance data: (seedX, seedY, dirX, dirY, alpha) × N.
+  // alpha scales with log(force magnitude) so weak-field zones fade out
+  // and don't add visual noise. Clamped to [0.15, 1.0].
+  const N = _streamlineSeedCount;
+  const need = N * 5;
+  if (_streamlineInstanceData.length < need) {
+    _streamlineInstanceData = new Float32Array(need);
+  }
+  let liveCount = 0;
+  for (let i = 0; i < N; i++) {
+    const sx = _streamlineSeeds[i * 2];
+    const sy = _streamlineSeeds[i * 2 + 1];
+    const f = computeForceDirAt(sx, sy, state.entities, state.G, state.epsilon);
+    if (f.mag === 0) continue;                // skip null-field seeds
+    // Use log-scale to map force magnitude to brightness, then clamp.
+    // mag near a heavy entity can be huge; far-field is tiny. Log compresses.
+    const logMag = Math.log10(1 + f.mag);
+    const alpha = Math.max(0.15, Math.min(1.0, logMag / 4.0));
+    const o = liveCount * 5;
+    _streamlineInstanceData[o]     = sx;
+    _streamlineInstanceData[o + 1] = sy;
+    _streamlineInstanceData[o + 2] = f.x;
+    _streamlineInstanceData[o + 3] = f.y;
+    _streamlineInstanceData[o + 4] = alpha;
+    liveCount++;
+  }
+  if (liveCount === 0) return;
+
+  gl.useProgram(_progStreamline.prog);
+  gl.uniformMatrix4fv(_progStreamline.uOrtho, false, _orthoMat);
+  gl.uniform1f(_progStreamline.uLength, UI_STREAMLINE_LENGTH_PX);
+  gl.uniform1f(_progStreamline.uLineW, UI_STREAMLINE_WIDTH_PX);
+  gl.uniform1f(_progStreamline.uPulseHead, pulseHead);
+  gl.uniform1f(_progStreamline.uPulseTailFrac, UI_PULSE_TAIL_FRAC);
+  gl.uniform4f(_progStreamline.uColor,
+    UI_STREAMLINE_COLOR[0], UI_STREAMLINE_COLOR[1],
+    UI_STREAMLINE_COLOR[2], UI_STREAMLINE_COLOR[3]);
+  gl.bindVertexArray(_vaoStreamline);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceStreamline);
+  gl.bufferData(gl.ARRAY_BUFFER, _streamlineInstanceData.subarray(0, liveCount * 5), gl.DYNAMIC_DRAW);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, liveCount);
+  gl.bindVertexArray(null);
 }

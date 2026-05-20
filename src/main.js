@@ -19,6 +19,7 @@ import { stepVerlet, handleCollisions, updateAbsorptions, applyBoundary, prepare
 import {
   initWebGL,
   drawScene as drawSceneGL,
+  drawField,
   drawUI,
   updateTrailCanvas,
   resizeRenderer,
@@ -91,9 +92,11 @@ function frame(now) {
   }
 
   // V9.0b: WebGL draws everything. drawScene clears, blits trail, draws
-  // entity sprites; drawUI then overlays hover/drag/prediction/selection/
-  // absorbing on the same framebuffer with standard alpha blending.
+  // entity sprites. V9.1 inserts drawField between scene and UI (gated by
+  // state.showField → zero cost when off). drawUI then overlays hover /
+  // drag / prediction / selection / absorbing on the same framebuffer.
   drawSceneGL();
+  drawField();
   drawUI();
 
   updateEntityCount();

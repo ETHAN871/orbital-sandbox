@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>orbital-sandbox · potential.js fixtures</title>
+  <style>
+    body { font-family: ui-monospace, monospace; padding: 24px; max-width: 900px; }
+    h1 { font-size: 18px; }
+    pre { white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+    .pass { color: #2a8a2a; }
+    .fail { color: #c33; font-weight: bold; }
+    .summary { padding: 10px 14px; border-radius: 6px; margin-top: 12px; font-weight: bold; }
+    .summary.ok { background: #e8f6e8; color: #2a8a2a; }
+    .summary.bad { background: #fde8e8; color: #c33; }
+  </style>
+</head>
+<body>
+  <h1>orbital-sandbox · potential.js fixtures</h1>
+  <p>
+    Hand-computed expected values for <code>computePotentialAt(x, y, entities, G, ε)</code>
+    in <code>../src/potential.js</code>. The GPU equipotential fragment shader
+    (<code>EQUIPOTENTIAL.FS</code> in <code>../src/shaders.js</code>) must produce
+    bit-identical results at the same query points. Open this file directly in a
+    browser — no build, no test runner. Output below; check the green/red summary.
+  </p>
+  <pre id="output"></pre>
+
+  <script type="module">
+    import { computePotentialAt, computeForceDirAt } from '../src/potential.js';
+
+    const out = document.getElementById('output');
+    let passed = 0, failed = 0;
+    function log(line, cls) { out.innerHTML += `<span class="${cls || ''}">${line}</span>\n`; }
+    function approxEq(actual, expected, tol = 1e-9) {
+      return Math.abs(actual - expected) <= tol;
+    }
+    function check(name, actual, expected, tol = 1e-9) {
+      const ok = approxEq(actual, expected, tol);
+      if (ok) {
+        passed++;
+        log(`  ✓ ${name}  (= ${actual.toFixed(6)})`, 'pass');
+      } else {
+        failed++;
+        log(`  ✗ ${name}  expected ${expected}  got ${actual}`, 'fail');
+      }
+    }
+
+    // ─── Test entity helper ────────────────────────────────────────
+    // Minimum shape matching production entities for the potential math:
+    // { x, y, mass, charge, absorbing }. Other fields (id, type, color)
+    // don't affect computePotentialAt and are omitted here.
+    const E = (x, y, mass, charge, absorbing = null) => ({ x, y, mass, charge, absorbing });
+
+    const G = 80;     // matches DEFAULTS_TUNING.G in state.js
+    const EPS = 4;    // matches DEFAULTS_TUNING.epsilon
+
+    // ─── Fixture 1: single-mass radial drop ────────────────────────
+    // One entity at (100, 100), q=+1, m=10. At probe (200, 100), r=100.
+    // φ = -G · 1 · 10 / 100 = -G/10 = -8.
+    log('\n[1] Single mass radial drop');
+    {
+      const ents = [E(100, 100, 10, 1)];
+      const phi = computePotentialAt(200, 100, ents, G, EPS);
+      check('φ(200,100) for q=+1 m=10 at (100,100)', phi, -8);
+    }
+
+    // ─── Fixture 2: two-mass symmetry → gradient zero at origin ────
+    // Entities at (-50, 0) and (+50, 0), both q=+1, m=10. At origin,
+    // r=50 to each, so φ = -2·G·1·10/50 = -32.
+    // computeForceDirAt at origin should return mag≈0 (symmetric cancellation).
+    log('\n[2] Two equal masses, null axis point');
+    {
+      const ents = [E(-50, 0, 10, 1), E(50, 0, 10, 1)];
+      const phi = computePotentialAt(0, 0, ents, G, EPS);
+      check('φ(0,0) for two q=+1 m=10 at ±50', phi, -32);
+      const f = computeForceDirAt(0, 0, ents, G, EPS);
+      check('|F|(0,0) for symmetric pair', f.mag, 0, 1e-9);
+    }
+
+    // ─── Fixture 3: opposite-charge dipole on bisector ─────────────
+    // Entity at (-50, 0) q=+1 m=10; entity at (+50, 0) q=-1 m=10.
+    // At any point (0, y) on the perpendicular bisector, r is the same to
+    // both. φ = -G·(+1)·10/r + -G·(-1)·10/r = 0. Test at y=30.
+    log('\n[3] Opposite-charge dipole, φ=0 on bisector');
+    {
+      const ents = [E(-50, 0, 10, 1), E(50, 0, 10, -1)];
+      check('φ(0, 30) dipole bisector', computePotentialAt(0, 30, ents, G, EPS), 0);
+      check('φ(0, -25) dipole bisector', computePotentialAt(0, -25, ents, G, EPS), 0);
+      check('φ(0,   0) dipole bisector', computePotentialAt(0,   0, ents, G, EPS), 0);
+    }
+
+    // ─── Fixture 4: linearity in mass ──────────────────────────────
+    // Doubling mass doubles φ (everything else equal).
+    log('\n[4] φ is linear in mass');
+    {
+      const ents10 = [E(0, 0, 10, 1)];
+      const ents20 = [E(0, 0, 20, 1)];
+      const phi10 = computePotentialAt(100, 0, ents10, G, EPS);
+      const phi20 = computePotentialAt(100, 0, ents20, G, EPS);
+      check('φ doubles when mass doubles', phi20, 2 * phi10, 1e-9);
+    }
+
+    // ─── Fixture 5: ε softening floor at r=0 ───────────────────────
+    // At the entity's own position (r=0), without the ε floor we would
+    // get φ = -∞. With ε=4, the formula uses max(r, ε) = 4:
+    // φ = -G · 1 · 10 / 4 = -G·2.5 = -200.
+    log('\n[5] ε softening floor prevents r→0 singularity');
+    {
+      const ents = [E(0, 0, 10, 1)];
+      const phi = computePotentialAt(0, 0, ents, G, EPS);
+      check('φ at r=0 with ε=4 returns finite -G·m/ε', phi, -200);
+      // Same at r=2 (still within ε floor):
+      check('φ at r=2 (inside ε floor) clamped to r=ε', computePotentialAt(2, 0, ents, G, EPS), -200);
+      // At r=ε exactly, formula transitions smoothly:
+      check('φ at r=ε exactly', computePotentialAt(4, 0, ents, G, EPS), -200);
+      // Beyond ε, regular 1/r:
+      check('φ at r=8 outside ε floor uses real r', computePotentialAt(8, 0, ents, G, EPS), -100);
+    }
+
+    // ─── Fixture 6: charge sign flip mirrors φ ─────────────────────
+    log('\n[6] Charge sign flip mirrors φ');
+    {
+      const probeX = 200, probeY = 100;
+      const entsPos = [E(100, 100, 10, +1)];
+      const entsNeg = [E(100, 100, 10, -1)];
+      const phiPos = computePotentialAt(probeX, probeY, entsPos, G, EPS);
+      const phiNeg = computePotentialAt(probeX, probeY, entsNeg, G, EPS);
+      check('φ(+q) = -φ(-q) for identical mass+position', phiPos, -phiNeg, 1e-9);
+      check('q=0 contributes nothing',
+        computePotentialAt(probeX, probeY, [E(100, 100, 10, 0)], G, EPS),
+        0);
+    }
+
+    // ─── Fixture 7: absorbing entities are skipped ─────────────────
+    log('\n[7] Absorbing entities skipped');
+    {
+      const ents = [
+        E(100, 100, 10, 1),                                          // visible
+        E(150, 100, 10, 1, { blackHoleId: 99, elapsedSim: 0.1 }),    // absorbing → skip
+      ];
+      const phi = computePotentialAt(200, 100, ents, G, EPS);
+      // Only the visible one contributes: r=100, φ = -8.
+      check('absorbing entity excluded from sum', phi, -8);
+    }
+
+    // ─── Summary ────────────────────────────────────────────────────
+    const total = passed + failed;
+    const summary = document.createElement('div');
+    summary.className = `summary ${failed === 0 ? 'ok' : 'bad'}`;
+    summary.textContent = failed === 0
+      ? `✓ all ${total} fixtures passed`
+      : `✗ ${failed} of ${total} fixtures FAILED — fix before integrating with GPU shader`;
+    document.body.appendChild(summary);
+    console[failed === 0 ? 'log' : 'error'](
+      `[potential.test] ${failed === 0 ? 'PASS' : 'FAIL'} — ${passed}/${total}`
+    );
+  </script>
+</body>
+</html>

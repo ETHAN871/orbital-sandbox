@@ -38,6 +38,7 @@ export function bindUI() {
   els.deleteBtn.addEventListener('click', deleteSelectedEntity);
   els.pendingPinBtn.addEventListener('click', togglePendingPin);
   els.boundaryBtn.addEventListener('click', toggleBoundaryMode);
+  els.fieldBtn.addEventListener('click', toggleFieldMode);
   els.bgThemeBtn.addEventListener('click', toggleBgTheme);
 
   // Trail-width slider (collapsible "线宽设置" section).
@@ -100,6 +101,8 @@ function cacheElements() {
   els.deleteBtn  = document.getElementById('delete-entity-btn');
   els.pendingPinBtn = document.getElementById('pending-pin-btn');
   els.boundaryBtn   = document.getElementById('boundary-btn');
+  // V9.1 field visualization toggle.
+  els.fieldBtn      = document.getElementById('field-btn');
   // Background theme + trail width + advanced tuning panel.
   els.bgThemeBtn      = document.getElementById('bg-theme-btn');
   els.trailWidthInput = document.getElementById('trail-width');
@@ -385,4 +388,19 @@ function refreshBoundaryBtn() {
   const wrap = state.boundaryMode === 'wrap';
   els.boundaryBtn.classList.toggle('active', wrap);
   els.boundaryBtn.textContent = wrap ? '循环边界（开）' : '循环边界';
+}
+
+// V9.1: toggle the gravitational field overlay (equipotential contours +
+// synchronized pulsing streamlines). When OFF the renderer skips drawField
+// entirely, so the GPU cost is zero — gated check happens in main.js
+// frame loop.
+function toggleFieldMode() {
+  state.showField = !state.showField;
+  refreshFieldBtn();
+}
+
+function refreshFieldBtn() {
+  if (!els.fieldBtn) return;
+  els.fieldBtn.classList.toggle('active', state.showField);
+  els.fieldBtn.textContent = state.showField ? '隐藏场' : '显示场';
 }

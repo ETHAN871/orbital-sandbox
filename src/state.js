@@ -156,6 +156,12 @@ export const state = {
   // Trail dot width in px (diameter). Renderer derives radius R = trailWidth / 2.
   // Default 3 px → solid 3×3 with 1 px AA edge.
   trailWidth: 3,
+
+  // V9.1: when true, drawField() runs after drawScene() — renders the
+  // gravitational equipotential contour lines + synchronized pulsing
+  // streamlines as a topographic-style "field flow" visualization. Default
+  // OFF so the GPU work is fully gated (zero overhead when not displayed).
+  showField: false,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────

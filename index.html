@@ -72,6 +72,16 @@
         </label>
       </section>
 
+      <!-- V9.1: gravitational field visualization. Default OFF → drawField is
+           gated by state.showField, so zero GPU cost when hidden. -->
+      <section class="group">
+        <h2>场可视化</h2>
+        <div class="btn-row">
+          <button id="field-btn" class="btn" type="button">显示场</button>
+        </div>
+        <p class="hint">等势线 + 同步脉冲流线（地形图风格）</p>
+      </section>
+
       <details class="group collapsible">
         <summary>线宽设置</summary>
         <label>
