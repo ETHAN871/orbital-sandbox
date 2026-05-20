@@ -24,16 +24,33 @@
 // Keep the formula bit-for-bit identical between this file and the FS
 // or the test fixtures lose their value as a GPU-vs-CPU oracle.
 
-export function computePotentialAt(x, y, entities, G, epsilon) {
+// `boundary` is optional. When wrap mode is active, pass
+// `{ width, height }` so each entity's contribution is summed over its
+// 9-ghost PBC neighbourhood (itself + 8 mirror copies offset by ±W
+// horizontally and ±H vertically). This keeps the field continuous as
+// bodies cross the wrap boundary — without it, an entity teleporting
+// from x=W-1 to x=1 would cause its phi contribution at a probe near
+// x=W-5 to flip discontinuously. The closest mirror image hands off the
+// influence smoothly. Matches the 9-ghost PBC physics in physics.js.
+export function computePotentialAt(x, y, entities, G, epsilon, boundary = null) {
   let phi = 0;
+  const W = boundary ? boundary.width : 0;
+  const H = boundary ? boundary.height : 0;
+  const N = boundary ? 1 : 0;
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.absorbing) continue;
-    const dx = x - e.x;
-    const dy = y - e.y;
-    const r = Math.sqrt(dx * dx + dy * dy);
-    const safeR = Math.max(r, epsilon);
-    phi += -G * e.charge * e.mass / safeR;
+    const baseK = -G * e.charge * e.mass;
+    if (baseK === 0) continue;
+    for (let oy = -N; oy <= N; oy++) {
+      for (let ox = -N; ox <= N; ox++) {
+        const dx = x - (e.x + ox * W);
+        const dy = y - (e.y + oy * H);
+        const r = Math.sqrt(dx * dx + dy * dy);
+        const safeR = Math.max(r, epsilon);
+        phi += baseK / safeR;
+      }
+    }
   }
   return phi;
 }
@@ -49,21 +66,30 @@ export function computePotentialAt(x, y, entities, G, epsilon) {
 // a +probe toward itself (force points from probe to entity). For
 // near-zero-magnitude fields (saddle / symmetry points), returns a stable
 // fallback direction (1, 0) so the streamline still has a defined tangent.
-export function computeForceDirAt(x, y, entities, G, epsilon) {
+export function computeForceDirAt(x, y, entities, G, epsilon, boundary = null) {
   let fx = 0;
   let fy = 0;
+  const W = boundary ? boundary.width : 0;
+  const H = boundary ? boundary.height : 0;
+  const N = boundary ? 1 : 0;
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.absorbing) continue;
-    const dx = e.x - x;
-    const dy = e.y - y;
-    const r2 = dx * dx + dy * dy;
-    const r = Math.sqrt(r2);
-    const safeR = Math.max(r, epsilon);
-    const inv3 = 1 / (safeR * safeR * safeR);
-    const k = G * e.charge * e.mass * inv3;
-    fx += k * dx;
-    fy += k * dy;
+    const baseK = G * e.charge * e.mass;
+    if (baseK === 0) continue;
+    for (let oy = -N; oy <= N; oy++) {
+      for (let ox = -N; ox <= N; ox++) {
+        const dx = (e.x + ox * W) - x;
+        const dy = (e.y + oy * H) - y;
+        const r2 = dx * dx + dy * dy;
+        const r = Math.sqrt(r2);
+        const safeR = Math.max(r, epsilon);
+        const inv3 = 1 / (safeR * safeR * safeR);
+        const k = baseK * inv3;
+        fx += k * dx;
+        fy += k * dy;
+      }
+    }
   }
   const mag = Math.sqrt(fx * fx + fy * fy);
   if (mag < 1e-6) return { x: 1, y: 0, mag: 0 };

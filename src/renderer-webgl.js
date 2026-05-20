@@ -1276,23 +1276,42 @@ export function drawField() {
   if (_vpW <= 0 || _vpH <= 0) return;
   const gl = _gl;
 
-  // Pack entity data: only first MAX_FIELD_ENTITIES non-absorbing,
-  // non-neutral entries make it into the GPU uniform array. (Neutral q=0
-  // entities contribute nothing to φ, so dropping them saves a few
-  // shader iterations per pixel.)
+  // Pack entity data into the GPU uniform array. In normal (destroy)
+  // boundary mode each non-absorbing, non-neutral entity contributes a
+  // single entry. In wrap mode each such entity contributes its 9-ghost
+  // PBC neighbourhood (itself + 8 mirror copies offset by ±W and ±H), so
+  // the field continuously hands off across the wrap boundary instead of
+  // discontinuously snapping when a body teleports. Matches the 9-ghost
+  // PBC physics in physics.js — without this the streamlines would
+  // disagree with where the bodies actually feel force.
+  //
+  // MAX_FIELD_ENTITIES caps total entries (entity × ghost). At 9× cost
+  // per entity in wrap mode the budget is ~14 visible entities before
+  // truncation; truncated ghosts just visually approximate but do not
+  // crash. Acceptable for the typical scene; user can disable field viz
+  // if they spawn 20+ bodies in wrap mode.
   _fieldEntityCount = 0;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = _vpW, H = _vpH;
   const ents = state.entities;
-  for (let i = 0; i < ents.length && _fieldEntityCount < MAX_FIELD_ENTITIES; i++) {
+  outer: for (let i = 0; i < ents.length; i++) {
     const e = ents[i];
     if (e.absorbing) continue;
     const Gqm = state.G * e.charge * e.mass;
     if (Gqm === 0) continue;
-    const o = _fieldEntityCount * 4;
-    _fieldEntityData[o]     = e.x;
-    _fieldEntityData[o + 1] = e.y;
-    _fieldEntityData[o + 2] = Gqm;
-    _fieldEntityData[o + 3] = 0;
-    _fieldEntityCount++;
+    const nLo = wrap ? -1 : 0;
+    const nHi = wrap ? 1 : 0;
+    for (let oy = nLo; oy <= nHi; oy++) {
+      for (let ox = nLo; ox <= nHi; ox++) {
+        if (_fieldEntityCount >= MAX_FIELD_ENTITIES) break outer;
+        const o = _fieldEntityCount * 4;
+        _fieldEntityData[o]     = e.x + ox * W;
+        _fieldEntityData[o + 1] = e.y + oy * H;
+        _fieldEntityData[o + 2] = Gqm;
+        _fieldEntityData[o + 3] = 0;
+        _fieldEntityCount++;
+      }
+    }
   }
   if (_fieldEntityCount === 0) return;       // empty scene → nothing to draw
 
@@ -1322,29 +1341,36 @@ const _PHI_SAMPLE_FRACS = [
 
 function _drawEquipotential() {
   const gl = _gl;
+  // When wrap mode is active, CPU samplers must use the same 9-ghost PBC
+  // sum the GPU shader does (via the ghost copies pre-packed into the
+  // uniform array). Otherwise the (φmax-φmin) range we compute here
+  // disagrees with what the shader actually renders, and the contour
+  // spacing falls out of sync at the wrap boundary.
+  const boundary = (state.boundaryMode === 'wrap')
+    ? { width: _vpW, height: _vpH }
+    : null;
 
   // Adaptive contour spacing: sample φ at 9 viewport reference points
   // PLUS each visible entity's position (where φ-extremes always live —
   // near ε floor depth). Spacing = (φmax − φmin) / numBands puts roughly
   // numBands visible contour lines across the actual rendered φ-range,
-  // regardless of how strong or weak the dominant entity is. The fallback
-  // characteristicPhi heuristic stays as a floor in case no samples vary
-  // (e.g., single neutral entity sitting alone — no field at all).
+  // regardless of how strong or weak the dominant entity is.
   let phiMin = +Infinity;
   let phiMax = -Infinity;
   for (let i = 0; i < _PHI_SAMPLE_FRACS.length; i++) {
     const sx = _PHI_SAMPLE_FRACS[i][0] * _vpW;
     const sy = _PHI_SAMPLE_FRACS[i][1] * _vpH;
-    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon);
+    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon, boundary);
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
-  // Sample at each packed-entity position too (the deepest wells / highest
-  // peaks of φ).
-  for (let i = 0; i < _fieldEntityCount; i++) {
-    const sx = _fieldEntityData[i * 4];
-    const sy = _fieldEntityData[i * 4 + 1];
-    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon);
+  // Sample at each VISIBLE entity (use state.entities, not the packed
+  // ghost array) so the deepest wells / highest peaks of φ are caught.
+  for (let i = 0; i < state.entities.length; i++) {
+    const e = state.entities[i];
+    if (e.absorbing) continue;
+    if (e.charge * e.mass === 0) continue;
+    const phi = computePotentialAt(e.x, e.y, state.entities, state.G, state.epsilon, boundary);
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
@@ -1401,11 +1427,14 @@ function _drawStreamlines() {
   if (_streamlineInstanceData.length < need) {
     _streamlineInstanceData = new Float32Array(need);
   }
+  const boundary = (state.boundaryMode === 'wrap')
+    ? { width: _vpW, height: _vpH }
+    : null;
   let liveCount = 0;
   for (let i = 0; i < N; i++) {
     const sx = _streamlineSeeds[i * 2];
     const sy = _streamlineSeeds[i * 2 + 1];
-    const f = computeForceDirAt(sx, sy, state.entities, state.G, state.epsilon);
+    const f = computeForceDirAt(sx, sy, state.entities, state.G, state.epsilon, boundary);
     if (f.mag === 0) continue;                // skip null-field seeds
     // Use log-scale to map force magnitude to brightness, then clamp.
     // mag near a heavy entity can be huge; far-field is tiny. Log compresses.

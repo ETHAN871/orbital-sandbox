@@ -143,6 +143,71 @@
       check('absorbing entity excluded from sum', phi, -8);
     }
 
+    // ─── Fixture 8: wrap-mode PBC continuity at boundary ───────────
+    // Entity at left edge (x=1) with viewport W=400, H=200. Probe at right
+    // edge (x=399). Without wrap → direct distance = 398, φ ≈ -G·m/398.
+    // With wrap → also include the right-mirror at x=401 (distance 2). The
+    // mirror contribution dominates because 1/2 >> 1/398. So with-wrap φ
+    // should be much more negative than without-wrap φ at the same probe.
+    log('\n[8] Wrap PBC mirror dominates at boundary');
+    {
+      const W = 400, H = 200;
+      const ents = [E(1, 100, 10, 1)];
+      const probeX = 399, probeY = 100;
+      const phiNoWrap = computePotentialAt(probeX, probeY, ents, G, EPS);
+      const phiWrap = computePotentialAt(probeX, probeY, ents, G, EPS, { width: W, height: H });
+      check('no-wrap φ uses 398px distance only', phiNoWrap, -G * 10 / 398, 1e-9);
+      // With wrap, 9 ghosts at offsets (-W..W, -H..H). The closest two are
+      // the right mirror at (1+W, 100) = (401, 100), distance 2, AND the
+      // self at (1, 100), distance 398. Plus 7 other ghosts: corners (1±W,
+      // 100±H) and verticals (1, 100±H) and (1±W, 100). Total = sum of
+      // -G*m/safeR over all 9.
+      const W_ = W, H_ = H;
+      const expected = [
+        [1 - W_, 100 - H_],   // (-399, -100)
+        [1,      100 - H_],   // (1, -100)
+        [1 + W_, 100 - H_],   // (401, -100)
+        [1 - W_, 100],        // (-399, 100)
+        [1,      100],        // (1, 100)
+        [1 + W_, 100],        // (401, 100)
+        [1 - W_, 100 + H_],   // (-399, 300)
+        [1,      100 + H_],   // (1, 300)
+        [1 + W_, 100 + H_],   // (401, 300)
+      ].reduce((acc, [ex, ey]) => {
+        const dx = probeX - ex, dy = probeY - ey;
+        const r = Math.sqrt(dx*dx + dy*dy);
+        return acc + -G * 10 / Math.max(r, EPS);
+      }, 0);
+      check('wrap φ matches manual 9-ghost sum', phiWrap, expected, 1e-9);
+      // Sanity: wrap version is much more negative (closer well from the mirror).
+      check('wrap φ is more negative than no-wrap φ', phiWrap < phiNoWrap * 10, true, 0);
+    }
+
+    // ─── Fixture 9: wrap-mode continuity across crossing ───────────
+    // Same entity crossing from x=W-1 to x=1 should produce nearly the
+    // same φ at a probe near x=W-3 in wrap mode (the right-mirror at
+    // x+W ≈ W+1 hands off the influence smoothly). Without wrap the
+    // probe would see φ change drastically as the entity teleports.
+    log('\n[9] Wrap φ continuous as entity crosses boundary');
+    {
+      const W = 400, H = 200;
+      const bnd = { width: W, height: H };
+      // Entity just before crossing
+      const entsBefore = [E(W - 1, 100, 10, 1)];
+      // Entity just after crossing (teleported via wrap)
+      const entsAfter  = [E(1,     100, 10, 1)];
+      const probeX = W - 3, probeY = 100;
+      const phiBefore = computePotentialAt(probeX, probeY, entsBefore, G, EPS, bnd);
+      const phiAfter  = computePotentialAt(probeX, probeY, entsAfter,  G, EPS, bnd);
+      // The two should be nearly equal — the entity at x=W-1 was 2px to
+      // the right of the probe, and after wrap is at x=1 with right-mirror
+      // at x=W+1 → 4px to the right of probe (W-3 → W+1). Distances
+      // 2 vs 4 → contributions differ by 2×. Not equal but should be
+      // continuous (no order-of-magnitude jump like 1/2 vs 1/(W-3)≈1/397).
+      const ratio = phiAfter / phiBefore;
+      check('wrap φ ratio across crossing within ~3×', ratio > 0.25 && ratio < 4.0, true, 0);
+    }
+
     // ─── Summary ────────────────────────────────────────────────────
     const total = passed + failed;
     const summary = document.createElement('div');
