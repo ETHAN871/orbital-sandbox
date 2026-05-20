@@ -13,7 +13,7 @@ import {
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
-import { resetTrailCanvas } from './renderer.js';
+import { resetTrailCanvas } from './renderer-webgl.js';
 
 const els = {};
 

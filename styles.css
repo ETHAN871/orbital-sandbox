@@ -30,15 +30,56 @@ html, body {
   grid-template-columns: 1fr 280px;
 }
 
-#stage {
+/* V9.0a: stage is now wrapped in a relative container so the WebGL canvas
+   (#stage) and the Canvas2D UI overlay (#overlay) can stack absolutely. */
+#stage-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+#stage,
+#overlay {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
   height: 100%;
+}
+
+#stage {
   cursor: crosshair;
   background: var(--bg);
 }
 
+/* The overlay is transparent to clicks — pointer events pass through to the
+   stage canvas underneath, which is what input.js attaches handlers to. */
+#overlay {
+  pointer-events: none;
+}
+
 #stage.edit-mode { cursor: pointer; }
+
+/* Shown only when WebGL 2 init fails. Stays out of layout when hidden. */
+#webgl-error {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  background: rgba(10, 10, 15, 0.92);
+  color: var(--danger);
+  font-size: 14px;
+  line-height: 1.6;
+  z-index: 10;
+}
+
+#webgl-error[hidden] {
+  display: none;
+}
 
 #panel {
   background: var(--panel-bg);
