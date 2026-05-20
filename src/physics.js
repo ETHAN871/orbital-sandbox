@@ -186,17 +186,15 @@ let _currentSimDt = 0;
 // Per-body grace cleanly isolates the affected bodies; stable bodies
 // elsewhere keep getting refund every substep.
 //
-// SOLVER_DV_THRESHOLD: |Δv| from the velocity solver that marks a
-// body as "in transient". 5 px/s separates static gravity-kick |Δv|
-// (~1.5 px/s, refund stays active) from collision-cascade |Δv|
-// (~30-50 px/s on struck bodies, propagating into 5-15 px/s on
-// neighbors; refund pauses). After the cascade settles, individual
-// bodies' per-substep |Δv| drops below 5 — but their counter is
-// already set and continues to count down for ~0.33 s, covering the
-// full settling time.
-const REFUND_GRACE_FRAMES = 40;             // ~0.33 s at SIM_DT=1/120
-const SOLVER_DV_THRESHOLD = 5.0;            // px/s
-const SOLVER_DV_THRESHOLD2 = SOLVER_DV_THRESHOLD * SOLVER_DV_THRESHOLD;
+// COLLISION_IMPULSE_THRESHOLD: cumulative |J| (across velocity-solver
+// iterations) per contact that marks it as collision-cascade rather
+// than gravity-induced. Static / orbital contacts: solver applies
+// small impulse each substep just to zero the kick-induced inward
+// velocity component (~150 per contact for typical G=500 dt=1/120
+// mass=100). Collision-cascade contacts: solver applies impulse
+// proportional to the cascade's velocity transmission (~3000+).
+// 500 cleanly separates them.
+const COLLISION_IMPULSE_THRESHOLD = 500;
 
 // Pre-kick approach-velocity threshold for "this is a real collision,
 // not a kick-induced spurious approach". A few ULPs above zero leaves
@@ -317,65 +315,24 @@ export function stepPBD(entities, dt) {
   // we cancel it explicitly at the velocity level, which is the
   // canonical fix for "stacking under gravity" per Box2D / Catto.
   //
-  // Snapshot velocity before the solver. After the solver runs, any
-  // body whose |Δv| exceeds SOLVER_DV_THRESHOLD is part of a
-  // collision cascade and gets its PER-BODY refund grace counter set
-  // (see step G''). Decrement happens in G''.
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    e._vxPreSolver = e.vx;
-    e._vyPreSolver = e.vy;
-  }
   _solveContactVelocities(_contactCount);
-  // Mark direct cascade members (bodies the solver applied a
-  // significant impulse to this substep), then propagate the grace
-  // flag through the contact graph: any body in contact with a
-  // grace-flagged body also enters grace. This catches far-cluster
-  // bodies whose per-substep impulse was small but who are still
-  // part of the transient post-collision cluster motion (the user
-  // observed bullet-impact CoM momentum decaying because such bodies
-  // didn't hit the |Δv| threshold and got refund-damped).
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    const dvx = e.vx - e._vxPreSolver;
-    const dvy = e.vy - e._vyPreSolver;
-    if (dvx * dvx + dvy * dvy > SOLVER_DV_THRESHOLD2) {
-      e._refundSkipCounter = REFUND_GRACE_FRAMES;
-    }
-  }
-  // Propagate through contact graph (3 passes; typical clusters
-  // fully reach all members within 3 hops).
-  for (let pass = 0; pass < 3; pass++) {
-    let changed = false;
-    for (let k = 0; k < _contactCount; k++) {
-      const c = _contacts[k];
-      const a = c.a, b = c.b;
-      if (a.absorbing || b.absorbing) continue;
-      const aMarked = a._refundSkipCounter > 0;
-      const bMarked = b._refundSkipCounter > 0;
-      if (aMarked && !bMarked && !b.pinned) {
-        b._refundSkipCounter = REFUND_GRACE_FRAMES;
-        changed = true;
-      } else if (bMarked && !aMarked && !a.pinned) {
-        a._refundSkipCounter = REFUND_GRACE_FRAMES;
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
 
   // ── G. Position solver (non-linear Gauss-Seidel) ───────────────
   // Resolve residual penetration. Now that velocities along each
   // contact normal are already zero, the position projection mostly
   // catches first-time penetrations (initial overlap, fast impacts).
   //
-  // Snapshot positions BEFORE projection so step G'' can compute the
-  // ΔPE the projection injected and refund it from KE.
+  // Reset each body's GRAVITY-only Δx accumulator before the position
+  // solver. _projectPBDContacts will accumulate displacement
+  // contributions from gravity-induced contacts only (per-contact
+  // classification via c.preVn vs COLLISION_PREVN_THRESHOLD). The
+  // energy refund (G'') uses this gravity-only Δx so collision-cascade
+  // displacements don't get refunded (which would drain the
+  // momentum the impact installed in the cluster).
   for (let i = 0; i < n; i++) {
     const e = entities[i];
-    e._sxProj = e.x;
-    e._syProj = e.y;
+    e._dxGrav = 0;
+    e._dyGrav = 0;
   }
   _projectPBDContacts(_contactCount);
 
@@ -419,27 +376,30 @@ export function stepPBD(entities, dt) {
   // step C kicked with — physically consistent because it represents
   // the body's effective acceleration (gravity minus implicit
   // constraint absorption).
-  // Gate: skip refund for THIS body if it's in a transient (its
-  // velocity-solver impulse this substep was significant, or its
-  // PER-BODY grace counter is still ticking down from a recent
-  // impulse). Stable bodies elsewhere in the scene continue to
-  // benefit from the refund's static-stability properties.
+  // Refund uses each body's GRAVITY-only Δx accumulator (set by the
+  // position solver during step G; only gravity-induced contacts
+  // contributed). This per-contact classification cleanly separates:
+  //   - Stable clusters (all contacts gravity-induced) — refund
+  //     fires fully on every body each substep, suppressing the
+  //     FP-noise amplification that otherwise jitters dense piles.
+  //   - Collision cascades — contacts with high pre-kick approach
+  //     velocity are excluded from refund accumulator, so the
+  //     cluster's impact-given momentum is preserved. As the
+  //     impulse propagates through the cluster across substeps,
+  //     subsequent contacts get marked collision-induced by their
+  //     pre-kick relative velocity automatically.
   //
-  // Per-body (not scene-global) because in busy scenes any new
-  // collision anywhere would reset a global counter and refund
-  // would NEVER fire, breaking static cluster stability — visible
-  // as dense aggregates jittering near wrap boundaries.
+  // Replaces the earlier per-body grace counter, which had to
+  // choose between (a) too-narrow gating that left collision
+  // cascades refund-damped or (b) propagation through the contact
+  // graph that disabled refund scene-wide in dense aggregates.
   for (let i = 0; i < n; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
-    if (e._refundSkipCounter > 0) {
-      e._refundSkipCounter--;
-      continue;
-    }
-    const dx = e.x - e._sxProj;
-    const dy = e.y - e._syProj;
+    const dx = e._dxGrav;
+    const dy = e._dyGrav;
     const dx2 = dx * dx + dy * dy;
-    if (dx2 < 1e-12) continue;                  // body wasn't moved
+    if (dx2 < 1e-12) continue;                  // no gravity-induced motion
     const adx = e.ax * dx + e.ay * dy;
     const v2 = e.vx * e.vx + e.vy * e.vy;
     const v2New = v2 + 2 * adx;
@@ -649,6 +609,15 @@ function _centripetalProject(entities) {
 // pair (A, C). For our typical small clusters (≤6 simultaneous contacts
 // per body), 4 iterations leaves residual penetration well below the
 // visible threshold. See architect blueprint for the convergence analysis.
+// Threshold for classifying a contact as "gravity-induced" (where
+// position projection's displacement should be refunded as gravity-
+// against-constraint work) vs "collision-induced" (where the
+// displacement is part of a real impulse cascade and should NOT be
+// refunded — otherwise the cluster's impact-given momentum gets
+// drained). Pre-kick approach velocity > -1 px/s is essentially
+// "static or slowly drifting" = gravity-induced; below = collision.
+const COLLISION_PREVN_THRESHOLD = -1.0;       // px/s
+
 function _projectPBDContacts(count) {
   if (count === 0) return;
   const wrap = state.boundaryMode === 'wrap';
@@ -661,18 +630,7 @@ function _projectPBDContacts(count) {
       const c = _contacts[k];
       const a = c.a;
       const b = c.b;
-      // Defensive: a pair may have been turned into prey since detection
-      // (handleCollisions can flip absorbing mid-walk). Such pairs no
-      // longer participate in the constraint network.
       if (a.absorbing || b.absorbing) continue;
-      // RECOMPUTE the normal from CURRENT positions each iteration.
-      // Using the stored detection-time normal leaks tangential energy
-      // for orbiting contacts: the body's angle rotates between detection
-      // and projection, so pushing along the OLD normal leaves residual
-      // overlap AND injects an angular sweep that surfaces as false
-      // tangential velocity in step G's `v = Δx/dt`. Recomputing is
-      // ~10 fp ops per contact per iter — negligible — and lets each
-      // iter converge against the body's true current geometry.
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
@@ -683,23 +641,47 @@ function _projectPBDContacts(count) {
       if (dist2 < 1e-12) continue;
       const dist = Math.sqrt(dist2);
       const overlap = c.rSum - dist;
-      if (overlap <= 0) continue;                // already separated this iter
+      if (overlap <= 0) continue;
       const wA = a.pinned ? 0 : 1 / a.mass;
       const wB = b.pinned ? 0 : 1 / b.mass;
       const wSum = wA + wB;
-      if (wSum === 0) continue;                  // two pinned bodies stuck
-      // Use CURRENT-iteration normal for the push direction. Update c.nx/c.ny
-      // so the rest of the pipeline (centripetal projection, restitution)
-      // reads the freshest geometry.
+      if (wSum === 0) continue;
       const nx = dx / dist;
       const ny = dy / dist;
       c.nx = nx;
       c.ny = ny;
       const correction = overlap / wSum;
-      a.x -= nx * correction * wA;
-      a.y -= ny * correction * wA;
-      b.x += nx * correction * wB;
-      b.y += ny * correction * wB;
+      const dax = nx * correction * wA;
+      const day = ny * correction * wA;
+      const dbx = nx * correction * wB;
+      const dby = ny * correction * wB;
+      a.x -= dax;
+      a.y -= day;
+      b.x += dbx;
+      b.y += dby;
+      // Per-contact classification: this contact is gravity-induced
+      // (and contributes to the refund accumulator) only if BOTH:
+      //   (a) preVn > threshold — bodies weren't approaching pre-kick
+      //   (b) solverImpulseMag below threshold — the velocity solver
+      //       did NOT apply a large impulse to this contact (which
+      //       would indicate collision-cascade impulse transmission)
+      //
+      // Per-contact classification (instead of per-body grace) lets
+      // the cascade auto-propagate: in the impact substep the
+      // bullet-light contact has huge impulse, while light-heavy
+      // and light-neighbor contacts ALSO have huge impulse because
+      // the solver transmitted the cascade through them — so all
+      // are marked collision and excluded from refund. In subsequent
+      // substeps the cascade naturally continues via preVn (bodies'
+      // pre-kick velocity reflects the just-installed momentum).
+      const isGravity = c.preVn > COLLISION_PREVN_THRESHOLD
+                     && c.solverImpulseMag < COLLISION_IMPULSE_THRESHOLD;
+      if (isGravity) {
+        a._dxGrav -= dax;
+        a._dyGrav -= day;
+        b._dxGrav += dbx;
+        b._dyGrav += dby;
+      }
     }
   }
 }
@@ -732,6 +714,12 @@ const VELOCITY_ITERATIONS = 4;
 
 function _solveContactVelocities(count) {
   if (count === 0) return;
+  // Reset per-contact impulse accumulators. Used by the position
+  // solver to classify each contact as gravity-induced vs
+  // collision-cascade (large cumulative impulse → collision, excluded
+  // from the energy-refund accumulator so the cluster's
+  // impulse-given momentum is preserved).
+  for (let k = 0; k < count; k++) _contacts[k].solverImpulseMag = 0;
   const e = state.elasticRestitution;
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width : 0;
@@ -743,7 +731,6 @@ function _solveContactVelocities(count) {
       const a = c.a;
       const b = c.b;
       if (a.absorbing || b.absorbing) continue;
-      // Recompute contact normal from current positions every iteration.
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
@@ -754,15 +741,10 @@ function _solveContactVelocities(count) {
       if (dist2 < 1e-12) continue;
       const dist = Math.sqrt(dist2);
       const nx = dx / dist, ny = dy / dist;
-      // Current relative normal velocity.
       const rvx = b.vx - a.vx;
       const rvy = b.vy - a.vy;
       const vn = rvx * nx + rvy * ny;
-      // Persistent → 0 (no bounce). New collision → -e·vnApproach (bounce).
       const vnTarget = c.wasPersistent ? 0 : -e * c.vnApproach;
-      // Only apply if currently approaching faster than target (vn < vnTarget).
-      // For persistent contacts: target=0, fire if vn < 0 (any approach).
-      // For collisions: target=positive, fire if vn < positive (still net inward).
       if (vn >= vnTarget) continue;
       const wA = a.pinned ? 0 : 1 / a.mass;
       const wB = b.pinned ? 0 : 1 / b.mass;
@@ -773,6 +755,8 @@ function _solveContactVelocities(count) {
       a.vy -= J * ny * wA;
       b.vx += J * nx * wB;
       b.vy += J * ny * wB;
+      // Accumulate |J| per contact for downstream classification.
+      c.solverImpulseMag += J >= 0 ? J : -J;
     }
   }
 }
@@ -963,7 +947,7 @@ function processCollisionPair(a, b, dx, dy) {
     }
     let c = _contacts[_contactCount];
     if (!c) {
-      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, preVn: 0, wasPersistent: false };
+      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0, vnApproach: 0, preVn: 0, wasPersistent: false, solverImpulseMag: 0 };
       _contacts[_contactCount] = c;
     }
     const dist = Math.sqrt(dist2);
