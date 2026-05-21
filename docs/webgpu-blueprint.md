@@ -407,6 +407,60 @@ When ready, kick off Phase 2 with `/feature-dev` + this blueprint as input.
 
 ---
 
+## 11.9 Phase 2 — Sub-phase Implementation Status
+
+**Status**: 5 of 7 sub-phases shipped, all dark-launched (kernels dispatch on GPU but output not yet consumed by CPU). B1 orbit stability remains at 0.538 % eccentricity throughout.
+
+| Sub-phase | Commits | Kernels | Status |
+|---|---|---|---|
+| Cross-cutting design | `61dadc5` | — | ✓ 2-round architect + 2-round reviewer, all 12 G-items locked in §12 |
+| 2a — K2 + K7 | `707df65`, `930a4ea` | K2 active, K7 written | ✓ K2 in substep pipeline; K7 unit-test-only (wires in at 2g) |
+| 2b — broadphase trio | `b48700b`, `4103e49` | K3 + K3b + K3c | ✓ dark-launched; CPU still owns `handleCollisions` |
+| 2c — K4 contact_detect | `c9f6256` | K4 | ✓ dark-launched; emits Contact + AbsorptionEvent + entityMaxImpulse |
+| 2d — K5a + K5 solver | `618e824` | K5a + K5 (accumulate + apply) | ✓ dark-launched via `gpuVelScratchBuf` |
+| 2e — K6 position solver | `04d7a0c` | K6 (accumulate + apply) | ✓ dark-launched via `gpuPVScratchBuf` |
+| **2f — K8 + pairImpulseTable** | — | K8 + open-addressing hash | ⏳ NOT YET STARTED |
+| **2g — integration + acceptance** | — | flip CPU consumer to GPU | ⏳ NOT YET STARTED |
+
+### Sub-phase deferrals (deliberate technical debt)
+
+- **K4 FLAG_ABSORBING atomicOr**: WGSL forbids atomic ops on struct fields not declared `atomic<u32>`, and `EntityMeta.flags` is plain `u32` (K1's frozen contract). Resolution: K4 emits AbsorptionEvents only; CPU drains them and sets the flag via writeBuffer for the *next* substep (1-substep visual lag, acceptable while dark-launch). Real atomicOr design lands in 2g when a separate `entityFlagsAtomicBuf` parallel buffer is added.
+- **K7 substep activation**: K7 WGSL exists since 2a but the substep insertion + CPU `applyBoundary` wrap-mode gating is deferred to 2g (reviewer 2a H2: must gate CPU wrap on `backend.name === 'webgpu'` when K7 enters the loop to avoid double-wrap).
+- **K5a `jPrev` from pairImpulseTable**: K5a's persistent-contact path uses `max(jGrav, jPrev * 0.10)` with `jPrev = 0` in 2d/2e because K8 hash lands in 2f. Structural form is ready; replace the literal `0.0` with the table lookup.
+- **K5 adaptive iter count**: `prevContactCount = 32` constant in 2d/2e (→ 8 iters always) because K4's `contactCount` readback isn't drained in dark-launch. 2g wires the mapAsync pipeline.
+
+### Device limit requests added (gpu-init.js REQUIRED_LIMITS)
+
+| Limit | Value | Reason |
+|---|---|---|
+| `maxStorageBufferBindingSize` | 64 MB | Phase 1 K1 baseline |
+| `maxComputeWorkgroupStorageSize` | 16 KB | K1 tile (6 KB) + K3b block scan (4 KB) |
+| `maxComputeInvocationsPerWorkgroup` | 1024 | K3b block_scan + apply_spine (workgroup_size 1024) |
+| `maxComputeWorkgroupSizeX` | 1024 | Same |
+| `maxStorageBuffersPerShaderStage` | 13 | K4 binds 13 storage buffers (default cap 8) |
+
+All five are confirmed available on RTX-class hardware via adapter pre-check; a device that caps lower falls back to CPU at `requestDevice`.
+
+### Remaining Phase 2 work
+
+**2f — K8 rebuild_warm_start + pairImpulseTable** (estimated 1 commit, ~250 LOC WGSL + ~200 LOC JS wrapper):
+- Open-addressing hash with linear probing (architect G8). Cell = 32 B `{keyA, keyB, j, nx, ny, flags, _pad, _pad}`. Hash `(lo*1000003)^(hi*999983)`. 8-slot probe budget; drop+STATUS_HASH_OVERFLOW on miss.
+- `encoder.clearBuffer(pairImpulseTable)` before each K8 dispatch (no tombstone bit needed).
+- K8 reads K4's converged `contacts[t].normalImpulse` (post-K5) and writes to the hash. K5a's persistent-contact branch then reads the hash for `jPrev`.
+
+**2g — full GPU pipeline activation** (estimated 2-3 commits):
+- New `stepPBD` options: `skipBroadphase` (skip step E), `skipVelocitySolver` (skip step F+F'), `skipPositionSolver` (skip step G).
+- Drain K4's `absorptionEventBuf` per-frame; CPU `beginAbsorption()` driven by GPU events.
+- Drain K4's `contactCount` per-substep; updates `prevContactCount` for next-substep K5 iter ramp.
+- Copy `gpuVelScratchBuf` → `entity.vx/vy`, `gpuPVScratchBuf` → `entity._pvx/_pvy` after K6.
+- Wire K7 into the substep encoder; gate CPU `applyBoundary` wrap path.
+- Add `entityFlagsAtomicBuf` for K4's atomicOr (FLAG_ABSORBING). CPU and K4 both write; CPU reads it back as the GPU's flag opinion alongside `entity.absorbing`.
+- Full B1-B8 + F1-F3 acceptance with GPU as physics authority.
+- Perf bench at N=500/1k/5k/10k/50k against blueprint §8 targets.
+- 2 rounds of phase-end code-review per user discipline.
+
+---
+
 ## 12. Phase 2 — Cross-Cutting Design (locked, 2-round architect + 2-round reviewer)
 
 Resolved in tracker session 2026-05-21. See branches §3 / §4 / §4.1 / §6.3 above for the integrated content; this section is a directory.
