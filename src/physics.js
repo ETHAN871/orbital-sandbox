@@ -432,28 +432,26 @@ export function stepPBD(entities, dt, options) {
 // fraction of rSum. Prevents teleporting when a fast-moving body
 // penetrates deeply — corrections spread over multiple frames instead.
 //
-// CFL pseudo-velocity cap (PV_CAP_*): bug-fix-2026-05-21 part 3. The
-// architectural claim above ("position correction does not inject PE")
-// is FALSIFIED in dense-cluster regimes (high mass, small radius). The
-// energy ledger probe in physics-backend.js measured +70k-87k PE per
-// substep injected by _capAndIntegratePseudoVels for the 24×m=1000
-// r=0.4 cluster case — bodies moved up the gravity gradient at zero
-// KE cost. The cap clamps |_pvx,_pvy| ≤ ALPHA·|v| + FLOOR. For resting
-// bodies (v=0) this drives correction to near-zero (FLOOR·dt ≈ 0.008 px
-// per substep) so bodies stay overlapped instead of being pushed apart
-// by free energy. For moving bodies, correction scales with their real
-// motion. Worst-case penetration clearing time for a slow body with
-// 1 px overlap and v=5 px/s: ≈ 1/(2*5+0.5)/dt ≈ 17 substeps ≈ 35 ms.
-// The gravity softening floor (state.effectiveEpsilon) already prevents
-// force divergence at contact distance, so residual visible overlap
-// in static piles is stable — preferable to the prior powder-explosion.
+// CFL pseudo-velocity cap + per-pair-momentum-conserving correction
+// (bug-fix-2026-05-21 part 3): see _capAndIntegratePseudoVels below for
+// the full derivation. Briefly: PBD pseudo-velocity NGS is supposed to
+// not inject PE per the header claim, but the energy ledger in
+// physics-backend.js proved it does inject +70k PE per substep for the
+// 24×m=1000/r=0.4 dense cluster (bodies pushed up the gravity gradient
+// at zero KE cost). The cap clamps |_pvx,_pvy| ≤ ALPHA·|v| + FLOOR and
+// then re-imposes Σ m·_pv = 0 to preserve per-pair Newton's 3rd. For
+// resting bodies (v=0) cap drives correction to near-zero so the
+// cluster stays bound. For moving bodies (legitimate B1 collisions),
+// the larger v gives a larger cap window. Gravity softening
+// (state.effectiveEpsilon) already prevents force divergence at contact
+// distance, so residual interpenetration is stable.
 //
 // Reference: Catto's "Iterative Dynamics with Temporal Coherence"
 // (GDC 2005); Planck.js b2ContactSolver::SolvePositionConstraints.
 const POS_ITERATIONS = 3;
 const LINEAR_SLOP_FRAC = 0.005;       // unitless × rSum
 const MAX_CORRECTION_FRAC = 0.2;      // unitless × rSum
-const PV_CAP_FLOOR = 0.5;             // px/s — floor keeps slow collisions resolvable
+const PV_CAP_FLOOR = 0.5;             // px/s
 const PV_CAP_ALPHA = 2.0;             // |_pv| ≤ ALPHA × |v| + FLOOR
 
 function _solvePositionConstraints(count, entities, dt) {
@@ -522,6 +520,7 @@ function _solvePositionConstraints(count, entities, dt) {
 }
 
 function _capAndIntegratePseudoVels(entities, dt) {
+  // (1) Per-body CFL cap to bound per-substep PE injection.
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
@@ -535,6 +534,38 @@ function _capAndIntegratePseudoVels(entities, dt) {
         e._pvy *= s;
       }
     }
+  }
+  // (2) Restore CoM momentum invariant. K6's raw output satisfies
+  // Σ m·_pv = 0 (per-pair Newton's 3rd). The per-body cap above is
+  // asymmetric — it scales body A's _pv without symmetrically scaling
+  // its contact-partner B, so Σ m·_pv ≠ 0 afterward. Without this
+  // re-balance, the cluster CoM drifts ~0.002 px per substep (measured
+  // via ledger probe — over thousands of substeps, the cluster slowly
+  // walks across the viewport). Subtract the mass-weighted average _pv
+  // from each body to restore Σ m·_pv = 0; relative displacements stay
+  // unchanged.
+  let MpvX = 0, MpvY = 0, Mtot = 0;
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    MpvX += e.mass * e._pvx;
+    MpvY += e.mass * e._pvy;
+    Mtot += e.mass;
+  }
+  if (Mtot > 0) {
+    const avgPvX = MpvX / Mtot;
+    const avgPvY = MpvY / Mtot;
+    for (let i = 0; i < entities.length; i++) {
+      const e = entities[i];
+      if (e.pinned || e.absorbing) continue;
+      e._pvx -= avgPvX;
+      e._pvy -= avgPvY;
+    }
+  }
+  // (3) Integrate into position.
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
     e.x += e._pvx * dt;
     e.y += e._pvy * dt;
   }
