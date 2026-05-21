@@ -30,6 +30,7 @@ import { createBroadphaseGPU } from './physics-gpu-broadphase.js';
 import { createK4GPU } from './physics-gpu-k4.js';
 import { createK5GPU, computeVelIter } from './physics-gpu-k5.js';
 import { createK6GPU } from './physics-gpu-k6.js';
+import { createK8GPU } from './physics-gpu-k8.js';
 
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
@@ -81,6 +82,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
   const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase);
   const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4);
   const k6 = await createK6GPU(device, wgslSources.k6, gravity, k2, k4);
+  const k8 = await createK8GPU(device, wgslSources.k8, gravity, k4);
   const verbose = isVerbose();
   let lastGridMeta = null;
   let prevContactCount = 32;   // blueprint §3.2 cold-start seed → 8 iters initially
@@ -93,6 +95,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     if (teardown) return;
     teardown = true;
     pendingReadback = null;
+    try { k8.destroy(); } catch {}
     try { k6.destroy(); } catch {}
     try { k5.destroy(); } catch {}
     try { k4.destroy(); } catch {}
@@ -130,16 +133,18 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     const iterCount = computeVelIter(prevContactCount);
     k5.uploadParams(N, prevContactCount, dt, state.G, state.elasticRestitution);
     k6.uploadParams(N, prevContactCount, dt);
+    k8.uploadParams(prevContactCount);
 
     const stagingIdx = dispatchIdx % 2;
     dispatchIdx++;
-    const enc = device.createCommandEncoder({ label: 'K1-K6 frame encoder' });
+    const enc = device.createCommandEncoder({ label: 'K1-K8 frame encoder' });
     gravity.recordDispatch(enc, N, stagingIdx);
     k2.recordDispatch(enc, N, stagingIdx);
     broadphase.recordDispatch(enc, N);
     k4.recordDispatch(enc, N);
     k5.recordDispatch(enc, N, prevContactCount, iterCount);   // dark-launch
     k6.recordDispatch(enc, N, prevContactCount);              // dark-launch
+    k8.recordDispatch(enc, prevContactCount);                 // dark-launch — fills pairImpulseTable for next substep
     device.queue.submit([enc.finish()]);
     pendingReadback = (async () => {
       const [positions, velocities, nanCount] = await Promise.all([
@@ -158,17 +163,18 @@ async function makeGpuBackend(device, wgslSources, onLost) {
   function ensureCapacity(entities) {
     const N = entities.length;
     const gravityRealloc = gravity.growIfNeeded(N);
-    if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); k4.onGravityRealloc(); k5.onGravityRealloc(); k6.onGravityRealloc(); }
+    if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); k4.onGravityRealloc(); k5.onGravityRealloc(); k6.onGravityRealloc(); k8.onGravityRealloc(); }
     const k2Realloc = k2.growIfNeeded(N);
     if (k2Realloc) { broadphase.onK2Realloc(); k6.onK2Realloc(); }
     const bpRealloc = broadphase.growIfNeeded(N);
     if (bpRealloc) k4.onBroadphaseRealloc();
     const k4Realloc = k4.growIfNeeded(N);
-    if (k4Realloc) { k5.onK4Realloc(); k6.onK4Realloc(); }
+    if (k4Realloc) { k5.onK4Realloc(); k6.onK4Realloc(); k8.onK4Realloc(); }
     const k5Realloc = k5.growIfNeeded(N);
     const k6Realloc = k6.growIfNeeded(N);
-    if (gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc) pendingReadback = null;
-    return gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc;
+    const k8Realloc = k8.growIfNeeded(N);
+    if (gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc || k8Realloc) pendingReadback = null;
+    return gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc || k8Realloc;
   }
 
   function applyK2OutputToEntities(entities, N, positions, velocities) {
@@ -281,8 +287,8 @@ export async function createBackend() {
     }
     let wgslSources;
     try {
-      // Phase 2a-2e: + K6 position solver.
-      const [k1, k2, k3, k3b, k3c, k4, k5a, k5, k6] = await Promise.all([
+      // Phase 2a-2f: + K8 rebuild_warm_start.
+      const [k1, k2, k3, k3b, k3c, k4, k5a, k5, k6, k8] = await Promise.all([
         loadKernel('./kernels/gravity_accel.wgsl'),
         loadKernel('./kernels/kick_predict.wgsl'),
         loadKernel('./kernels/broadphase_count.wgsl'),
@@ -292,8 +298,9 @@ export async function createBackend() {
         loadKernel('./kernels/warm_start_calibrate.wgsl'),
         loadKernel('./kernels/velocity_solver.wgsl'),
         loadKernel('./kernels/position_solver.wgsl'),
+        loadKernel('./kernels/rebuild_warm_start.wgsl'),
       ]);
-      wgslSources = { k1, k2, k3, k3b, k3c, k4, k5a, k5, k6 };
+      wgslSources = { k1, k2, k3, k3b, k3c, k4, k5a, k5, k6, k8 };
     } catch (e) {
       if (isVerbose()) console.warn('[physics-backend] loadKernel failed:', e);
       detection.device.destroy();
