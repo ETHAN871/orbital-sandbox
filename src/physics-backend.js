@@ -28,6 +28,7 @@ import { createGravityGPU } from './physics-gpu-gravity.js';
 import { createK2GPU } from './physics-gpu-k2.js';
 import { createBroadphaseGPU } from './physics-gpu-broadphase.js';
 import { createK4GPU } from './physics-gpu-k4.js';
+import { createK5GPU, computeVelIter } from './physics-gpu-k5.js';
 
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
@@ -77,8 +78,10 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     k3c: wgslSources.k3c,
   }, gravity, k2);
   const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase);
+  const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4);
   const verbose = isVerbose();
-  let lastGridMeta = null;     // populated by broadphase.uploadParams
+  let lastGridMeta = null;
+  let prevContactCount = 32;   // blueprint §3.2 cold-start seed → 8 iters initially
 
   let dispatchIdx = 0;
   let pendingReadback = null;     // resolves to { positions, velocities, nanCount }
@@ -88,6 +91,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     if (teardown) return;
     teardown = true;
     pendingReadback = null;
+    try { k5.destroy(); } catch {}
     try { k4.destroy(); } catch {}
     try { broadphase.destroy(); } catch {}
     try { k2.destroy(); } catch {}
@@ -118,14 +122,19 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     // Broadphase grid params recompute per substep — depends on maxR + viewport.
     lastGridMeta = broadphase.uploadParams(entities, N, state.viewport.width, state.viewport.height);
     k4.uploadParams(N, lastGridMeta, dt, state.boundaryMode === 'wrap');
+    // K5 iter count is 1-substep-stale per blueprint G4. prevContactCount
+    // seeds to 32 (→8 iters) for the very first substep.
+    const iterCount = computeVelIter(prevContactCount);
+    k5.uploadParams(N, prevContactCount, dt, state.G, state.elasticRestitution);
 
     const stagingIdx = dispatchIdx % 2;
     dispatchIdx++;
-    const enc = device.createCommandEncoder({ label: 'K1+K2+K3+K4 frame encoder' });
-    gravity.recordDispatch(enc, N, stagingIdx);     // K1 → accels
-    k2.recordDispatch(enc, N, stagingIdx);          // K2 → outPositions / velocities / nanCount
-    broadphase.recordDispatch(enc, N);              // K3 / K3b / K3c → cellCounts / cellOffsets / cellContents
-    k4.recordDispatch(enc, N);                      // K4 → contacts / absEvents / maxImpulse (dark-launch)
+    const enc = device.createCommandEncoder({ label: 'K1-K5 frame encoder' });
+    gravity.recordDispatch(enc, N, stagingIdx);
+    k2.recordDispatch(enc, N, stagingIdx);
+    broadphase.recordDispatch(enc, N);
+    k4.recordDispatch(enc, N);
+    k5.recordDispatch(enc, N, prevContactCount, iterCount);   // dark-launch via gpuVelScratchBuf
     device.queue.submit([enc.finish()]);
     pendingReadback = (async () => {
       const [positions, velocities, nanCount] = await Promise.all([
@@ -144,14 +153,16 @@ async function makeGpuBackend(device, wgslSources, onLost) {
   function ensureCapacity(entities) {
     const N = entities.length;
     const gravityRealloc = gravity.growIfNeeded(N);
-    if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); k4.onGravityRealloc(); }
+    if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); k4.onGravityRealloc(); k5.onGravityRealloc(); }
     const k2Realloc = k2.growIfNeeded(N);
     if (k2Realloc) broadphase.onK2Realloc();
     const bpRealloc = broadphase.growIfNeeded(N);
     if (bpRealloc) k4.onBroadphaseRealloc();
     const k4Realloc = k4.growIfNeeded(N);
-    if (gravityRealloc || k2Realloc || bpRealloc || k4Realloc) pendingReadback = null;
-    return gravityRealloc || k2Realloc || bpRealloc || k4Realloc;
+    if (k4Realloc) k5.onK4Realloc();
+    const k5Realloc = k5.growIfNeeded(N);
+    if (gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc) pendingReadback = null;
+    return gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc;
   }
 
   function applyK2OutputToEntities(entities, N, positions, velocities) {
@@ -203,6 +214,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       if (readback.nanCount > 0) {
         if (verbose) console.warn('[physics-backend] NaN detected on GPU; swapping to CPU');
         teardown = true;
+        try { k5.destroy(); } catch {}
         try { k4.destroy(); } catch {}
         try { broadphase.destroy(); } catch {}
         try { k2.destroy(); } catch {}
@@ -231,6 +243,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     destroy() {
       teardown = true;
       pendingReadback = null;
+      try { k5.destroy(); } catch {}
       try { k4.destroy(); } catch {}
       try { broadphase.destroy(); } catch {}
       try { k2.destroy(); } catch {}
@@ -260,16 +273,18 @@ export async function createBackend() {
     }
     let wgslSources;
     try {
-      // Phase 2a-2c: K1+K2 + broadphase trio + K4 contact_detect.
-      const [k1, k2, k3, k3b, k3c, k4] = await Promise.all([
+      // Phase 2a-2d: K1+K2 + broadphase trio + K4 contact + K5a/K5 solver.
+      const [k1, k2, k3, k3b, k3c, k4, k5a, k5] = await Promise.all([
         loadKernel('./kernels/gravity_accel.wgsl'),
         loadKernel('./kernels/kick_predict.wgsl'),
         loadKernel('./kernels/broadphase_count.wgsl'),
         loadKernel('./kernels/broadphase_prefix_sum.wgsl'),
         loadKernel('./kernels/broadphase_scatter.wgsl'),
         loadKernel('./kernels/contact_detect.wgsl'),
+        loadKernel('./kernels/warm_start_calibrate.wgsl'),
+        loadKernel('./kernels/velocity_solver.wgsl'),
       ]);
-      wgslSources = { k1, k2, k3, k3b, k3c, k4 };
+      wgslSources = { k1, k2, k3, k3b, k3c, k4, k5a, k5 };
     } catch (e) {
       if (isVerbose()) console.warn('[physics-backend] loadKernel failed:', e);
       detection.device.destroy();
