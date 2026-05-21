@@ -86,20 +86,25 @@ export async function createGravityGPU(device, wgslSource) {
   // ── Mutable buffer set (reallocated on capacity change) ────────────
   let capacity = 0;
   let positionsBuf, metasBuf, outputBuf;
+  let velocitiesBuf;        // Phase 2a — read by K2; allocated here so K2's
+                            // wrapper binds to the same buffer object via the
+                            // exposed getter (architect M1 resolution).
   let stagingBufs;          // length-2 ping-pong
   let bindGroup;            // re-created each time capacity changes
 
   // Reusable CPU-side typed arrays for upload. Re-allocated on grow.
   let posScratch;           // Float32Array, 2 × capacity
+  let velScratch;           // Float32Array, 2 × capacity (Phase 2a)
   let metaScratch;          // ArrayBuffer + DataView, capacity × META_STRIDE
   let metaScratchView;
   const paramsScratch = new ArrayBuffer(PARAMS_BYTE_SIZE);
   const paramsView    = new DataView(paramsScratch);
 
   function destroyAllocBuffers() {
-    if (positionsBuf) { positionsBuf.destroy(); positionsBuf = null; }
-    if (metasBuf)     { metasBuf.destroy();     metasBuf     = null; }
-    if (outputBuf)    { outputBuf.destroy();    outputBuf    = null; }
+    if (positionsBuf)  { positionsBuf.destroy();  positionsBuf  = null; }
+    if (velocitiesBuf) { velocitiesBuf.destroy(); velocitiesBuf = null; }
+    if (metasBuf)      { metasBuf.destroy();      metasBuf      = null; }
+    if (outputBuf)     { outputBuf.destroy();     outputBuf     = null; }
     if (stagingBufs) {
       for (const sb of stagingBufs) { try { sb.destroy(); } catch {} }
       stagingBufs = null;
@@ -111,12 +116,17 @@ export async function createGravityGPU(device, wgslSource) {
     destroyAllocBuffers();
     capacity = newCapacity;
     positionsBuf = device.createBuffer({
-      label: 'K1 positions',
+      label: 'positions',
       size: capacity * POS_STRIDE,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    velocitiesBuf = device.createBuffer({
+      label: 'velocities',
+      size: capacity * POS_STRIDE,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     metasBuf = device.createBuffer({
-      label: 'K1 metas',
+      label: 'metas',
       size: capacity * META_STRIDE,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
@@ -148,6 +158,7 @@ export async function createGravityGPU(device, wgslSource) {
       ],
     });
     posScratch     = new Float32Array(capacity * 2);
+    velScratch     = new Float32Array(capacity * 2);
     metaScratch    = new ArrayBuffer(capacity * META_STRIDE);
     metaScratchView = new DataView(metaScratch);
   }
@@ -182,6 +193,20 @@ export async function createGravityGPU(device, wgslSource) {
     device.queue.writeBuffer(
       positionsBuf, 0,
       posScratch.buffer, posScratch.byteOffset,
+      N * POS_STRIDE,
+    );
+  }
+
+  // Phase 2a — K2 reads velocities each substep (gravity kick).
+  function uploadVelocities(entities, N) {
+    for (let i = 0; i < N; i++) {
+      const e = entities[i];
+      velScratch[i * 2]     = e.vx;
+      velScratch[i * 2 + 1] = e.vy;
+    }
+    device.queue.writeBuffer(
+      velocitiesBuf, 0,
+      velScratch.buffer, velScratch.byteOffset,
       N * POS_STRIDE,
     );
   }
@@ -273,6 +298,7 @@ export async function createGravityGPU(device, wgslSource) {
   return {
     growIfNeeded,
     uploadPositions,
+    uploadVelocities,
     uploadMetaAll,
     uploadMetaOne,
     uploadParams,
@@ -280,5 +306,13 @@ export async function createGravityGPU(device, wgslSource) {
     readbackStaging,
     destroy,
     get capacity() { return capacity; },
+    // Phase 2a: getters expose the live GPU buffer objects so downstream
+    // kernel wrappers (K2, K7, K3...) can bind to the same pool without
+    // duplicating allocations. Architect M1 resolution.
+    get device()        { return device; },
+    get positionsBuf()  { return positionsBuf; },
+    get velocitiesBuf() { return velocitiesBuf; },
+    get metasBuf()      { return metasBuf; },
+    get accelsBuf()     { return outputBuf; },   // alias — K1's outputBuf IS the accels buffer
   };
 }

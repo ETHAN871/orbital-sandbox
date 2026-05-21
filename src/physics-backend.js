@@ -25,6 +25,7 @@ import {
 } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';
+import { createK2GPU } from './physics-gpu-k2.js';
 
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
@@ -37,8 +38,8 @@ function makeCpuBackend() {
     prepareFrame(entities) {
       cpuPrepareFrame(entities);
     },
-    async step(entities, dt, viewport, boundaryMode) {
-      stepPBD(entities, dt);   // no injectedAccels → CPU O(N²) / BH path runs
+    async step(entities, dt, viewport, boundaryMode, _isLastSubstep) {
+      stepPBD(entities, dt);   // no options → CPU O(N²) / BH path runs unchanged
       updateAbsorptions(entities, dt);
       applyBoundary(entities, viewport, boundaryMode);
     },
@@ -48,33 +49,37 @@ function makeCpuBackend() {
 }
 
 // ── GPU backend ────────────────────────────────────────────────────
-// Owns the K1 gravity_accel pipeline (physics-gpu-gravity.js). Per-substep:
-//   1. await pendingReadback   → accels from the dispatch submitted at end of
-//                                 prior substep (or priming on first call /
-//                                 after a buffer reallocation).
-//   2. stepPBD(entities, dt, accels) → CPU integrator/collisions/solver with
-//                                       the injected accels.
-//   3. updateAbsorptions + applyBoundary.
-//   4. uploadPositions+Meta+Params; record + submit K1 dispatch into
-//      `stagingBufs[dispatchIdx % 2]`; pendingReadback = mapAsync of that slot.
+// Phase 2a: K1 (gravity_accel) + K2 (kick_predict) chained in one encoder.
+// K1 writes accels; K2 reads them + writes outPositions + velocities (in
+// place). CPU reads back positions / velocities / nanCounter each substep,
+// applies them to entity objects, then runs collision + solver + boundary
+// on CPU via stepPBD(..., { skipKickPredict: true }). Steps A and I still
+// run CPU-side (per blueprint §12 G12 + physics.js header comment).
 //
-// Meta is re-uploaded every substep so that FLAG_ABSORBING flips from
-// beginAbsorption (inside stepPBD → handleCollisions) and updateAbsorptions
-// reach the GPU before the next K1 dispatch (architect risk #2). 80 KB at
-// N=5000 — sub-ms writeBuffer.
+// Buffer ownership: gravity wrapper owns positions / velocities / metas /
+// accels (now with COPY_SRC for K2 readback). K2 wrapper owns outPositions /
+// pseudoVels / nanCheckBuf and binds the gravity buffers by reference via
+// getters (architect M1 resolution). On gravity realloc, K2's bind group
+// must be rebuilt via k2.onGravityRealloc().
+//
+// nanCheckBuf reset is per-frame (in prepareFrame), NOT per-substep, so a
+// NaN trip in any substep within the frame stays visible to the CPU drain
+// at the next substep boundary — triggers swapToCpu('nan-propagation').
 
-async function makeGpuBackend(device, wgslSource, onLost) {
-  const gravity = await createGravityGPU(device, wgslSource);
+async function makeGpuBackend(device, wgslSources, onLost) {
+  const gravity = await createGravityGPU(device, wgslSources.k1);
+  const k2 = await createK2GPU(device, wgslSources.k2, gravity);
   const verbose = isVerbose();
 
   let dispatchIdx = 0;
-  let pendingReadback = null;
+  let pendingReadback = null;     // resolves to { positions, velocities, nanCount }
   let teardown = false;
 
   device.lost.then(info => {
     if (teardown) return;
     teardown = true;
     pendingReadback = null;
+    try { k2.destroy(); } catch {}
     try { gravity.destroy(); } catch {}
     if (verbose) console.warn('[physics-backend] device lost:', info.reason, info.message);
     onLost(info);
@@ -87,27 +92,33 @@ async function makeGpuBackend(device, wgslSource, onLost) {
     return { G: state.G, epsilon: state.epsilon, W, H };
   }
 
-  async function submitDispatch(entities) {
+  async function submitDispatch(entities, dt) {
     const N = entities.length;
     if (N === 0) {
       pendingReadback = null;
       return;
     }
     gravity.uploadPositions(entities, N);
+    gravity.uploadVelocities(entities, N);    // K2 reads velocities (kick)
     gravity.uploadMetaAll(entities, N);
     const { G, epsilon, W, H } = readStateParams();
     gravity.uploadParams(N, G, epsilon, W, H);
+    k2.uploadParams(N, dt);
 
     const stagingIdx = dispatchIdx % 2;
     dispatchIdx++;
-    const enc = device.createCommandEncoder({ label: 'K1 frame encoder' });
-    gravity.recordDispatch(enc, N, stagingIdx);
+    const enc = device.createCommandEncoder({ label: 'K1+K2 frame encoder' });
+    gravity.recordDispatch(enc, N, stagingIdx);   // K1 → accels
+    k2.recordDispatch(enc, N, stagingIdx);        // K2 → outPositions / velocities / nanCount
     device.queue.submit([enc.finish()]);
-    pendingReadback = gravity.readbackStaging(stagingIdx, N).catch(err => {
-      // mapAsync may reject after a buffer reallocation destroyed the slot;
-      // the realloc path already nulled pendingReadback so the rejection
-      // is harmless. Surface only under ?backend=verbose to avoid console
-      // noise during normal entity-count transitions.
+    pendingReadback = (async () => {
+      const [positions, velocities, nanCount] = await Promise.all([
+        k2.readbackPositions(stagingIdx, N),
+        k2.readbackVelocities(stagingIdx, N),
+        k2.readbackNanCounter(),
+      ]);
+      return { positions, velocities, nanCount };
+    })().catch(err => {
       if (teardown) return null;
       if (verbose) console.warn('[physics-backend] readback rejected:', err);
       return null;
@@ -116,9 +127,21 @@ async function makeGpuBackend(device, wgslSource, onLost) {
 
   function ensureCapacity(entities) {
     const N = entities.length;
-    const realloc = gravity.growIfNeeded(N);
-    if (realloc) pendingReadback = null;
-    return realloc;
+    const gravityRealloc = gravity.growIfNeeded(N);
+    if (gravityRealloc) k2.onGravityRealloc();    // rebuild K2 bind group
+    const k2Realloc = k2.growIfNeeded(N);
+    if (gravityRealloc || k2Realloc) pendingReadback = null;
+    return gravityRealloc || k2Realloc;
+  }
+
+  function applyK2OutputToEntities(entities, N, positions, velocities) {
+    for (let i = 0; i < N; i++) {
+      const e = entities[i];
+      e.x  = positions[i * 2];
+      e.y  = positions[i * 2 + 1];
+      e.vx = velocities[i * 2];
+      e.vy = velocities[i * 2 + 1];
+    }
   }
 
   return {
@@ -126,31 +149,59 @@ async function makeGpuBackend(device, wgslSource, onLost) {
 
     async init(entities) {
       ensureCapacity(entities);
-      await submitDispatch(entities);
+      k2.resetNanCounter();
+      await submitDispatch(entities, 1 / 60);
     },
 
     prepareFrame(_entities) {
       // No BH tree build (GPU runs exact O(N²)); no spatial hash either —
       // that's still per-substep inside handleCollisions on the CPU side.
+      // nanCheckBuf reset is per-frame (not per-substep) so a NaN trip in
+      // any substep stays visible to this frame's CPU drain — see blueprint
+      // §3 NaN guards paragraph.
+      k2.resetNanCounter();
     },
 
-    async step(entities, dt, viewport, boundaryMode) {
+    async step(entities, dt, viewport, boundaryMode, _isLastSubstep) {
+      // _isLastSubstep is the G12 5th-arg seam for sub-phase 2e+ shadow
+      // buffer activation. In 2a, K7 isn't yet wired into the substep loop
+      // and the shadow buffer isn't activated; this arg is currently a no-op.
       if (teardown) return;
       ensureCapacity(entities);
       if (pendingReadback === null) {
-        await submitDispatch(entities);
+        await submitDispatch(entities, dt);
       }
-      const accelsBuf = pendingReadback;
+      const readbackPromise = pendingReadback;
       pendingReadback = null;
-      const accels = await accelsBuf;
-      if (teardown || accels == null) return;
+      const readback = await readbackPromise;
+      if (teardown || readback == null) return;
 
-      stepPBD(entities, dt, { injectedAccels: accels });
+      // NaN propagation check (blueprint §3 / §6.3). If K2 (or K7 once
+      // wired) tripped the guard, GPU positions are corrupted. Fall back
+      // to CPU with the entity state we had BEFORE applying the bad
+      // readback — i.e., do not call applyK2OutputToEntities.
+      if (readback.nanCount > 0) {
+        if (verbose) console.warn('[physics-backend] NaN detected on GPU; swapping to CPU');
+        teardown = true;
+        try { k2.destroy(); } catch {}
+        try { gravity.destroy(); } catch {}
+        onLost({ reason: 'nan-propagation', message: 'GPU produced NaN; restored CPU state' });
+        return;
+      }
+
+      const N = entities.length;
+      applyK2OutputToEntities(entities, N, readback.positions, readback.velocities);
+
+      // K2 already did steps C (kick) and D (predict). CPU still runs:
+      //   A (pseudoVel reset of entity._pvx — separate from GPU pseudoVels)
+      //   E (handleCollisions), F (vel solver), F' (warm-start rebuild),
+      //   G (position solver), I (pinned hard-reset of entity.vx/vy).
+      stepPBD(entities, dt, { skipKickPredict: true });
       updateAbsorptions(entities, dt);
       applyBoundary(entities, viewport, boundaryMode);
 
       ensureCapacity(entities);
-      await submitDispatch(entities);
+      await submitDispatch(entities, dt);
     },
 
     onEntityMetaMaybeChanged() { /* meta re-uploaded each submitDispatch */ },
@@ -158,6 +209,7 @@ async function makeGpuBackend(device, wgslSource, onLost) {
     destroy() {
       teardown = true;
       pendingReadback = null;
+      try { k2.destroy(); } catch {}
       try { gravity.destroy(); } catch {}
     },
   };
@@ -182,9 +234,14 @@ export async function createBackend() {
       if (isVerbose()) console.info('[physics-backend] using CPU:', detection.reason);
       return false;
     }
-    let wgslSource;
+    let wgslSources;
     try {
-      wgslSource = await loadKernel('./kernels/gravity_accel.wgsl');
+      // Phase 2a: load K1 + K2 in parallel; later sub-phases will add more.
+      const [k1, k2] = await Promise.all([
+        loadKernel('./kernels/gravity_accel.wgsl'),
+        loadKernel('./kernels/kick_predict.wgsl'),
+      ]);
+      wgslSources = { k1, k2 };
     } catch (e) {
       if (isVerbose()) console.warn('[physics-backend] loadKernel failed:', e);
       detection.device.destroy();
@@ -193,8 +250,8 @@ export async function createBackend() {
     try {
       active = await makeGpuBackend(
         detection.device,
-        wgslSource,
-        info => swapToCpu(`device.lost: ${info.reason || 'unknown'}`),
+        wgslSources,
+        info => swapToCpu(`${info.reason || 'unknown'}: ${info.message || ''}`),
       );
       await active.init(entities);
     } catch (e) {
@@ -221,8 +278,8 @@ export async function createBackend() {
       active.prepareFrame(entities);
     },
 
-    async step(entities, dt, viewport, boundaryMode) {
-      await active.step(entities, dt, viewport, boundaryMode);
+    async step(entities, dt, viewport, boundaryMode, isLastSubstep) {
+      await active.step(entities, dt, viewport, boundaryMode, isLastSubstep);
     },
 
     onEntityMetaMaybeChanged() {

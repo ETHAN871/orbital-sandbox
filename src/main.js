@@ -85,11 +85,12 @@ async function runFrame(now) {
   accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
   let steps = 0;
   while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
-    // Backend.step: CPU runs stepPBD + updateAbsorptions + applyBoundary
-    // sequentially; GPU awaits the prior K1 readback, calls stepPBD with
-    // the injected accels, runs the same updateAbsorptions + applyBoundary,
-    // then submits the next K1 dispatch for the following substep.
-    await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode);
+    // Phase 2 G12 contract: isLast is true on the substep whose completion
+    // ends the current frame's substep loop. Backend uses this to gate the
+    // end-of-frame shadow-buffer copy + mapAsync (active at sub-phase 2e+
+    // when K7 wires in; currently a no-op).
+    const isLast = (accumulator - SIM_DT < SIM_DT) || (steps + 1 >= MAX_SUBSTEPS);
+    await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode, isLast);
     accumulator -= SIM_DT;
     steps++;
   }
