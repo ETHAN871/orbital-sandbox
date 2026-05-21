@@ -53,6 +53,14 @@ K7  pseudo_integrate_boundary  # integrate pvx into position; wrap; pinned hard-
 K8  rebuild_warm_start         # write pairImpulseTable from contacts for next substep
 ```
 
+**K8 table-clear requirement** (resolves Phase 2 round-2 review HIGH): each substep's encoder issues `encoder.clearBuffer(pairImpulseTable)` *before* K8 dispatches. The open-addressing scheme uses bit 0 of each cell's first word as the occupancy flag; clearing zeroes those bits and obviates a tombstone mechanism. Write bandwidth cost at N=10⁵: 38.4 MB × 8 substeps = 307 MB/frame ≈ 0.04 % of the 5070 Ti's ~800 GB/s memory bandwidth — confirmed acceptable.
+
+**K2 and K7 NaN guards** (resolves Phase 2 round-2 review LOW): K2 and K7 are the only kernels that write positions / velocities. Each wraps its write in:
+```wgsl
+if (any(isNan(pos)) || any(isNan(vel))) { pos = vec2f(0.0); vel = vec2f(0.0); atomicAdd(&nanCheckBuf, 1u); }
+```
+CPU reads `nanCheckBuf` each frame via mapAsync (pipelined); non-zero triggers `swapToCpu('nan-propagation')` and shadow restore per §6.3.
+
 ### 3.1 Solver concurrency model
 
 **K5 and K6 use Jacobi iteration with two dispatches per iteration**:
@@ -71,6 +79,8 @@ Mitigation: **K4 maintains `entityMaxImpulse: array<f32>`** — for each entity,
 
 **Limitation**: this works for incremental cluster growth (entities added one at a time, warm-start table builds up over frames). A pathological scenario — N=10⁴ bodies spawned simultaneously from rest with no prior warm-start state — may show 1–3 frames of visible overlap during initial settle. Acceptable for the orbital sandbox use case.
 
+**Cold-start seed for K5 iteration-count uniform** (resolves Phase 2 round-2 review MEDIUM): `contactCountBuf` is initialized to **32** at backend init via `device.queue.writeBuffer`, which maps to the minimum 8-iteration count in the CPU adaptive ramp. K4 overwrites the buffer on the first substep; the seed is never re-applied after init. K5 reads the count as a `u32` uniform, computed CPU-side from the previous substep's mapAsync readback (1-substep-stale) using the identical `VEL_ITERATIONS_MIN / MAX / RAMP_LO / RAMP_HI` constants as the CPU ramp at `physics.js:487-493`.
+
 ---
 
 ## 4. Data Layout (Phase 2)
@@ -86,8 +96,9 @@ All buffers are GPU-resident. SoA for hot-path physics state; AoS for structures
 | `EntityMeta` | AoS struct {mass, chargeF, radius, flags} | 16 B | 1.6 MB |
 | `contacts` | AoS Contact struct | 48 B | 14.4 MB (3N slots) |
 | `pairImpulseTable` | Open-addressing hash | 32 B | 38.4 MB (4× load factor) |
-| `velDeltaBuf` | `array<atomic<i32>>` | 4 B × 2 | 0.8 MB |
-| `entityMaxImpulse` | `array<f32>` | 4 B | 0.4 MB |
+| `velDeltaBuf` | `array<atomic<i32>>` interleaved x/y | 4 B × 2 | 0.8 MB |
+| `pvDeltaBuf` | `array<atomic<i32>>` interleaved x/y | 4 B × 2 | 0.8 MB |
+| `entityMaxImpulse` | `array<atomic<i32>>` (bit-reinterpret of non-negative f32 for atomicMax emulation) | 4 B | 0.4 MB |
 | `cellCounts`, `cellOffsets`, `cellContents` | grid metadata | varies | 0.4 MB |
 | Shadow buffers (positions + velocities) | double-buffered staging | 16 B | 3.2 MB |
 | Render instance buffer (Phase 3) | per-entity render data | 20 B | 2.0 MB |
@@ -113,6 +124,17 @@ const FLAG_IS_BH:     u32 = 4u;  // bit 2 — type === 'black_hole'
 const FLAG_TOMBSTONE: u32 = 8u;  // bit 3 — dead, awaiting compaction
 ```
 
+**Flag authority** (single-writer per bit, resolves Phase 2 round-2 review CRITICAL):
+
+| Flag | Write authority | Mechanism |
+|---|---|---|
+| `FLAG_ABSORBING` | **K4 only (GPU)** | `atomicOr(&metas[preyIdx].flags, FLAG_ABSORBING)` at detection |
+| `FLAG_PINNED` | **CPU only** | `writeBuffer` patch on EntityMeta.flags from UI pin button |
+| `FLAG_IS_BH` | **CPU only** | `writeBuffer` at entity creation, never changes after |
+| `FLAG_TOMBSTONE` | **CPU only** | `writeBuffer` after `updateAbsorptions` finishes the animation |
+
+CPU **never** writes FLAG_ABSORBING. CPU reads it from the shadow buffer to drive the JS `entity.absorbing` animation.
+
 **Per-kernel access matrix** (Phase 2):
 
 | Kernel | Reads bits | Writes |
@@ -127,7 +149,7 @@ const FLAG_TOMBSTONE: u32 = 8u;  // bit 3 — dead, awaiting compaction
 | K7 | ABSORBING, PINNED (zero v) | — |
 | K8 | ABSORBING (skip) | — |
 
-CPU writes: `beginAbsorption` triggers ABSORBING (via writeBuffer patch after event drain), UI pin button triggers PINNED, entity creation sets IS_BH, `updateAbsorptions` completion triggers TOMBSTONE.
+CPU write paths: UI pin button writes FLAG_PINNED via `writeBuffer` patch on `EntityMeta.flags`; entity creation writes FLAG_IS_BH; `updateAbsorptions` completion (after the JS animation finishes) writes FLAG_TOMBSTONE. **CPU never writes FLAG_ABSORBING** — K4 is the sole authority for that bit, via `atomicOr` (see Flag authority table above). CPU reads ABSORBING from the shadow copy to trigger the JS animation; it does not echo the bit back to the GPU.
 
 ---
 
@@ -231,6 +253,11 @@ absorption event drain when GPU takes ownership of positions.
 4. `_prevPairImpulses.clear()` — accept 1–2 substep warm-start transient (bounded by `WARM_START_PERSIST_FLOOR = 10%` floor).
 5. In-flight absorption events lost: affected entities snap from "mid-absorption" position back to shadow position (≤1 body diameter pop). Accepted as rare corner case.
 6. Physics continues on CPU from synchronized state.
+
+**Buffer capacities** (resolves Phase 2 round-2 review LOW for G7):
+- `absorptionEventBuf` capacity = **128 slots** (16 B each = 2 KB). Sufficient for any plausible per-substep burst. Overflow path: K4 still sets FLAG_ABSORBING on the prey, but the event is dropped and `STATUS_ABS_OVERFLOW` bit is set in `statusFlagBuf`. CPU surfaces this via `?backend=verbose` console.warn.
+- `nanCheckBuf` = 4 B atomic u32. Reset to zero each frame by CPU after readback.
+- `statusFlagBuf` = 4 B atomic u32. Bit 0 = HASH_OVERFLOW, bit 1 = ABS_OVERFLOW, bit 2 = NAN_DETECTED. Reset each frame.
 
 User-visible transient: one frame at most of slightly imperfect convergence on dense clusters. Documented; not a regression on top of the underlying GPU loss.
 
@@ -377,3 +404,26 @@ Phase 2 scope per §2: K1–K8 entirely GPU-resident, including spatial-hash bro
 - Shadow buffer activation (Fork B in this phase flips: GPU becomes authoritative for positions; CPU shadow exists for `device.lost` recovery and Phase 3 rendering)
 
 When ready, kick off Phase 2 with `/feature-dev` + this blueprint as input.
+
+---
+
+## 12. Phase 2 — Cross-Cutting Design (locked, 2-round architect + 2-round reviewer)
+
+Resolved in tracker session 2026-05-21. See branches §3 / §4 / §4.1 / §6.3 above for the integrated content; this section is a directory.
+
+| Decision | Resolution | Location |
+|---|---|---|
+| **G1** Sub-phase sync mechanics | Per-sub-phase round-trip (CPU upload → GPU dispatch → readback before CPU continues). Matches Phase 1 pattern. | §11.8 / per-sub-phase commits |
+| **G2** Shadow buffer activation | Per-frame end readback into `shadowStagingBuf[frame%2]`. CPU `mapAsync` resolves at next frame start. 1-frame stale for render/hit-test/predict per §5.3. | §5 |
+| **G3** Absorption flow GPU→CPU | K4's `atomicOr` is sole authority for FLAG_ABSORBING. CPU drains AbsorptionEventBuf for animation only; CPU writes only FLAG_TOMBSTONE on completion. | §4.1 Flag authority table |
+| **G4** K5 adaptive iter source | 1-substep-stale `contactCount`. CPU computes ramp from previous K4 readback, uploads as u32 uniform. Cold-start seed = 32 → 8 iterations. | §3.2 (added) |
+| **G5** Perf measurement | Best-effort `timestamp-query` optional feature. Fall back to CPU `performance.now()` brackets with `[cpu-wall]` tag. | §2g acceptance |
+| **G6** Contact struct | 48 B: 9 × 4 B fields (idxA, idxB, rSum, dist, nx, ny, vnApproach, normalImpulse, flags) + 3 × 4 B pad. `wasPersistent` in flags bit 0, set by K4 at detect time. | §4 contacts row |
+| **G7** AbsorptionEvent + slot allocation | 16 B struct (preyIdx, predatorIdx, _pad0, _pad1) + atomic u32 head counter. Capacity 128. Overflow drops event + sets STATUS_ABS_OVERFLOW; K4 still sets FLAG_ABSORBING. | §6.3 (added) |
+| **G8** pairImpulseTable hash | Cell 32 B (keyA, keyB, j, nx, ny, flags, pad×2). Hash `(lo×1000003) ^ (hi×999983)`. Two-u32 keys support N > 65 535. 8-slot linear probe, drop + STATUS_HASH_OVERFLOW on overflow. **Table fully zeroed via `encoder.clearBuffer` before each K8 dispatch** (no tombstones needed). | §3 K8 entry + §4 |
+| **G9** Fixed-point atomic scales | Uniform `FIXED_SCALE = 2^14 = 16384` across `velDeltaBuf`, `pvDeltaBuf`, `entityMaxImpulse`. All three buffers declared `array<atomic<i32>>`. `atomicMax<i32>` on bit-reinterpret of non-negative f32 for `entityMaxImpulse`. | §4 buffer table |
+| **G10** Mid-pipeline failure | K8 hash overflow + K4 event overflow → drop + log + STATUS_* flag (acceptable per §3.2). K1/K2/K7 NaN → CPU fallback via `swapToCpu('nan-propagation')` + shadow restore. | §3 (K2/K7 guard) + §6.3 |
+| **G11** Test infrastructure | Hand-fixture HTML pages in `/tests/` (same pattern as `tests/potential.test.html`). Per-kernel `runKernelTest` + cross-pipeline `runParityFrame` helpers in `tests/gpu-test-harness.js`. fp32 tolerance baseline 6e-4, relax empirically for impulse fields. | Phase 2 dev |
+| **G12** `gpuBackend.step()` shape | Per-substep API preserved. `main.js` passes `isLastSubstep` as the 5th arg, computed as `(accumulator - SIM_DT < SIM_DT) \|\| (steps + 1 >= MAX_SUBSTEPS)`. Backend appends shadow + event copy + `scheduleMapAsync` only when `isLastSubstep === true`. `updateAbsorptions` + `applyBoundary` stay CPU-side, reading the one-frame-stale `cpuShadow`. | New backend interface |
+
+**Review trail**: code-architect round 1 (12 G-items) → code-reviewer round 1 (1 CRITICAL + 2 HIGH + 2 MEDIUM + 2 LOW) → code-architect round 2 (all 7 resolved with mechanical doc/design fixes; no design pivots) → code-reviewer round 2 (closure verification). Locked at commit (next).
