@@ -147,12 +147,16 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     k8.recordDispatch(enc, prevContactCount);                 // dark-launch — fills pairImpulseTable for next substep
     device.queue.submit([enc.finish()]);
     pendingReadback = (async () => {
-      const [positions, velocities, nanCount] = await Promise.all([
+      // Phase 2g: also drain K5/K6 solver outputs + K4 contactCount.
+      const [positions, velocities, nanCount, gpuVel, gpuPV, k4Read] = await Promise.all([
         k2.readbackPositions(stagingIdx, N),
         k2.readbackVelocities(stagingIdx, N),
         k2.readbackNanCounter(),
+        k5.readbackVelocities(N),
+        k6.readbackPseudoVels(N),
+        k4.readback(),
       ]);
-      return { positions, velocities, nanCount };
+      return { positions, velocities, nanCount, gpuVel, gpuPV, k4Read };
     })().catch(err => {
       if (teardown) return null;
       if (verbose) console.warn('[physics-backend] readback rejected:', err);
@@ -240,15 +244,47 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       }
 
       const N = entities.length;
+      // Phase 2g flip: apply K2 positions (needed by CPU handleCollisions
+      // broadphase + CPU absorption detection); override velocities with
+      // K5's converged output; pre-load _pvx/_pvy with K6's converged
+      // pseudo-velocities so stepPBD's integrate-only path consumes them.
       applyK2OutputToEntities(entities, N, readback.positions, readback.velocities);
-
-      // K2 already did steps C (kick) and D (predict). CPU still runs:
-      //   A (pseudoVel reset of entity._pvx — separate from GPU pseudoVels)
-      //   E (handleCollisions), F (vel solver), F' (warm-start rebuild),
-      //   G (position solver), I (pinned hard-reset of entity.vx/vy).
-      stepPBD(entities, dt, { skipKickPredict: true });
+      const haveGpuVel = readback.gpuVel && readback.gpuVel.length >= N * 2;
+      const haveGpuPV  = readback.gpuPV  && readback.gpuPV.length  >= N * 2;
+      if (haveGpuVel) {
+        for (let i = 0; i < N; i++) {
+          entities[i].vx = readback.gpuVel[i * 2];
+          entities[i].vy = readback.gpuVel[i * 2 + 1];
+        }
+      }
+      if (haveGpuPV) {
+        for (let i = 0; i < N; i++) {
+          entities[i]._pvx = readback.gpuPV[i * 2];
+          entities[i]._pvy = readback.gpuPV[i * 2 + 1];
+        }
+      }
+      // stepPBD runs:
+      //   A (skipped via skipPseudoVelReset — GPU values preserved)
+      //   B+C+D (skipped via skipKickPredict — K2 did them)
+      //   E (handleCollisions runs — drives beginAbsorption on BH-pair
+      //     contacts; CPU is the absorption authority per blueprint
+      //     §11.9 deferral until K4 atomicOr lands)
+      //   F+F' (skipped via skipVelocitySolver — K5 + K8 did them)
+      //   G (skipped iter; _integratePseudoVelsOnly applies GPU _pv to x/y)
+      //   I (pinned hard-reset runs)
+      stepPBD(entities, dt, {
+        skipKickPredict:        true,
+        skipVelocitySolver:     haveGpuVel,
+        skipPositionSolverIter: haveGpuPV,
+        skipPseudoVelReset:     haveGpuPV,
+      });
       updateAbsorptions(entities, dt);
       applyBoundary(entities, viewport, boundaryMode);
+
+      // Update prevContactCount for next substep's K5 iter ramp.
+      if (readback.k4Read && readback.k4Read.contactCount !== undefined) {
+        prevContactCount = readback.k4Read.contactCount;
+      }
 
       ensureCapacity(entities);
       await submitDispatch(entities, dt);

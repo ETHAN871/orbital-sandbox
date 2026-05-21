@@ -34,11 +34,12 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
   const view = new DataView(scratch);
 
   let capacity = 0;
-  let pvDeltaBuf, gpuPVScratchBuf, bindGroup;
+  let pvDeltaBuf, gpuPVScratchBuf, pvStagingBuf, bindGroup;
 
   function destroyOwn() {
     if (pvDeltaBuf)      { pvDeltaBuf.destroy();      pvDeltaBuf = null; }
     if (gpuPVScratchBuf) { gpuPVScratchBuf.destroy(); gpuPVScratchBuf = null; }
+    if (pvStagingBuf)    { pvStagingBuf.destroy();    pvStagingBuf = null; }
     bindGroup = null;
   }
 
@@ -49,6 +50,8 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     gpuPVScratchBuf = device.createBuffer({ label: 'gpuPVScratch', size: cap * 8,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    pvStagingBuf = device.createBuffer({ label: 'gpuPVScratch staging', size: cap * 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     rebuildBindGroup();
   }
 
@@ -81,19 +84,35 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
   }
 
   function recordDispatch(encoder, N, contactCount) {
-    if (N === 0 || contactCount === 0) return;
-    const cWg = Math.ceil(contactCount / WORKGROUP);
-    const eWg = Math.ceil(N / WORKGROUP);
+    if (N === 0) return;
+    // ALWAYS seed scratch from K2's zeroed pseudoVels and stage to staging.
+    // Backend reads back unconditionally; without this copy, no-contact
+    // substeps would readback stale/zero-init data and clobber entities.
     encoder.copyBufferToBuffer(k2Handle.pseudoVelsBuf, 0, gpuPVScratchBuf, 0, N * 8);
-    encoder.clearBuffer(pvDeltaBuf, 0, capacity * 2 * 4);
-    for (let iter = 0; iter < POS_ITERATIONS; iter++) {
-      { const p = encoder.beginComputePass({ label: 'K6 accum' });
-        p.setPipeline(pipeAccum); p.setBindGroup(0, bindGroup);
-        p.dispatchWorkgroups(cWg); p.end(); }
-      { const p = encoder.beginComputePass({ label: 'K6 apply' });
-        p.setPipeline(pipeApply); p.setBindGroup(0, bindGroup);
-        p.dispatchWorkgroups(eWg); p.end(); }
+    if (contactCount > 0) {
+      const cWg = Math.ceil(contactCount / WORKGROUP);
+      const eWg = Math.ceil(N / WORKGROUP);
+      encoder.clearBuffer(pvDeltaBuf, 0, capacity * 2 * 4);
+      for (let iter = 0; iter < POS_ITERATIONS; iter++) {
+        { const p = encoder.beginComputePass({ label: 'K6 accum' });
+          p.setPipeline(pipeAccum); p.setBindGroup(0, bindGroup);
+          p.dispatchWorkgroups(cWg); p.end(); }
+        { const p = encoder.beginComputePass({ label: 'K6 apply' });
+          p.setPipeline(pipeApply); p.setBindGroup(0, bindGroup);
+          p.dispatchWorkgroups(eWg); p.end(); }
+      }
     }
+    encoder.copyBufferToBuffer(gpuPVScratchBuf, 0, pvStagingBuf, 0, N * 8);
+  }
+
+  async function readbackPseudoVels(N) {
+    if (capacity === 0 || N === 0) return new Float32Array(0);
+    await pvStagingBuf.mapAsync(GPUMapMode.READ, 0, N * 8);
+    const mapped = pvStagingBuf.getMappedRange(0, N * 8);
+    const out = new Float32Array(mapped.byteLength / 4);
+    out.set(new Float32Array(mapped));
+    pvStagingBuf.unmap();
+    return out;
   }
 
   function destroy() {
@@ -102,7 +121,7 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
   }
 
   return {
-    growIfNeeded, uploadParams, recordDispatch,
+    growIfNeeded, uploadParams, recordDispatch, readbackPseudoVels,
     onGravityRealloc() { if (capacity > 0) rebuildBindGroup(); },
     onK2Realloc()      { if (capacity > 0) rebuildBindGroup(); },
     onK4Realloc()      { if (capacity > 0) rebuildBindGroup(); },

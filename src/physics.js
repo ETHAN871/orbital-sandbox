@@ -259,8 +259,23 @@ export function stepPBD(entities, dt, options) {
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
 
-  const injectedAccels  = options?.injectedAccels;
-  const skipKickPredict = options?.skipKickPredict === true;
+  const injectedAccels         = options?.injectedAccels;
+  const skipKickPredict        = options?.skipKickPredict === true;
+  // Phase 2g flip: when GPU has run K5 (velocity solver) and K8 (warm-start
+  // rebuild) on the same contact set, skip CPU's F + F' steps. Caller must
+  // have already copied gpuVelScratchBuf → entity.vx/vy before this call.
+  const skipVelocitySolver     = options?.skipVelocitySolver === true;
+  // Phase 2g flip: when GPU has run K6 (position solver) and produced
+  // converged pseudo-velocities, skip CPU's G iteration loop. The _pv → x/y
+  // integration still runs unconditionally so the GPU's converged _pvx/_pvy
+  // are applied to position. Caller must have copied gpuPVScratchBuf →
+  // entity._pvx/_pvy before this call.
+  const skipPositionSolverIter = options?.skipPositionSolverIter === true;
+  // Phase 2g flip companion: when the caller has set entity._pvx/_pvy
+  // from K6's output before this call, skip step A's zero-reset. Otherwise
+  // step A would clobber the GPU-supplied values and the integration step
+  // would see zeros.
+  const skipPseudoVelReset     = options?.skipPseudoVelReset === true;
 
   // Cache dt for processCollisionPair's pre-kick velocity calculation
   // (used by the wasPersistent gate, NOT by any deleted refund code).
@@ -269,9 +284,14 @@ export function stepPBD(entities, dt, options) {
   // ── A. Reset pseudo-velocity accumulator (for step G) ──────────
   // Always runs even when K2 zeroed GPU pseudoVels — CPU's entity._pvx is
   // a separate JS field that the CPU position solver reads.
-  for (let i = 0; i < n; i++) {
-    entities[i]._pvx = 0;
-    entities[i]._pvy = 0;
+  // Phase 2g flip: skip the reset when the caller has pre-loaded _pv from
+  // K6's output (skipPseudoVelReset). Otherwise the GPU-supplied values
+  // would be clobbered before the integrate step uses them.
+  if (!skipPseudoVelReset) {
+    for (let i = 0; i < n; i++) {
+      entities[i]._pvx = 0;
+      entities[i]._pvy = 0;
+    }
   }
 
   if (!skipKickPredict) {
@@ -310,25 +330,32 @@ export function stepPBD(entities, dt, options) {
   // ── E. Detect contacts at predicted positions ──────────────────
   // handleCollisions: BH pairs → beginAbsorption immediately.
   // planet-planet pairs → push onto _contacts[] with warm-start lookup.
+  // Still runs even in Phase 2g flip because CPU is the absorption-event
+  // authority until K4 atomicOr lands (see blueprint §11.9 deferrals).
   handleCollisions(entities);
 
-  // ── F. Sequential-Impulses velocity solver (Box2D-style) ───────
-  // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
-  // clamp ≥ 0. Convergence on resting/stacked contacts comes from
-  // the previous substep's seeded normalImpulse.
-  _solveContactVelocities(_contactCount);
+  if (!skipVelocitySolver) {
+    // ── F. Sequential-Impulses velocity solver (Box2D-style) ───────
+    // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
+    // clamp ≥ 0. Convergence on resting/stacked contacts comes from
+    // the previous substep's seeded normalImpulse.
+    _solveContactVelocities(_contactCount);
 
-  // ── F'. Persist this substep's impulses for next substep's warm-start
-  _rebuildPrevPairImpulses();
+    // ── F'. Persist this substep's impulses for next substep's warm-start
+    _rebuildPrevPairImpulses();
+  }
 
   // ── G. Pseudo-velocity NGS position solver (Box2D-style) ───────
   // 3-iter Gauss-Seidel with Baumgarte slop + maxCorrection cap.
-  // Writes to body._pvx/_pvy; integrates into body.x/y at the end
-  // without touching real velocity. This is the key "split impulses"
-  // pattern that prevents position correction from injecting phantom
-  // PE into the gravity field — the failure mode the old _dxGrav
-  // energy-refund pass was patching after the fact.
-  _solvePositionConstraints(_contactCount, entities, dt);
+  // When skipPositionSolverIter is set (Phase 2g flip), K6 already
+  // converged the pseudo-velocities and the caller has copied them to
+  // entity._pvx/_pvy. We then only run the integration step (x += _pv*dt)
+  // — see _integratePseudoVelsOnly below.
+  if (skipPositionSolverIter) {
+    _integratePseudoVelsOnly(entities, dt);
+  } else {
+    _solvePositionConstraints(_contactCount, entities, dt);
+  }
 
   // ── I. Pinned bodies hard-reset ────────────────────────────────
   for (let i = 0; i < n; i++) {
@@ -426,6 +453,20 @@ function _solvePositionConstraints(count, entities, dt) {
 
   // Integrate pseudo-velocity into real position. Real velocity is
   // untouched — this is the whole point of split impulses.
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    e.x += e._pvx * dt;
+    e.y += e._pvy * dt;
+  }
+}
+
+// Phase 2g flip: when K6 converged the pseudo-velocities on GPU and the
+// caller has copied them into entity._pvx/_pvy, we skip the 3-iter NGS
+// loop and only run the integration step. Same semantics as the end of
+// _solvePositionConstraints above — pinned and absorbing entities are
+// skipped so their positions stay frozen.
+function _integratePseudoVelsOnly(entities, dt) {
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;

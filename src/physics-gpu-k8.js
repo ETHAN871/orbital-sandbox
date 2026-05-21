@@ -8,7 +8,14 @@ const CELL_META_STRIDE = 20;   // keyA u32, keyB u32, j f32, nx f32, ny f32
 // Table size = max(256, nextPow2(N * 4)) — 4× load factor per blueprint §4.
 // Split layout (cellMeta + cellFlags) lets WGSL keep atomic flags without
 // forcing per-field atomic on data reads.
+//
+// IMPORTANT: at N=0 we MUST return 0 so K8 stays unallocated, matching K1-
+// K6's pattern (those use `if (N > capacity)` which is false when N=0).
+// Otherwise K8 grows to 256-cell minimum even at empty scene, and its
+// bind group's reference to k4Handle.contactsBuf (still undefined at N=0)
+// crashes createBindGroup.
 function tableSizeFor(N) {
+  if (N === 0) return 0;
   if (N <= 64) return 256;
   let want = N * 4;
   let v = want - 1;

@@ -45,7 +45,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
   const k5ParamsBuf  = device.createBuffer({ label: 'K5 params',  size: K5_PARAMS_SIZE,  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
   let capacity = 0;
-  let velDeltaBuf, gpuVelScratchBuf, bgK5a, bgK5;
+  let velDeltaBuf, gpuVelScratchBuf, velStagingBuf, bgK5a, bgK5;
   const k5aScratch = new ArrayBuffer(K5A_PARAMS_SIZE);
   const k5aView    = new DataView(k5aScratch);
   const k5Scratch  = new ArrayBuffer(K5_PARAMS_SIZE);
@@ -54,6 +54,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
   function destroyOwn() {
     if (velDeltaBuf)      { velDeltaBuf.destroy();      velDeltaBuf = null; }
     if (gpuVelScratchBuf) { gpuVelScratchBuf.destroy(); gpuVelScratchBuf = null; }
+    if (velStagingBuf)    { velStagingBuf.destroy();    velStagingBuf = null; }
     bgK5a = null; bgK5 = null;
   }
 
@@ -64,6 +65,8 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     gpuVelScratchBuf = device.createBuffer({ label: 'gpuVelScratch', size: cap * 8,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    velStagingBuf = device.createBuffer({ label: 'gpuVelScratch staging', size: cap * 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     rebuildBindGroups();
   }
 
@@ -114,22 +117,40 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
   }
 
   function recordDispatch(encoder, N, contactCount, iterCount) {
-    if (N === 0 || contactCount === 0) return;
-    const cWg = Math.ceil(contactCount / WORKGROUP);
-    const eWg = Math.ceil(N / WORKGROUP);
+    if (N === 0) return;
+    // ALWAYS seed scratch from K2's post-kick velocity. Even when there are
+    // no contacts (contactCount===0), the backend reads back this staging
+    // buffer and applies it to entities — without this copy the buffer
+    // would hold stale/zero data and the readback would clobber the
+    // entities' velocities. Phase 2g flip correctness.
     encoder.copyBufferToBuffer(gravityHandle.velocitiesBuf, 0, gpuVelScratchBuf, 0, N * 8);
-    encoder.clearBuffer(velDeltaBuf, 0, capacity * 2 * 4);
-    { const p = encoder.beginComputePass({ label: 'K5a' });
-      p.setPipeline(pipeK5a); p.setBindGroup(0, bgK5a);
-      p.dispatchWorkgroups(cWg); p.end(); }
-    for (let iter = 0; iter < iterCount; iter++) {
-      { const p = encoder.beginComputePass({ label: 'K5 accum' });
-        p.setPipeline(pipeAccum); p.setBindGroup(0, bgK5);
+    if (contactCount > 0) {
+      const cWg = Math.ceil(contactCount / WORKGROUP);
+      const eWg = Math.ceil(N / WORKGROUP);
+      encoder.clearBuffer(velDeltaBuf, 0, capacity * 2 * 4);
+      { const p = encoder.beginComputePass({ label: 'K5a' });
+        p.setPipeline(pipeK5a); p.setBindGroup(0, bgK5a);
         p.dispatchWorkgroups(cWg); p.end(); }
-      { const p = encoder.beginComputePass({ label: 'K5 apply' });
-        p.setPipeline(pipeApply); p.setBindGroup(0, bgK5);
-        p.dispatchWorkgroups(eWg); p.end(); }
+      for (let iter = 0; iter < iterCount; iter++) {
+        { const p = encoder.beginComputePass({ label: 'K5 accum' });
+          p.setPipeline(pipeAccum); p.setBindGroup(0, bgK5);
+          p.dispatchWorkgroups(cWg); p.end(); }
+        { const p = encoder.beginComputePass({ label: 'K5 apply' });
+          p.setPipeline(pipeApply); p.setBindGroup(0, bgK5);
+          p.dispatchWorkgroups(eWg); p.end(); }
+      }
     }
+    encoder.copyBufferToBuffer(gpuVelScratchBuf, 0, velStagingBuf, 0, N * 8);
+  }
+
+  async function readbackVelocities(N) {
+    if (capacity === 0 || N === 0) return new Float32Array(0);
+    await velStagingBuf.mapAsync(GPUMapMode.READ, 0, N * 8);
+    const mapped = velStagingBuf.getMappedRange(0, N * 8);
+    const out = new Float32Array(mapped.byteLength / 4);
+    out.set(new Float32Array(mapped));
+    velStagingBuf.unmap();
+    return out;
   }
 
   function destroy() {
@@ -139,7 +160,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
   }
 
   return {
-    growIfNeeded, uploadParams, recordDispatch,
+    growIfNeeded, uploadParams, recordDispatch, readbackVelocities,
     onGravityRealloc() { if (capacity > 0) rebuildBindGroups(); },
     onK4Realloc()      { if (capacity > 0) rebuildBindGroups(); },
     onK8Realloc()      { if (capacity > 0) rebuildBindGroups(); },
