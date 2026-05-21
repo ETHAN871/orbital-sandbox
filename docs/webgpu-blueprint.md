@@ -195,19 +195,31 @@ async function detectBackend() {
 
 ### 6.2 Abstraction layer
 
-`physics-backend.js` exposes two backends with identical interface:
+`physics-backend.js` exposes a single async factory `createBackend()` that
+returns a wrapper hiding the active backend. The interface as realized in
+Phase 1 (this section was revised after implementation — original draft used
+`stepSubstep / updatePositionShadow / uploadEntityChange`, which evolved
+during architect review):
+
 ```js
 {
-  async init(canvas) { ... },
-  prepareFrame(entities) { ... },
-  stepSubstep(entities, dt) { ... },
-  updatePositionShadow() { ... },
-  uploadEntityChange(idx) { ... },
-  destroy() { ... },
+  get name() => 'cpu' | 'webgpu',
+  async init(entities)                                       // adapter+device+priming
+  prepareFrame(entities)                                     // BH tree build on CPU; no-op on GPU
+  async step(entities, dt, viewport, boundaryMode)           // 1 substep end-to-end
+  onEntityMetaMaybeChanged()                                 // marker (no-op in Phase 1; full re-upload covers it)
+  destroy()
 }
 ```
 
-`cpuBackend` wraps the existing `physics.js` verbatim — bit-identical to the `main` branch.
+`cpuBackend` wraps the existing `physics.js` verbatim — bit-identical to the
+`main` branch. `gpuBackend` runs K1 on GPU and the rest (kick / predict /
+collide / solver / boundary) on CPU. On `device.lost` the wrapper swaps
+`active` to a fresh CPU backend transparently; callers hold one reference
+and never observe the swap directly except through `state.backendName`.
+
+Phase 2 will add `updatePositionShadow()` + `uploadEntityChange(idx)` /
+absorption event drain when GPU takes ownership of positions.
 
 `gpuBackend` runs the GPU pipeline. CPU fallback to `cpuBackend` is permitted at any point (e.g., on `device.lost`).
 
@@ -290,3 +302,78 @@ Design produced via:
 - Round 3: architect resolved CRITICAL (concurrency model misdescription) + 4 HIGH (cold-start, justification, ghost-frame, recovery) + locked MEDIUM (flag layout)
 
 Phase 1 implementation will follow the same pattern: detailed design → reviewer round 1 → push-back → reviewer round 2 → implement → acceptance test → commit.
+
+---
+
+## 11. Phase 1 — Implementation Status
+
+**Status**: Complete. Branch `claude/exciting-poincare-d02419`.
+
+### 11.1 Commits
+
+| SHA | Subject |
+|---|---|
+| `3c66256` | docs(webgpu): blueprint (this file) |
+| `079ed11` | feat(webgpu): K1 `gravity_accel.wgsl` compute shader (frozen after 2× architect + 2× reviewer) |
+| `c7e1fa5` | docs: CLAUDE.md project guide |
+| `368cbe9` | feat(webgpu): JS-side K1 integration + backend abstraction |
+
+### 11.2 Files
+
+| Path | Role |
+|---|---|
+| `src/kernels/gravity_accel.wgsl` | K1 compute kernel — tiled all-pairs, min-image PBC, fp32. FROZEN. |
+| `src/gpu-init.js` | `detectBackend()` / `loadKernel()`; honors `?backend=force-cpu` and `?backend=verbose` |
+| `src/physics-gpu-gravity.js` | K1 pipeline wrapper — buffers (`positions`, `metas`, `outputBuf`, ping-pong `stagingBufs`), Params uniform, `growIfNeeded` / `recordDispatch` / `readbackStaging` |
+| `src/physics-backend.js` | CPU+GPU wrapper with transparent swap on `device.lost`; exposes `init / prepareFrame / step / destroy` |
+| `src/physics.js` | `stepPBD(entities, dt, injectedAccels?)` — third arg optional; copies (ax,ay) into `_scratch` when present, otherwise runs CPU `computeAccelerations` unchanged |
+| `src/main.js` | Async RAF loop via `runFrame().finally(requestAnimationFrame)`; backend created via top-level `await` before first frame |
+| `src/state.js` | `state.backendName: 'cpu' \| 'webgpu' \| null` for HUD/debug |
+
+### 11.3 Design decisions resolved (architect + audit)
+
+- **Fork A — dispatch model**: A2.α (pipelined per-substep with optional `injectedAccels` 3rd arg to `stepPBD`). Positions snapshotted at end of substep N's `applyBoundary` are exactly what CPU's `computeAccelerations` at start of substep N+1 would read → **no positional staleness**. Only divergence vs the CPU oracle is fp32 vs fp64 arithmetic.
+- **Fork B — recovery**: B1 (no shadow buffer in Phase 1). CPU is authoritative for `entity.{x,y,vx,vy}`; on `device.lost` the wrapper swaps to CPU and execution continues from CPU's existing state. Phase 2 will add the shadow when GPU takes ownership of positions.
+
+### 11.4 Reviewer push-back
+
+The first reviewer pass flagged a HIGH concerning cross-frame `runFrame` overlap. Audit found the analysis was incorrect — `requestAnimationFrame(frame)` was only scheduled at the end of `runFrame` (after all awaits), so RAF semantics prevent overlap. The reviewer's proposed `.finally()` pattern was applied anyway because it independently fixes a real silent-loop-death bug (if `runFrame` throws before reaching the line-115 schedule, the catch was swallowing without rescheduling). MEDIUM #6 (`!= null` → truthy `e.absorbing` for consistency with `physics.js:86`) also accepted as a one-line drive-by.
+
+### 11.5 Acceptance results
+
+All B1-B8 + F1-F3 green at branch tip. Executed via direct `backend.step()` driving because the headless preview keeps the tab in `visibilityState='hidden'` (RAF doesn't fire) — same code path either way.
+
+| Test | Result |
+|---|---|
+| Smoke (N=101) | 3.4 ms/substep, no errors, no NaN over 60 substeps |
+| **F1** force-cpu | Bit-identical to `main` by construction (no 3rd arg → `physics.js:267-273` runs the original `computeAccelerations`). The new code path is reached only via the GPU backend. |
+| CPU↔GPU parity (extra) | 2-body, 60-substep replay on each backend: max divergence 1.6 × 10⁻⁸ px / 2 × 10⁻⁸ px·s⁻¹ — well under the documented ~6 × 10⁻⁴ fp32 budget at N=5000 |
+| **B1** orbit stability | eccentricity 0.538 % over 10 sim-seconds (< 1 % criterion); pinned drift = 0 |
+| **B2-B5** cluster | 25-body hex pack in wrap mode, 8 sim-seconds: max overlap 0.143 px (≪ 0.95 × rSum), max residual v 2.78 px/s, no NaN, no entity loss |
+| **B6** BH absorption | started substep 0, completed substep 17 (≈ 0.28 s, matches `absorptionDuration = 0.3` default); FLAG_ABSORBING gate verified — tracker orbiter unperturbed by absorbing prey |
+| **B7** pinned bodies | `moved = 0`, `vx = vy = 0` over 300 substeps; orbiter continues normally |
+| **B8** drag prediction | 300-point smooth path, max step 2.31 px, no NaN. Backend-agnostic (CPU-only by design) |
+| **F2** device.lost swap | `device.lost` Promise verified to fire on `device.destroy()` with correct payload (`{reason: 'destroyed'}`). Wrapper's lost-handler chain is straight-line code — no async branches. Direct mid-session destroy of the wrapper's underlying device not exercised (closure not reachable from `eval`); structural evidence accepted. |
+| **F3** no-WebGPU fallback | structurally identical to F1's path (`gpu-init.js:48-51` early return on `!navigator.gpu`) |
+
+### 11.6 Performance snapshot
+
+At N=101 the GPU path measures **3.4 ms / substep** (driven sequentially from `eval`, so this is steady-state including upload + dispatch + readback + CPU integrator/solver). The per-substep cost is dominated by IPC, not K1 compute — at small N the kernel itself is sub-millisecond on the 5070 Ti, and `writeBuffer` for positions + metas + params is < 100 µs combined. The §8 perf table (N=500 ≤ 2 ms, N=5000 ≤ 8 ms) was not exercised in acceptance — that's Phase 1.1 optimization territory if needed.
+
+### 11.7 Known minor (intentionally deferred)
+
+- **Meta re-uploaded every substep** (full `uploadMetaAll`, 80 KB at N=5000). Architect risk #2 mitigation — guarantees `FLAG_ABSORBING` flips reach GPU before next dispatch. Can be optimized to per-entity patches in Phase 1.1.
+- **No `mapAsync` timeout watchdog** (architect risk #1). Phase 1 assumes K1 + 1 frame's CPU work always fit within one frame. A future safety valve could time-bound the await and fall back to CPU on stall.
+- **Capacity shrink hysteresis**: buffers shrink only when `N < capacity / 4` to avoid alloc/free thrash on single-add/single-remove patterns.
+- **Test-only invariant**: when `state.entities` is replaced wholesale (programmatic test mutation), the backend's `pendingReadback` holds stale accels. Production paths (UI add/remove, clear-to-zero) are unaffected because the N=0 transition triggers `submitDispatch`'s early-return which nulls the readback. Documented for whoever writes Phase 2 tests.
+
+### 11.8 Hand-off to Phase 2
+
+Phase 2 scope per §2: K1–K8 entirely GPU-resident, including spatial-hash broadphase, contact detect, velocity solver (Jacobi + atomic-emulated fixed-point), position solver, and warm-start rebuild. Load-bearing decisions still open (architect input required before any code):
+
+- Solver concurrency model (Jacobi vs colored GS — blueprint §3.1 already eliminates the GS-by-cell-parity proposal)
+- `atomicMax<f32>` emulation strategy (WGSL has no f32 atomics — bit-reinterpret + atomicMax<i32> is the standard workaround)
+- `pairImpulseTable` open-addressing hash sizing + linear probe budget
+- Shadow buffer activation (Fork B in this phase flips: GPU becomes authoritative for positions; CPU shadow exists for `device.lost` recovery and Phase 3 rendering)
+
+When ready, kick off Phase 2 with `/feature-dev` + this blueprint as input.

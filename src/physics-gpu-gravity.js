@@ -160,7 +160,10 @@ export async function createGravityGPU(device, wgslSource) {
       allocateBuffers(newCap);
       return true;
     }
-    if (capacity > 256 && N > 0 && N < capacity / 4) {
+    if (capacity > 256 && N < capacity / 4) {
+      // Floor at 256 (nextPow2(0)=1 would otherwise drop to a 1-slot buffer).
+      // Lets a cleared scene reclaim memory down to the minimum instead of
+      // keeping a 4096-entity buffer alive for the rest of the session.
       const newCap = Math.max(256, nextPow2(N));
       if (newCap < capacity) {
         allocateBuffers(newCap);

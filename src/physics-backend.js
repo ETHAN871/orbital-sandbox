@@ -104,8 +104,12 @@ async function makeGpuBackend(device, wgslSource, onLost) {
     gravity.recordDispatch(enc, N, stagingIdx);
     device.queue.submit([enc.finish()]);
     pendingReadback = gravity.readbackStaging(stagingIdx, N).catch(err => {
+      // mapAsync may reject after a buffer reallocation destroyed the slot;
+      // the realloc path already nulled pendingReadback so the rejection
+      // is harmless. Surface only under ?backend=verbose to avoid console
+      // noise during normal entity-count transitions.
       if (teardown) return null;
-      console.warn('[physics-backend] readback rejected:', err);
+      if (verbose) console.warn('[physics-backend] readback rejected:', err);
       return null;
     });
   }
