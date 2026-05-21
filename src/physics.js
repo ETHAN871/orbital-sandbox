@@ -432,11 +432,29 @@ export function stepPBD(entities, dt, options) {
 // fraction of rSum. Prevents teleporting when a fast-moving body
 // penetrates deeply — corrections spread over multiple frames instead.
 //
+// CFL pseudo-velocity cap (PV_CAP_*): bug-fix-2026-05-21 part 3. The
+// architectural claim above ("position correction does not inject PE")
+// is FALSIFIED in dense-cluster regimes (high mass, small radius). The
+// energy ledger probe in physics-backend.js measured +70k-87k PE per
+// substep injected by _capAndIntegratePseudoVels for the 24×m=1000
+// r=0.4 cluster case — bodies moved up the gravity gradient at zero
+// KE cost. The cap clamps |_pvx,_pvy| ≤ ALPHA·|v| + FLOOR. For resting
+// bodies (v=0) this drives correction to near-zero (FLOOR·dt ≈ 0.008 px
+// per substep) so bodies stay overlapped instead of being pushed apart
+// by free energy. For moving bodies, correction scales with their real
+// motion. Worst-case penetration clearing time for a slow body with
+// 1 px overlap and v=5 px/s: ≈ 1/(2*5+0.5)/dt ≈ 17 substeps ≈ 35 ms.
+// The gravity softening floor (state.effectiveEpsilon) already prevents
+// force divergence at contact distance, so residual visible overlap
+// in static piles is stable — preferable to the prior powder-explosion.
+//
 // Reference: Catto's "Iterative Dynamics with Temporal Coherence"
 // (GDC 2005); Planck.js b2ContactSolver::SolvePositionConstraints.
 const POS_ITERATIONS = 3;
 const LINEAR_SLOP_FRAC = 0.005;       // unitless × rSum
 const MAX_CORRECTION_FRAC = 0.2;      // unitless × rSum
+const PV_CAP_FLOOR = 0.5;             // px/s — floor keeps slow collisions resolvable
+const PV_CAP_ALPHA = 2.0;             // |_pv| ≤ ALPHA × |v| + FLOOR
 
 function _solvePositionConstraints(count, entities, dt) {
   if (count === 0) return;
@@ -500,28 +518,38 @@ function _solvePositionConstraints(count, entities, dt) {
     }
   }
 
-  // Integrate pseudo-velocity into real position. Real velocity is
-  // untouched — this is the whole point of split impulses.
+  _capAndIntegratePseudoVels(entities, dt);
+}
+
+function _capAndIntegratePseudoVels(entities, dt) {
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
+    const pvMag = Math.sqrt(e._pvx * e._pvx + e._pvy * e._pvy);
+    if (pvMag > 0) {
+      const speed = Math.sqrt(e.vx * e.vx + e.vy * e.vy);
+      const cap = PV_CAP_ALPHA * speed + PV_CAP_FLOOR;
+      if (pvMag > cap) {
+        const s = cap / pvMag;
+        e._pvx *= s;
+        e._pvy *= s;
+      }
+    }
     e.x += e._pvx * dt;
     e.y += e._pvy * dt;
   }
 }
 
-// Phase 2g flip: when K6 converged the pseudo-velocities on GPU and the
-// caller has copied them into entity._pvx/_pvy, we skip the 3-iter NGS
-// loop and only run the integration step. Same semantics as the end of
-// _solvePositionConstraints above — pinned and absorbing entities are
-// skipped so their positions stay frozen.
+// Phase 2g flip: when K6 converged pseudo-velocities on GPU and the
+// caller pre-loaded entity._pvx/_pvy from K6's readback, skip the 3-iter
+// NGS loop and only run the cap+integrate step. CPU path and GPU-flip
+// path both funnel through _capAndIntegratePseudoVels so the CFL cap
+// fires in both — though on the GPU path, K6's WGSL also applies a
+// JACOBI_RELAX=0.5 internally for Jacobi stability that the CPU GS
+// solver doesn't need. The cap is the energy guard; relaxation is the
+// solver-convergence guard. They are orthogonal protections.
 function _integratePseudoVelsOnly(entities, dt) {
-  for (let i = 0; i < entities.length; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    e.x += e._pvx * dt;
-    e.y += e._pvy * dt;
-  }
+  _capAndIntegratePseudoVels(entities, dt);
 }
 
 // ─── Velocity solver (Box2D-style Sequential Impulses) ────────────

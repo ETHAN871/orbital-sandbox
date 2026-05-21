@@ -18,6 +18,16 @@
 //
 // FIXED_SCALE=16384 (2^14, blueprint G9). Per-slot max ~1000 px/s × FS
 // = 1.6e7, well under i32 max 2.1e9.
+//
+// JACOBI_RELAX (bug-fix-2026-05-21): Jacobi over-correction damping.
+// A body in K aligned contacts sees velocity move by K × (per-contact
+// dLambda) per iter because all K atomic adds read the START-of-iter
+// velocity. CPU's sequential GS self-damps this (each contact sees the
+// previous one's update); Jacobi must do so explicitly. ω=0.5 keeps
+// convergence within the ITER budget for sparse contacts while
+// stabilizing dense clusters (m=1000/r=0.4 with 12+ same-side neighbors).
+// Orthogonal to the CFL pseudo-vel cap in physics.js — relaxation is
+// solver convergence; cap is energy conservation.
 
 struct Contact {
   idxA: u32, idxB: u32, rSum: f32, dist: f32,
@@ -63,7 +73,8 @@ fn vs_accumulate(@builtin(global_invocation_id) gid: vec3u) {
   let vnNan = vn != vn;
 
   let vnTarget = select(-params.e * c.vnApproach, 0.0, (c.flags & CONTACT_PERSIST) != 0u);
-  let dLambdaRaw = select((vnTarget - vn) / wSum, 0.0, vnNan);
+  const JACOBI_RELAX: f32 = 0.5;
+  let dLambdaRaw = select(JACOBI_RELAX * (vnTarget - vn) / wSum, 0.0, vnNan);
 
   let oldImp = c.normalImpulse;
   let newImp = max(0.0, oldImp + dLambdaRaw);   // accumulated-impulse clamp ≥ 0
