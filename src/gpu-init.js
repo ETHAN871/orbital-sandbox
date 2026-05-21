@@ -26,11 +26,13 @@ const REQUIRED_LIMITS = {
   maxStorageBufferBindingSize: 64 * 1024 * 1024,
   maxComputeWorkgroupStorageSize: 16 * 1024,    // K1 uses 6 KB; K3b block_scan uses 4 KB shared
   // Phase 2b: K3b's block_scan + apply_spine declare workgroup_size(1024).
-  // Default device limit is 256; we must explicitly request 1024 (the WGSL
-  // portable cap). Adapters on RTX-class hardware report 1024 in WebGPU.
-  // If a device caps at 256 we'll fall back to CPU at requestDevice.
+  // Default device limit is 256; we must explicitly request 1024.
   maxComputeInvocationsPerWorkgroup: 1024,
   maxComputeWorkgroupSizeX: 1024,
+  // Phase 2c: K4 (contact_detect) binds 13 storage buffers (3 read-only +
+  // input metas + cellCounts/cellOffsets/cellContents + 6 read-write). Default
+  // limit is 8; adapter on RTX-class hardware reports 16.
+  maxStorageBuffersPerShaderStage: 13,
 };
 
 function queryParam(name) {
@@ -92,6 +94,12 @@ export async function detectBackend() {
     return {
       backend: 'cpu',
       reason: `maxComputeWorkgroupSizeX ${adapter.limits.maxComputeWorkgroupSizeX} < ${REQUIRED_LIMITS.maxComputeWorkgroupSizeX}`,
+    };
+  }
+  if (adapter.limits.maxStorageBuffersPerShaderStage < REQUIRED_LIMITS.maxStorageBuffersPerShaderStage) {
+    return {
+      backend: 'cpu',
+      reason: `maxStorageBuffersPerShaderStage ${adapter.limits.maxStorageBuffersPerShaderStage} < ${REQUIRED_LIMITS.maxStorageBuffersPerShaderStage}`,
     };
   }
 
