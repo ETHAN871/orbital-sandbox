@@ -23,15 +23,18 @@ import { buildSpatialHash, forEachCollisionPair } from './physics-spatial-hash.j
 // Functions read state.bhThreshold at call time so the slider takes
 // effect immediately on the next frame.
 
-// V8.2: prepare per-frame data structures once. main.js calls this before
-// the substep loop so the quadtree + spatial hash are built exactly 1× per
-// frame instead of up-to-8× (once per substep). Position drift between
-// substeps is bounded by SIM_DT × velocity and is within Verlet's
-// integration tolerance.
+// V8.3: prepare per-frame data structures. main.js calls this before the
+// substep loop. The BH quadtree is built ONCE per frame — gravity is a
+// continuous force (∝ 1/r²) and tolerates the SIM_DT × |v| position drift
+// between substeps within Verlet's integration tolerance. The spatial hash
+// is NOT built here (V8.3 fix): unlike gravity, the broadphase is a binary
+// classifier — a 0.5 px drift that crosses a cell boundary causes a 100%
+// miss for that pair, not a small numerical error. So the hash is rebuilt
+// per-substep inside handleCollisions (see comment there).
 export function prepareFrame(entities) {
   if (entities.length >= state.bhThreshold) {
     prepareBHTree(entities);
-    buildSpatialHash(entities);
+    // buildSpatialHash moved to handleCollisions for per-substep freshness.
   }
 }
 
@@ -680,10 +683,18 @@ export function handleCollisions(entities) {
   // _solvePositionConstraints (run later inside stepPBD) drains it.
   _contactCount = 0;
 
-  // V8.2: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
-  // The hash is built once per frame in prepareFrame() above; this just
-  // iterates the already-built buckets.
+  // V8.3: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
+  // The hash is rebuilt HERE (per-substep), not in prepareFrame (V8.2's
+  // per-frame approach caused Type-1 misses: bodies that drifted across
+  // cell boundaries during the gravity-kick + predict steps would still be
+  // registered in their old bucket, invisible to queries targeting their
+  // new neighborhood — observable as persistent overlaps at the Y wrap
+  // edge on dense BH-active clusters). After applyBoundary teleport at the
+  // end of the previous substep, positions are baked in here and the hash
+  // matches reality. BH tree stays per-frame (continuous force, tolerant
+  // of drift) — see prepareFrame.
   if (n >= state.bhThreshold) {
+    buildSpatialHash(entities);
     forEachCollisionPair(entities, processCollisionPair);
     return;
   }
