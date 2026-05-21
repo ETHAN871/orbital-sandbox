@@ -91,7 +91,10 @@ export async function createK8GPU(device, wgslSource, gravityHandle, k4Handle) {
   function uploadParams(contactCount) {
     view.setUint32( 0, contactCount >>> 0, true);
     view.setUint32( 4, tableSize >>> 0, true);
-    view.setUint32( 8, (tableSize - 1) >>> 0, true);
+    // Avoid 0 - 1 = 0xFFFFFFFF underflow when called before any growIfNeeded.
+    // The recordDispatch guard already short-circuits this state, but the
+    // uniform byte pattern stays clean in case future code paths consume it.
+    view.setUint32( 8, tableSize > 0 ? (tableSize - 1) >>> 0 : 0, true);
     view.setUint32(12, 0, true);
     device.queue.writeBuffer(paramsBuf, 0, scratch, 0, K8_PARAMS_SIZE);
   }

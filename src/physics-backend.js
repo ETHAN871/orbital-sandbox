@@ -228,6 +228,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       if (readback.nanCount > 0) {
         if (verbose) console.warn('[physics-backend] NaN detected on GPU; swapping to CPU');
         teardown = true;
+        try { k8.destroy(); } catch {}
         try { k6.destroy(); } catch {}
         try { k5.destroy(); } catch {}
         try { k4.destroy(); } catch {}
@@ -258,6 +259,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     destroy() {
       teardown = true;
       pendingReadback = null;
+      try { k8.destroy(); } catch {}
       try { k6.destroy(); } catch {}
       try { k5.destroy(); } catch {}
       try { k4.destroy(); } catch {}

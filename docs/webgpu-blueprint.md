@@ -124,7 +124,16 @@ const FLAG_IS_BH:     u32 = 4u;  // bit 2 — type === 'black_hole'
 const FLAG_TOMBSTONE: u32 = 8u;  // bit 3 — dead, awaiting compaction
 ```
 
-**Flag authority** (single-writer per bit, resolves Phase 2 round-2 review CRITICAL):
+**Flag authority** (single-writer per bit, resolves Phase 2 round-2 review CRITICAL).
+
+> **NOTE — shipped state vs eventual design**: the `FLAG_ABSORBING` row below
+> reflects the *eventual* Phase 2g design. The CURRENT shipped state
+> (through commit `70e2dd6`) has K4 emit AbsorptionEvent records only;
+> CPU drains them and writes FLAG_ABSORBING via `writeBuffer`. The
+> WGSL `atomicOr` mechanism is deferred to 2g remainder when a separate
+> `entityFlagsAtomicBuf` (parallel buffer holding `array<atomic<u32>>`)
+> is added — see §11.9 "Sub-phase deferrals" for why. Until then, CPU
+> is the de facto writer of FLAG_ABSORBING with a 1-substep lag.
 
 | Flag | Write authority | Mechanism |
 |---|---|---|
@@ -419,15 +428,16 @@ When ready, kick off Phase 2 with `/feature-dev` + this blueprint as input.
 | 2c — K4 contact_detect | `c9f6256` | K4 | ✓ dark-launched; emits Contact + AbsorptionEvent + entityMaxImpulse |
 | 2d — K5a + K5 solver | `618e824` | K5a + K5 (accumulate + apply) | ✓ dark-launched via `gpuVelScratchBuf` |
 | 2e — K6 position solver | `04d7a0c` | K6 (accumulate + apply) | ✓ dark-launched via `gpuPVScratchBuf` |
-| **2f — K8 + pairImpulseTable** | — | K8 + open-addressing hash | ⏳ NOT YET STARTED |
-| **2g — integration + acceptance** | — | flip CPU consumer to GPU | ⏳ NOT YET STARTED |
+| 2f — K8 + pairImpulseTable | `9499c9c` | K8 (rebuild_warm_start) + hash | ✓ dark-launched; hash table populated each substep |
+| 2g-partial — K5a↔K8 loop | `70e2dd6` | (no new kernels) | ✓ K5a's persistent path now reads K8's table for `jPrev`; warm-start feedback loop closed. Backend consumer flip (copy gpuVelScratch/gpuPVScratch → entities, skip CPU solvers, wire K7) NOT YET DONE — that's the remaining 2g work. |
+| **2g remainder — full consumer flip** | — | (no new kernels) | ⏳ NOT YET STARTED |
 
 ### Sub-phase deferrals (deliberate technical debt)
 
-- **K4 FLAG_ABSORBING atomicOr**: WGSL forbids atomic ops on struct fields not declared `atomic<u32>`, and `EntityMeta.flags` is plain `u32` (K1's frozen contract). Resolution: K4 emits AbsorptionEvents only; CPU drains them and sets the flag via writeBuffer for the *next* substep (1-substep visual lag, acceptable while dark-launch). Real atomicOr design lands in 2g when a separate `entityFlagsAtomicBuf` parallel buffer is added.
-- **K7 substep activation**: K7 WGSL exists since 2a but the substep insertion + CPU `applyBoundary` wrap-mode gating is deferred to 2g (reviewer 2a H2: must gate CPU wrap on `backend.name === 'webgpu'` when K7 enters the loop to avoid double-wrap).
-- **K5a `jPrev` from pairImpulseTable**: K5a's persistent-contact path uses `max(jGrav, jPrev * 0.10)` with `jPrev = 0` in 2d/2e because K8 hash lands in 2f. Structural form is ready; replace the literal `0.0` with the table lookup.
-- **K5 adaptive iter count**: `prevContactCount = 32` constant in 2d/2e (→ 8 iters always) because K4's `contactCount` readback isn't drained in dark-launch. 2g wires the mapAsync pipeline.
+- **K4 FLAG_ABSORBING atomicOr** (still deferred to full 2g): WGSL forbids atomic ops on struct fields not declared `atomic<u32>`, and `EntityMeta.flags` is plain `u32` (K1's frozen contract). Resolution: K4 emits AbsorptionEvents only; CPU drains them and sets the flag via writeBuffer for the *next* substep (1-substep visual lag, acceptable while dark-launch). Real atomicOr design lands in 2g remainder when a separate `entityFlagsAtomicBuf` parallel buffer is added. **§4.1 flag authority table reflects the eventual design; the shipped state currently has CPU as the FLAG_ABSORBING writer.**
+- **K7 substep activation** (still deferred to full 2g): K7 WGSL exists since 2a but the substep insertion + CPU `applyBoundary` wrap-mode gating is deferred to 2g (reviewer 2a H2: must gate CPU wrap on `backend.name === 'webgpu'` when K7 enters the loop to avoid double-wrap).
+- **K5a `jPrev` from pairImpulseTable**: ✓ RESOLVED at `70e2dd6`. K5a's persistent path now runs the 8-slot linear probe matching K8's hash; miss → `jPrev = 0` (graceful cold-start fallback). Warm-start values flow K8(substep N) → K5a(substep N+1).
+- **K5 adaptive iter count** (still deferred to full 2g): `prevContactCount = 32` constant (→ 8 iters always) because K4's `contactCount` readback isn't drained in dark-launch. 2g remainder wires the mapAsync pipeline.
 
 ### Device limit requests added (gpu-init.js REQUIRED_LIMITS)
 
@@ -443,9 +453,7 @@ All five are confirmed available on RTX-class hardware via adapter pre-check; a 
 
 ### Remaining Phase 2 work
 
-**2f — K8 rebuild_warm_start + pairImpulseTable** (estimated 1 commit, ~250 LOC WGSL + ~200 LOC JS wrapper):
-- Open-addressing hash with linear probing (architect G8). Cell = 32 B `{keyA, keyB, j, nx, ny, flags, _pad, _pad}`. Hash `(lo*1000003)^(hi*999983)`. 8-slot probe budget; drop+STATUS_HASH_OVERFLOW on miss.
-- `encoder.clearBuffer(pairImpulseTable)` before each K8 dispatch (no tombstone bit needed).
+**2f — K8 rebuild_warm_start + pairImpulseTable** — ✓ SHIPPED at `9499c9c`. Implementation deviated slightly from architect's locked 32 B / single-buffer cell: ships as a split layout (`cellMeta` = 20 B plain struct, `cellFlags` = 4 B atomic u32, totaling 24 B/cell). WGSL forbids `atomic<u32>` field on a non-atomic-cell struct without forcing per-field atomic ops on all reads; the split keeps occupancy atomic while letting the slot owner do plain writes to data fields. Hash function + 8-probe budget match the spec exactly.
 - K8 reads K4's converged `contacts[t].normalImpulse` (post-K5) and writes to the hash. K5a's persistent-contact branch then reads the hash for `jPrev`.
 
 **2g — full GPU pipeline activation** (estimated 2-3 commits):
