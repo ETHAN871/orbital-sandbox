@@ -97,7 +97,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     return false;
   }
 
-  function uploadParams(N, contactCount, dt, G, e) {
+  function uploadParams(N, contactCount, dt, G, e, epsilon) {
     k5aView.setUint32 ( 0, N >>> 0, true);
     k5aView.setUint32 ( 4, contactCount >>> 0, true);
     k5aView.setFloat32( 8, dt, true);
@@ -106,7 +106,10 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     const ts = k8Handle.tableSize;
     k5aView.setUint32 (16, ts >>> 0, true);
     k5aView.setUint32 (20, (ts > 0 ? ts - 1 : 0) >>> 0, true);
-    k5aView.setUint32 (24, 0, true);
+    // Bug-fix-2026-05-21: pass effectiveEpsilon for K5a's Plummer floor.
+    // Without it, dense-cluster contacts seeded jGrav from rSum-only,
+    // producing huge warm-start impulses that destabilized K5 Jacobi.
+    k5aView.setFloat32(24, epsilon, true);
     k5aView.setUint32 (28, 0, true);
     device.queue.writeBuffer(k5aParamsBuf, 0, k5aScratch, 0, K5A_PARAMS_SIZE);
     k5View.setUint32 ( 0, N >>> 0, true);

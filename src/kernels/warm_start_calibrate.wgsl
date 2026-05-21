@@ -24,7 +24,7 @@ struct EntityMeta { mass: f32, chargeF: f32, radius: f32, flags: u32 }
 struct PairCellMeta { keyA: u32, keyB: u32, j: f32, nx: f32, ny: f32 }
 struct K5aParams {
   N: u32, contactCount: u32, dt: f32, G: f32,
-  tableSize: u32, tableMask: u32, _pad0: u32, _pad1: u32,
+  tableSize: u32, tableMask: u32, epsilon: f32, _pad1: u32,
 }
 
 const FLAG_ABSORBING:  u32 = 1u;
@@ -58,8 +58,14 @@ fn warm_start_calibrate(@builtin(global_invocation_id) gid: vec3u) {
   let wSum = wA + wB;
   if (wSum == 0.0) { contacts[t].normalImpulse = 0.0; return; }
 
-  // Pairwise Plummer-softened r² (fix #3, physics.js:826).
-  let r2pw = c.dist * c.dist + c.rSum * c.rSum;
+  // Pairwise Plummer-softened r² (fix #3, physics.js:826) — but with the
+  // effective epsilon floor as in K1 (gravity_accel). Without this, dense
+  // small-radius high-mass clusters produced jGrav ≈ G·m/rSum² = huge,
+  // which seeded c.normalImpulse with a value the K5 Jacobi solver then
+  // amplified into a "powder explosion" (~20 bodies of mass=1000, radius=0.4
+  // would shake violently then blow apart). Bug-fix-2026-05-21.
+  let minRpw = max(c.rSum, params.epsilon);
+  let r2pw = c.dist * c.dist + minRpw * minRpw;
   let accelA_from_B = select(miB.chargeF * params.G * miB.mass / r2pw, 0.0, miB.chargeF == 0.0);
   let accelB_from_A = select(miA.chargeF * params.G * miA.mass / r2pw, 0.0, miA.chargeF == 0.0);
   let dvn_pair = (accelA_from_B + accelB_from_A) * params.dt;

@@ -13,6 +13,7 @@
 
 import {
   state,
+  SIM_DT,
   PREDICT_DT, PREDICT_STEPS_MAX,
   BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
@@ -36,6 +37,52 @@ export function prepareFrame(entities) {
     prepareBHTree(entities);
     // buildSpatialHash moved to handleCollisions for per-substep freshness.
   }
+  updateEffectiveEpsilon(entities);
+}
+
+// Exported for the GPU backend's prepareFrame, which skips the BH tree
+// build (GPU does its own O(N²) gravity) but still needs effectiveEpsilon
+// updated each frame — otherwise dense clusters would explode on the GPU
+// path. Safe to call before backend.init() too: the empty-entity branch
+// in _computeEffectiveEpsilon leaves the field at state.epsilon.
+export function updateEffectiveEpsilon(entities) {
+  // Auto-bump the Plummer softening floor when the cluster geometry would
+  // let per-pair gravity at contact distance overwhelm the contact solver.
+  // Bug: ~20 bodies of mass=1000 radius=0.4 (mass/r² ≫ typical) shake then
+  // explode outward like a powder bomb — net inward acceleration on edge
+  // bodies (≈ N_aligned · G·m / minR²) accumulates penetration faster than
+  // the position solver's 0.6·rSum / substep cap can drain. Boosting the
+  // softening floor caps the contact-distance acceleration to something
+  // the solver CAN absorb. Empirical scale: tested m=1000 r=0.4 N=24 case
+  // settles when effectiveEpsilon ≥ ~17. Formula uses worst-case full
+  // SIM_DT (no benefit from substepping for this bound). Default cases
+  // (m≤100, r≥3) stay below state.epsilon=4 → no behavior change.
+  state.effectiveEpsilon = _computeEffectiveEpsilon(entities);
+}
+
+// Safety floor multiplier — picks the smallest effective ε that keeps
+// per-frame gravity-injected penetration within the position solver's
+// drain rate. K=20 chosen empirically: K=10 still showed mild jitter at
+// the m=1000/r=0.4 cluster; K=20 settles cleanly with margin.
+const EPSILON_SAFETY_K = 20;
+
+function _computeEffectiveEpsilon(entities) {
+  let mMax = 0;
+  let rMin = Infinity;
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.absorbing) continue;
+    if (e.mass > mMax) mMax = e.mass;
+    if (e.radius > 0 && e.radius < rMin) rMin = e.radius;
+  }
+  if (mMax === 0 || rMin === Infinity) return state.epsilon;
+  // safetyFloor = SIM_DT · √(K · G · m_max / r_min)
+  // Derivation: edge-body net |a| ≈ (N/2)·G·m/minR². Position-solver drain
+  // is ~0.6·rSum per substep. Equating across full SIM_DT and absorbing
+  // the N/2 + drain ratio into the constant K gives this single-pair-like
+  // bound; the K is calibrated empirically (see EPSILON_SAFETY_K comment).
+  const safetyFloor = SIM_DT * Math.sqrt(EPSILON_SAFETY_K * state.G * mMax / rMin);
+  return Math.max(state.epsilon, safetyFloor);
 }
 
 // ─── Minimum-image distance helpers (wrap mode) ───────────────────
@@ -76,7 +123,9 @@ export function computeAccelerations(entities, accels) {
   const halfW = W * 0.5;
   const halfH = H * 0.5;
   const G = state.G;
-  const EPSILON = state.epsilon;
+  // Read the auto-bumped effective floor — see prepareFrame's
+  // _computeEffectiveEpsilon for the safety-floor rationale.
+  const EPSILON = state.effectiveEpsilon;
 
   for (let i = 0; i < n; i++) {
     const a = entities[i];
@@ -866,12 +915,15 @@ function _rebuildPrevPairImpulses() {
       if (wSum > 0) {
         // Pairwise Plummer-softened r² at the actual contact distance.
         // Detection-time c.dist captures where the pair is right now;
-        // c.rSum is the unsoftened separation that defines minR in the
-        // computeAccelerations Plummer term. Their squares sum to the
-        // softened r² used in the gravity formula. Using c.dist (rather
-        // than rSum) avoids the overshoot risk if the position solver
-        // has separated the bodies slightly past rSum since detection.
-        const r2pw = c.dist * c.dist + c.rSum * c.rSum;
+        // minR mirrors computeAccelerations: max(rSum, effectiveEpsilon).
+        // Bug-fix-2026-05-21: previously used c.rSum directly, which gave
+        // jGrav = G·m/rSum² for dense-cluster pairs — huge values that
+        // seeded huge warm-start impulses (GPU K5 Jacobi then amplified
+        // them into the powder-explosion failure mode). Mirroring K1's
+        // softening keeps gravity-derived warm-starts in scale with the
+        // gravity actually applied this substep.
+        const minRpw = c.rSum > state.effectiveEpsilon ? c.rSum : state.effectiveEpsilon;
+        const r2pw = c.dist * c.dist + minRpw * minRpw;
         // Pairwise acceleration magnitudes following the asymmetric
         // charge force law (see file header). Signs are carried by
         // charge: +1 attractive, −1 repulsive. accel_A_from_B is the
@@ -1035,7 +1087,9 @@ function ghostAccel(x, y, radius, others, out) {
   const halfW = W * 0.5;
   const halfH = H * 0.5;
   const G = state.G;
-  const EPSILON = state.epsilon;
+  // Read the auto-bumped effective floor — see prepareFrame's
+  // _computeEffectiveEpsilon for the safety-floor rationale.
+  const EPSILON = state.effectiveEpsilon;
   for (let k = 0; k < others.length; k++) {
     const o = others[k];
     if (o.charge === 0 || o.absorbing) continue;

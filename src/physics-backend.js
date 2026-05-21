@@ -19,6 +19,7 @@
 import { state } from './state.js';
 import {
   prepareFrame as cpuPrepareFrame,
+  updateEffectiveEpsilon,
   stepPBD,
   updateAbsorptions,
   applyBoundary,
@@ -110,7 +111,12 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     const wrap = state.boundaryMode === 'wrap';
     const W = wrap ? state.viewport.width  : 0;
     const H = wrap ? state.viewport.height : 0;
-    return { G: state.G, epsilon: state.epsilon, W, H };
+    // Bug-fix-2026-05-21: GPU K1 kernel reads the auto-bumped
+    // effectiveEpsilon (set by physics.js prepareFrame) so its Plummer
+    // softening matches the CPU path's dense-cluster safety floor. Without
+    // this, the WebGPU path would explode on dense-cluster scenes that the
+    // CPU path now stabilizes.
+    return { G: state.G, epsilon: state.effectiveEpsilon, W, H };
   }
 
   async function submitDispatch(entities, dt) {
@@ -131,7 +137,9 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     // K5 iter count is 1-substep-stale per blueprint G4. prevContactCount
     // seeds to 32 (→8 iters) for the very first substep.
     const iterCount = computeVelIter(prevContactCount);
-    k5.uploadParams(N, prevContactCount, dt, state.G, state.elasticRestitution);
+    // Bug-fix-2026-05-21: K5a needs effectiveEpsilon to compute its Plummer
+    // warm-start floor in sync with K1's gravity softening.
+    k5.uploadParams(N, prevContactCount, dt, state.G, state.elasticRestitution, state.effectiveEpsilon);
     k6.uploadParams(N, prevContactCount, dt);
     k8.uploadParams(prevContactCount);
 
@@ -208,12 +216,18 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       await submitDispatch(entities, 1 / 60);
     },
 
-    prepareFrame(_entities) {
+    prepareFrame(entities) {
       // No BH tree build (GPU runs exact O(N²)); no spatial hash either —
       // that's still per-substep inside handleCollisions on the CPU side.
       // nanCheckBuf reset is per-frame (not per-substep) so a NaN trip in
       // any substep stays visible to this frame's CPU drain — see blueprint
       // §3 NaN guards paragraph.
+      // Dense-cluster safety floor (bug-fix-2026-05-21): the CPU path's
+      // prepareFrame would bump state.effectiveEpsilon here, but the GPU
+      // path doesn't call cpuPrepareFrame. Update it explicitly so the
+      // K1 readStateParams sees the same auto-bumped softening as the
+      // CPU contact solver expects.
+      updateEffectiveEpsilon(entities);
       k2.resetNanCounter();
     },
 

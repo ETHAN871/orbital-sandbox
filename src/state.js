@@ -177,6 +177,15 @@ export const state = {
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
   // Read-only outside physics-backend.js; useful for HUD/debug displays.
   backendName: null,
+
+  // Effective Plummer softening floor — auto-bumped above state.epsilon when
+  // the cluster geometry (high mass / small radius) would let per-pair
+  // gravity at contact distance exceed what the contact solver can absorb,
+  // causing a "dense-cluster explosion" (~20 bodies of mass≫radius² shake
+  // violently then blow apart). Recomputed each frame by prepareFrame().
+  // Physics + GPU kernel + field viz all read effectiveEpsilon; only the
+  // user-facing slider reads/writes state.epsilon.
+  effectiveEpsilon: DEFAULTS_TUNING.epsilon,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────
