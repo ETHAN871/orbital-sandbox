@@ -26,6 +26,7 @@ import {
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';
 import { createK2GPU } from './physics-gpu-k2.js';
+import { createBroadphaseGPU } from './physics-gpu-broadphase.js';
 
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
@@ -69,6 +70,11 @@ function makeCpuBackend() {
 async function makeGpuBackend(device, wgslSources, onLost) {
   const gravity = await createGravityGPU(device, wgslSources.k1);
   const k2 = await createK2GPU(device, wgslSources.k2, gravity);
+  const broadphase = await createBroadphaseGPU(device, {
+    k3:  wgslSources.k3,
+    k3b: wgslSources.k3b,
+    k3c: wgslSources.k3c,
+  }, gravity, k2);
   const verbose = isVerbose();
 
   let dispatchIdx = 0;
@@ -79,6 +85,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     if (teardown) return;
     teardown = true;
     pendingReadback = null;
+    try { broadphase.destroy(); } catch {}
     try { k2.destroy(); } catch {}
     try { gravity.destroy(); } catch {}
     if (verbose) console.warn('[physics-backend] device lost:', info.reason, info.message);
@@ -104,12 +111,16 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     const { G, epsilon, W, H } = readStateParams();
     gravity.uploadParams(N, G, epsilon, W, H);
     k2.uploadParams(N, dt);
+    // Broadphase grid params recompute per substep — depends on maxR + viewport.
+    // viewport state is global; uploadParams uses state.viewport directly.
+    broadphase.uploadParams(entities, N, state.viewport.width, state.viewport.height);
 
     const stagingIdx = dispatchIdx % 2;
     dispatchIdx++;
-    const enc = device.createCommandEncoder({ label: 'K1+K2 frame encoder' });
-    gravity.recordDispatch(enc, N, stagingIdx);   // K1 → accels
-    k2.recordDispatch(enc, N, stagingIdx);        // K2 → outPositions / velocities / nanCount
+    const enc = device.createCommandEncoder({ label: 'K1+K2+K3 frame encoder' });
+    gravity.recordDispatch(enc, N, stagingIdx);     // K1 → accels
+    k2.recordDispatch(enc, N, stagingIdx);          // K2 → outPositions / velocities / nanCount
+    broadphase.recordDispatch(enc, N);              // K3 / K3b / K3c → cellCounts / cellOffsets / cellContents (dark-launch)
     device.queue.submit([enc.finish()]);
     pendingReadback = (async () => {
       const [positions, velocities, nanCount] = await Promise.all([
@@ -128,10 +139,12 @@ async function makeGpuBackend(device, wgslSources, onLost) {
   function ensureCapacity(entities) {
     const N = entities.length;
     const gravityRealloc = gravity.growIfNeeded(N);
-    if (gravityRealloc) k2.onGravityRealloc();    // rebuild K2 bind group
+    if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); }
     const k2Realloc = k2.growIfNeeded(N);
-    if (gravityRealloc || k2Realloc) pendingReadback = null;
-    return gravityRealloc || k2Realloc;
+    if (k2Realloc) broadphase.onK2Realloc();
+    const bpRealloc = broadphase.growIfNeeded(N);
+    if (gravityRealloc || k2Realloc || bpRealloc) pendingReadback = null;
+    return gravityRealloc || k2Realloc || bpRealloc;
   }
 
   function applyK2OutputToEntities(entities, N, positions, velocities) {
@@ -183,6 +196,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       if (readback.nanCount > 0) {
         if (verbose) console.warn('[physics-backend] NaN detected on GPU; swapping to CPU');
         teardown = true;
+        try { broadphase.destroy(); } catch {}
         try { k2.destroy(); } catch {}
         try { gravity.destroy(); } catch {}
         onLost({ reason: 'nan-propagation', message: 'GPU produced NaN; restored CPU state' });
@@ -209,6 +223,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     destroy() {
       teardown = true;
       pendingReadback = null;
+      try { broadphase.destroy(); } catch {}
       try { k2.destroy(); } catch {}
       try { gravity.destroy(); } catch {}
     },
@@ -236,12 +251,15 @@ export async function createBackend() {
     }
     let wgslSources;
     try {
-      // Phase 2a: load K1 + K2 in parallel; later sub-phases will add more.
-      const [k1, k2] = await Promise.all([
+      // Phase 2a-2b: K1 (gravity) + K2 (kick_predict) + K3/K3b/K3c (broadphase).
+      const [k1, k2, k3, k3b, k3c] = await Promise.all([
         loadKernel('./kernels/gravity_accel.wgsl'),
         loadKernel('./kernels/kick_predict.wgsl'),
+        loadKernel('./kernels/broadphase_count.wgsl'),
+        loadKernel('./kernels/broadphase_prefix_sum.wgsl'),
+        loadKernel('./kernels/broadphase_scatter.wgsl'),
       ]);
-      wgslSources = { k1, k2 };
+      wgslSources = { k1, k2, k3, k3b, k3c };
     } catch (e) {
       if (isVerbose()) console.warn('[physics-backend] loadKernel failed:', e);
       detection.device.destroy();

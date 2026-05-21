@@ -24,7 +24,13 @@
 // against the eventual target.
 const REQUIRED_LIMITS = {
   maxStorageBufferBindingSize: 64 * 1024 * 1024,
-  maxComputeWorkgroupStorageSize: 16 * 1024,    // K1 uses 6 KB
+  maxComputeWorkgroupStorageSize: 16 * 1024,    // K1 uses 6 KB; K3b block_scan uses 4 KB shared
+  // Phase 2b: K3b's block_scan + apply_spine declare workgroup_size(1024).
+  // Default device limit is 256; we must explicitly request 1024 (the WGSL
+  // portable cap). Adapters on RTX-class hardware report 1024 in WebGPU.
+  // If a device caps at 256 we'll fall back to CPU at requestDevice.
+  maxComputeInvocationsPerWorkgroup: 1024,
+  maxComputeWorkgroupSizeX: 1024,
 };
 
 function queryParam(name) {
@@ -74,6 +80,18 @@ export async function detectBackend() {
     return {
       backend: 'cpu',
       reason: `maxComputeWorkgroupStorageSize ${adapter.limits.maxComputeWorkgroupStorageSize} < ${REQUIRED_LIMITS.maxComputeWorkgroupStorageSize}`,
+    };
+  }
+  if (adapter.limits.maxComputeInvocationsPerWorkgroup < REQUIRED_LIMITS.maxComputeInvocationsPerWorkgroup) {
+    return {
+      backend: 'cpu',
+      reason: `maxComputeInvocationsPerWorkgroup ${adapter.limits.maxComputeInvocationsPerWorkgroup} < ${REQUIRED_LIMITS.maxComputeInvocationsPerWorkgroup}`,
+    };
+  }
+  if (adapter.limits.maxComputeWorkgroupSizeX < REQUIRED_LIMITS.maxComputeWorkgroupSizeX) {
+    return {
+      backend: 'cpu',
+      reason: `maxComputeWorkgroupSizeX ${adapter.limits.maxComputeWorkgroupSizeX} < ${REQUIRED_LIMITS.maxComputeWorkgroupSizeX}`,
     };
   }
 
