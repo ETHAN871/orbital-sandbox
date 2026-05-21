@@ -19,9 +19,11 @@
 
 import { state } from './state.js';
 
-let _cellSize = 64;
+// Per-axis cell size so cells exactly tile the viewport (no overflow).
+// See buildSpatialHash for the rationale — Y wrap-neighbor miss fix.
+let _cellSizeX = 64, _cellSizeY = 64;
 let _cells = new Map();          // key "cx,cy" → entity[]
-let _ncx = 0, _ncy = 0;          // grid dims when in wrap mode (for modular indexing)
+let _ncx = 0, _ncy = 0;          // grid dims (used for modular indexing in wrap mode)
 
 export function buildSpatialHash(entities) {
   // Cell size MUST be ≥ 2 × maxR so the 3×3 cell-neighbourhood query
@@ -30,6 +32,28 @@ export function buildSpatialHash(entities) {
   // r_sum get silently dropped — manifesting as "one half of a portal-
   // straddling body fails to collide" because the boundary-spanning entity
   // can land 2 cells away from its peer via the wrap path.
+  //
+  // Bug fix (2026-05-21) — per-axis cellSize so cells exactly tile the
+  // viewport. The previous implementation used a single _cellSize and
+  // _ncx = ceil(W / _cellSize). When viewport.height isn't a multiple of
+  // _cellSize, the last cell extends past the viewport edge and is mostly
+  // empty. Modular wrap of the 3×3 query (qcy = ((acy-1) % _ncy + _ncy)
+  // % _ncy) then points to that empty overflow cell rather than to the
+  // cell that actually contains wrap-adjacent bodies. Result: at the Y
+  // wrap edge, broadphase silently dropped wrap-spanning pairs (verified:
+  // 17 missed pairs in a 99-body hex cluster at viewport 345×514, all in
+  // Y direction; X was fine because viewport.width / cellSize happened to
+  // overflow less, putting bodies near the right edge into the cell the
+  // modular wrap correctly pointed to). User-visible symptom: bodies
+  // overlapping at top/bottom of viewport, escalating Y jitter when BH is
+  // enabled (BH dispatch also gates the spatial hash via state.bhThreshold).
+  //
+  // Fix: count cells with FLOOR(viewport / minCellSize) so each cell is
+  // ≥ minCellSize (the 2×maxR guarantee is preserved), then compute the
+  // ACTUAL per-axis cellSize as viewport/count. With ncx × cellSizeX
+  // exactly = viewport.width, the modular wrap of cell -1 maps to cell
+  // ncx-1 which is also the cell containing bodies near the right edge —
+  // wrap-adjacency is now correctly found. Same for Y.
   //
   // V8.2 originally capped cellSize at 128 to keep cell count down; that
   // broke collisions for maxR > 64 (entities at max radius 80 had
@@ -41,17 +65,26 @@ export function buildSpatialHash(entities) {
     const r = entities[i].radius;
     if (r > maxR) maxR = r;
   }
-  _cellSize = Math.max(32, Math.ceil(maxR * 2));
+  const minCellSize = Math.max(32, Math.ceil(maxR * 2));
 
-  _ncx = Math.max(1, Math.ceil(state.viewport.width  / _cellSize));
-  _ncy = Math.max(1, Math.ceil(state.viewport.height / _cellSize));
+  const W = state.viewport.width;
+  const H = state.viewport.height;
+  // Floor ensures each cell is ≥ minCellSize (preserves the 2×maxR
+  // broadphase coverage guarantee). When the viewport is smaller than
+  // minCellSize, ncx/ncy clamp to 1 — the entire viewport is one cell
+  // and every pair is queried, so broadphase is trivially correct.
+  _ncx = Math.max(1, Math.floor(W / minCellSize));
+  _ncy = Math.max(1, Math.floor(H / minCellSize));
+  // Actual cell size now exactly tiles the viewport per axis.
+  _cellSizeX = W > 0 ? W / _ncx : minCellSize;
+  _cellSizeY = H > 0 ? H / _ncy : minCellSize;
 
   _cells.clear();
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.absorbing) continue;
-    const cx = Math.floor(e.x / _cellSize);
-    const cy = Math.floor(e.y / _cellSize);
+    const cx = Math.floor(e.x / _cellSizeX);
+    const cy = Math.floor(e.y / _cellSizeY);
     const key = cellKey(cx, cy);
     let bucket = _cells.get(key);
     if (!bucket) _cells.set(key, bucket = []);
@@ -76,8 +109,8 @@ export function forEachCollisionPair(entities, cb) {
   for (let i = 0; i < entities.length; i++) {
     const a = entities[i];
     if (a.absorbing) continue;
-    const acx = Math.floor(a.x / _cellSize);
-    const acy = Math.floor(a.y / _cellSize);
+    const acx = Math.floor(a.x / _cellSizeX);
+    const acy = Math.floor(a.y / _cellSizeY);
 
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
