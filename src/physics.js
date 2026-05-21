@@ -419,7 +419,24 @@ function _solvePositionConstraints(count, entities, dt) {
 //
 // Reference: Catto's GDC 2006 "Fast and Simple Physics using
 // Sequential Impulses"; Planck.js's b2ContactSolver::SolveVelocityConstraints.
-const VELOCITY_ITERATIONS = 8;
+//
+// Bug fix (2026-05-21): for dense clusters the chain-depth of the contact
+// graph exceeds 8 iterations — pressure impulses from the exterior do not
+// propagate to the interior within one substep, leaving interior contacts
+// to see unresisted gravity for 1-2 substeps. The result: visible body
+// overlap and chronic jitter at high G + dense clusters. We linearly ramp
+// iteration count by contact count: sparse scenes (orbits, small stacks)
+// keep the 8-iteration budget; dense clusters get up to 24. Linear ramp
+// avoids the visible "step" hitch a binary gate would cause as the user
+// adds the threshold-crossing body.
+//
+// Chain depth for a 2D hex-packed disc of N bodies ≈ 2·√(N/π). At
+// N=200 → depth ≈ 16. At N=300 → depth ≈ 20. 24 iterations covers
+// depth 24 with margin. RAMP_LO/RAMP_HI define the linear interval.
+const VEL_ITERATIONS_MIN = 8;
+const VEL_ITERATIONS_MAX = 24;
+const VEL_ITERATIONS_RAMP_LO = 60;    // sparse contact count — keep MIN
+const VEL_ITERATIONS_RAMP_HI = 380;   // dense contact count — saturate at MAX
 
 // Warm-start calibration for persistent (resting) contacts.
 //
@@ -449,6 +466,15 @@ const WARM_START_PERSIST_FLOOR = 0.10;   // fraction of j_prev kept as floor
 
 function _solveContactVelocities(count) {
   if (count === 0) return;
+  // Adaptive iteration count — see VEL_ITERATIONS_* comment block above.
+  // One comparison + arithmetic per substep (not per contact); negligible.
+  const VELOCITY_ITERATIONS = count <= VEL_ITERATIONS_RAMP_LO
+    ? VEL_ITERATIONS_MIN
+    : count >= VEL_ITERATIONS_RAMP_HI
+      ? VEL_ITERATIONS_MAX
+      : VEL_ITERATIONS_MIN + Math.floor(
+          (count - VEL_ITERATIONS_RAMP_LO) * (VEL_ITERATIONS_MAX - VEL_ITERATIONS_MIN)
+          / (VEL_ITERATIONS_RAMP_HI - VEL_ITERATIONS_RAMP_LO));
   const e = state.elasticRestitution;
   const wrap = state.boundaryMode === 'wrap';
   const W = wrap ? state.viewport.width : 0;
@@ -587,7 +613,7 @@ function processCollisionPair(a, b, dx, dy) {
     }
     let c = _contacts[_contactCount];
     if (!c) {
-      c = { a: null, b: null, rSum: 0, nx: 0, ny: 0,
+      c = { a: null, b: null, rSum: 0, dist: 0, nx: 0, ny: 0,
             vnApproach: 0, wasPersistent: false, normalImpulse: 0 };
       _contacts[_contactCount] = c;
     }
@@ -595,6 +621,7 @@ function processCollisionPair(a, b, dx, dy) {
     c.a = a;
     c.b = b;
     c.rSum = rSum;
+    c.dist = dist;   // used by _rebuildPrevPairImpulses for pairwise Plummer r²
     let nx, ny;
     if (dist < 1e-6) {
       // Co-located fallback: arbitrary axis, matches legacy resolution.
@@ -709,21 +736,31 @@ export function handleCollisions(entities) {
 //   PERSISTENT (c.wasPersistent === true): the contact has been resting
 //     across substeps. The velocity solver has already driven vN to 0
 //     this substep; the only approach velocity NEXT substep will come
-//     from differential gravity along the normal. Sign convention:
-//     c.nx, c.ny point from a toward b (set in processCollisionPair
-//     as dx/dist where dx = b.x - a.x). The differential acceleration
-//     projected on n̂ is dvn_grav = (b.a - a.a) · n̂ · dt. When
-//     negative, gravity accelerates b TOWARD a (the pair is being
-//     pushed together) and we need a positive push-only impulse to
-//     resist it: jGrav = -dvn_grav / wSum (the conditional negation
-//     enforces ≥ 0). Stored impulse is max(jGrav, c.normalImpulse *
-//     10%) — the 10% floor of the just-converged impulse covers
-//     perturbations the gravity-only estimate misses (third-body
-//     effects, fast geometry changes; ~2-3 SI iterations of
-//     convergence headroom at typical rates). This prevents the
-//     warm-start overshoot → clamp-to-zero → unresisted-gravity
-//     feedback loop that caused escalating Y jitter on hex-packed
-//     clusters straddling the Y wrap edge.
+//     from PAIRWISE differential gravity along the normal. Sign
+//     convention: c.nx, c.ny point from a toward b (set in
+//     processCollisionPair as dx/dist where dx = b.x - a.x).
+//
+//     Previous formula (2026-05-20, commit d3d3e7d) used the NET
+//     per-body cached acceleration: dvn_grav = (b.a - a.a) · n̂ · dt.
+//     That works for isolated pairs but is WRONG for cluster interiors,
+//     where opposing neighbor forces make b.a ≈ a.a ≈ 0 (forces
+//     cancel) so dvn_grav ≈ 0 even though the A-B pairwise approach
+//     impulse is significant. The under-calibrated warm-start let
+//     interior contacts repeatedly under-converge under high G,
+//     accumulating microscopic overlap until visible.
+//
+//     Fix (2026-05-21, this commit): compute the pairwise gravity
+//     directly from the two bodies' charges and masses at the contact
+//     distance (Plummer-softened: r² + rSum² ≈ c.dist² + c.rSum²).
+//     This isolates the A-B pairwise force from the cluster's net
+//     gravitational context. Signs follow the asymmetric charge model
+//     (A receives force from B iff b.charge ≠ 0, magnitude scaled by
+//     b.charge — and vice versa). Stored impulse is max(jGrav,
+//     c.normalImpulse * 10%) — the 10% floor handles mixed-charge
+//     scenarios where dvn_pair = 0 (e.g., A=+1, B=-1, equal mass:
+//     both translate together, no relative motion — but the velocity
+//     solver still needs a starting impulse for the persistent
+//     constraint).
 //
 // Keys with c.normalImpulse ≤ 0 are skipped to prevent unbounded Map
 // growth from transient brushing contacts that didn't accumulate
@@ -744,16 +781,34 @@ function _rebuildPrevPairImpulses() {
       const wB = b.pinned ? 0 : 1 / b.mass;
       const wSum = wA + wB;
       if (wSum > 0) {
-        // dvn_grav = (b.a - a.a) · n̂ · dt — see the function header for
-        // sign convention. Pinned-body note: a.ax/a.ay (and b.ax/b.ay)
-        // are 0 for any pinned endpoint because step C skips pinned
-        // bodies; the formula correctly treats a pinned endpoint as
-        // contributing zero gravitational delta. Charge-zero bodies
-        // (asymmetric force model) keep whatever asymmetric a was
-        // received in step C — still correct because we use the actual
-        // per-body cached acceleration.
-        const dvn_grav = ((b.ax - a.ax) * c.nx + (b.ay - a.ay) * c.ny) * _currentSimDt;
-        const jGrav = dvn_grav < 0 ? -dvn_grav / wSum : 0;
+        // Pairwise Plummer-softened r² at the actual contact distance.
+        // Detection-time c.dist captures where the pair is right now;
+        // c.rSum is the unsoftened separation that defines minR in the
+        // computeAccelerations Plummer term. Their squares sum to the
+        // softened r² used in the gravity formula. Using c.dist (rather
+        // than rSum) avoids the overshoot risk if the position solver
+        // has separated the bodies slightly past rSum since detection.
+        const r2pw = c.dist * c.dist + c.rSum * c.rSum;
+        // Pairwise acceleration magnitudes following the asymmetric
+        // charge force law (see file header). Signs are carried by
+        // charge: +1 attractive, −1 repulsive. accel_A_from_B is the
+        // n̂-component of A's gravitational acceleration due to B
+        // (= b.charge·G·m_B/r² since A is pulled in +n̂ direction when
+        // b.charge=+1, in −n̂ when b.charge=−1). accel_B_from_A is the
+        // (−n̂)-component of B's gravitational acceleration due to A,
+        // which equals a.charge·G·m_A/r² (B is pulled in −n̂ direction
+        // when a.charge=+1, +n̂ when a.charge=−1). Charge-zero source
+        // contributes no force — the early return preserves that.
+        // Pinned bodies have b.charge / a.charge intact; only the wA/wB
+        // weight gates the impulse distribution downstream.
+        const G = state.G;
+        const accel_A_from_B = b.charge !== 0 ? b.charge * G * b.mass / r2pw : 0;
+        const accel_B_from_A = a.charge !== 0 ? a.charge * G * a.mass / r2pw : 0;
+        // Sum = relative approach acceleration along n̂. Positive when
+        // bodies converge. Mixed-charge (+1,−1) at equal mass: both
+        // bodies translate in −n̂ at the same rate → 0 (correct).
+        const dvn_pair = (accel_A_from_B + accel_B_from_A) * _currentSimDt;
+        const jGrav = dvn_pair > 0 ? dvn_pair / wSum : 0;
         jStore = Math.max(jGrav, c.normalImpulse * WARM_START_PERSIST_FLOOR);
       }
       // wSum === 0: both bodies pinned. _solveContactVelocities also
