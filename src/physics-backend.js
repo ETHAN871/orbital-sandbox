@@ -145,7 +145,7 @@ async function makeGpuBackend(device, wgslSource, onLost) {
       const accels = await accelsBuf;
       if (teardown || accels == null) return;
 
-      stepPBD(entities, dt, accels);
+      stepPBD(entities, dt, { injectedAccels: accels });
       updateAbsorptions(entities, dt);
       applyBoundary(entities, viewport, boundaryMode);
 

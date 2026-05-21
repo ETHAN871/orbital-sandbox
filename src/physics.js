@@ -238,56 +238,74 @@ function ensureScratch(n) {
 //     converge to their equilibrium impulse in 1–2 iterations when
 //     seeded from the previous substep's converged value.
 //
-// Phase 1 WebGPU integration (architect decision A2.α): optional 3rd arg
-// `injectedAccels` — a Float32Array of interleaved (ax_0, ay_0, ax_1, ay_1, …)
-// from K1's `outputBuf` staging readback. When supplied, step B copies it
-// into `_scratch` instead of running the CPU O(N²) computeAccelerations.
-// `undefined` keeps the CPU path bit-identical to main (F1 acceptance).
-export function stepPBD(entities, dt, injectedAccels) {
+// Phase 1 + Phase 2a WebGPU integration. Optional 3rd arg `options`:
+//   - options.injectedAccels (Float32Array, Phase 1): interleaved (ax,ay)
+//     from K1's readback. When supplied, step B copies into _scratch instead
+//     of running CPU O(N²) computeAccelerations. Phase 1 dispatch model A2.α.
+//   - options.skipKickPredict (bool, Phase 2a): when true, steps B+C+D are
+//     skipped — K2 has already performed gravity kick + position predict on
+//     GPU and written results into entity.{vx, vy, x, y} (read back by
+//     physics-backend.js before this call). Step A (pseudoVel reset) STILL
+//     RUNS because CPU's _solvePositionConstraints (step G) reads entity._pvx
+//     which is a separate memory location from GPU's pseudoVels. Step I
+//     (pinned hard-reset) also always runs so CPU's entity.vx for pinned
+//     matches what K7 would produce. At 2e+ when K6/K7 also move to GPU,
+//     step A could additionally be skipped — revisit then.
+//
+// Backwards-compat: when 3rd arg is undefined, behavior is bit-identical to
+// the main branch (F1 acceptance).
+export function stepPBD(entities, dt, options) {
   const n = entities.length;
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
+
+  const injectedAccels  = options?.injectedAccels;
+  const skipKickPredict = options?.skipKickPredict === true;
 
   // Cache dt for processCollisionPair's pre-kick velocity calculation
   // (used by the wasPersistent gate, NOT by any deleted refund code).
   _currentSimDt = dt;
 
   // ── A. Reset pseudo-velocity accumulator (for step G) ──────────
+  // Always runs even when K2 zeroed GPU pseudoVels — CPU's entity._pvx is
+  // a separate JS field that the CPU position solver reads.
   for (let i = 0; i < n; i++) {
     entities[i]._pvx = 0;
     entities[i]._pvy = 0;
   }
 
-  // ── B. Compute accelerations at current positions ──────────────
-  if (injectedAccels !== undefined) {
-    for (let i = 0; i < n; i++) {
-      _scratch[i].ax = injectedAccels[i * 2];
-      _scratch[i].ay = injectedAccels[i * 2 + 1];
+  if (!skipKickPredict) {
+    // ── B. Compute accelerations at current positions ──────────────
+    if (injectedAccels !== undefined) {
+      for (let i = 0; i < n; i++) {
+        _scratch[i].ax = injectedAccels[i * 2];
+        _scratch[i].ay = injectedAccels[i * 2 + 1];
+      }
+    } else {
+      computeAccelerations(entities, _scratch);
     }
-  } else {
-    computeAccelerations(entities, _scratch);
-  }
 
-  // ── C. Gravity kick: v += a · dt ───────────────────────────────
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    const ax = _scratch[i].ax;
-    const ay = _scratch[i].ay;
-    e.vx += ax * dt;
-    e.vy += ay * dt;
-    // Cache a for downstream readers (prediction tooling).
-    e.ax = ax;
-    e.ay = ay;
-  }
+    // ── C. Gravity kick: v += a · dt ───────────────────────────────
+    for (let i = 0; i < n; i++) {
+      const e = entities[i];
+      if (e.pinned || e.absorbing) continue;
+      const ax = _scratch[i].ax;
+      const ay = _scratch[i].ay;
+      e.vx += ax * dt;
+      e.vy += ay * dt;
+      // Cache a for downstream readers (prediction tooling).
+      e.ax = ax;
+      e.ay = ay;
+    }
 
-  // ── D. Predict positions: x += v · dt ──────────────────────────
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    e.x += e.vx * dt;
-    e.y += e.vy * dt;
-  }
+    // ── D. Predict positions: x += v · dt ──────────────────────────
+    for (let i = 0; i < n; i++) {
+      const e = entities[i];
+      if (e.pinned || e.absorbing) continue;
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+    }
+  }   // end if (!skipKickPredict)
 
   // ── E. Detect contacts at predicted positions ──────────────────
   // handleCollisions: BH pairs → beginAbsorption immediately.
