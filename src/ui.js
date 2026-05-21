@@ -14,6 +14,8 @@ import {
 } from './state.js';
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
+import { clearContactState } from './physics.js';
+import { clearBHTree } from './physics-barneshut.js';
 
 const els = {};
 
@@ -31,6 +33,15 @@ export function bindUI() {
     // V8.1: also wipe the phosphor trail canvas — otherwise old dots
     // would linger and fade slowly even after entities are gone.
     resetTrailCanvas();
+    // 2026-05-21 memory-leak fix: drop physics module-level caches that
+    // hold strong refs to the just-cleared entities. Without these,
+    // _contacts[] slots, _prevPairImpulses, and the BH quadtree pin
+    // every removed entity until they're overwritten next substep —
+    // which never happens when the user pauses + clears, so memory
+    // accumulates across long sessions. See physics.js clearContactState
+    // and physics-barneshut.js clearBHTree for the full rationale.
+    clearContactState();
+    clearBHTree();
     syncFromSelection();
   });
   els.editBtn.addEventListener('click', toggleEditMode);

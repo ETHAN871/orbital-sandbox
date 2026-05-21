@@ -1041,3 +1041,35 @@ export function applyBoundary(entities, viewport, mode) {
     }
   }
 }
+
+// Drop all module-level contact + warm-start state. Called from the
+// "Clear Sandbox" UI handler so the array slots in `_contacts` (each
+// Contact object holds `.a` / `.b` strong refs to entity objects) and
+// the warm-start Map don't pin the just-cleared entities in memory.
+//
+// Why this is necessary even though `_contactCount = 0` already runs
+// at the top of `handleCollisions` each substep:
+//   - `_contactCount = 0` only moves the LOGICAL count, NOT the array
+//     length. `_contacts.length` stays at the peak observed during the
+//     session; slots [0 .. peakCount) still hold Contact objects with
+//     dead-entity refs after a clear. Those refs prevent garbage
+//     collection of the cleared entities.
+//   - `_prevPairImpulses` is normally rebuilt at the END of stepPBD via
+//     `_rebuildPrevPairImpulses()` which begins with a `.clear()`.
+//     But if the user pauses + clears, stepPBD never runs again, so the
+//     Map keeps its last-frame entries.
+// Both leaks are slow (peak-bounded, not unbounded) but compound across
+// long sessions where the user repeatedly populates and clears the
+// sandbox. Explicit cleanup avoids the "only a page refresh helps"
+// failure mode.
+export function clearContactState() {
+  for (let i = 0; i < _contacts.length; i++) {
+    const c = _contacts[i];
+    if (c) {
+      c.a = null;
+      c.b = null;
+    }
+  }
+  _contactCount = 0;
+  _prevPairImpulses.clear();
+}

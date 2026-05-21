@@ -208,6 +208,17 @@ export function prepareBHTree(entities) {
   _extent = tree.extent();
 }
 
+// Drop the cached quadtree + extent. Called from the "Clear Sandbox" UI
+// handler so the tree's strong refs to (now-removed) entity objects
+// don't survive in module scope. prepareBHTree already nulls these
+// fields when called with an empty entity list, but if the user pauses
+// and then clears, prepareBHTree never re-runs and the stale tree pins
+// every entity it held until the page refreshes.
+export function clearBHTree() {
+  _tree = null;
+  _extent = null;
+}
+
 export function computeAccelerationsBH(entities, accels) {
   // V8.1c: refresh module-level shadows from runtime-tunable state.
   G = state.G;

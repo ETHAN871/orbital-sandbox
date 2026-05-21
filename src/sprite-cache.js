@@ -23,6 +23,15 @@ const SPRITE_PADDING_PX = 8;   // room for pinned ring + antialias
 
 const cache = new Map();       // key → HTMLCanvasElement (canvas with ._ox/._oy)
 
+// Listener invoked with the EVICTED canvas when the LRU drops it. Renderer
+// registers this in initWebGL to call gl.deleteTexture on the orphan
+// _spriteTexMap entry and drop the JS-side reference. Without it, every
+// sprite that aged out of cache would leak its GPU texture handle + canvas
+// + info object until the WebGL context was lost (effectively only via a
+// page refresh) — a slow but visible long-session memory leak.
+let _evictionListener = null;
+export function onSpriteEvicted(fn) { _evictionListener = fn; }
+
 function getSprite(type, color, radius, charge, pinned) {
   // Quantize radius to 0.5 px to coalesce mid-drag slider variants AND so
   // the sprite is rendered at the same radius the cache key reflects (no
@@ -39,7 +48,13 @@ function getSprite(type, color, radius, charge, pinned) {
   const sprite = renderSprite(type, color, rQ, charge, pinned);
   if (cache.size >= SPRITE_CACHE_MAX) {
     const oldestKey = cache.keys().next().value;
-    if (oldestKey !== undefined) cache.delete(oldestKey);
+    if (oldestKey !== undefined) {
+      const evicted = cache.get(oldestKey);
+      cache.delete(oldestKey);
+      // Notify renderer so it can dispose the matching GL texture +
+      // _spriteTexMap entry. Listener is null-safe for headless tests.
+      if (_evictionListener && evicted) _evictionListener(evicted);
+    }
   }
   cache.set(key, sprite);
   return sprite;

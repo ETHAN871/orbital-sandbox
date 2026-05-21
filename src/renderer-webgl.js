@@ -42,10 +42,12 @@
 // Entity sprite design:
 //   - sprite-cache.js continues to produce HTMLCanvasElement sprites.
 //   - First time we see a unique canvas, lazily upload to a GL texture
-//     (kept in _spriteTexMap). Sprite cache caps at 200 → ≤200 textures,
-//     ~16MB total VRAM upper bound. No explicit GPU-texture eviction (the
-//     sprite-cache.js LRU caps CPU-side canvases; stale GL textures linger
-//     until context loss or page reload).
+//     (kept in _spriteTexMap). Sprite cache caps at 200 → ≤200 textures
+//     live at steady state, ~16MB total VRAM upper bound.
+//   - GPU-texture eviction: sprite-cache.js invokes the eviction listener
+//     registered in initWebGL when its LRU drops a canvas; we call
+//     gl.deleteTexture on the orphan and remove the _spriteTexMap entry,
+//     so long-session texture turnover doesn't leak GPU/JS memory.
 //   - Per frame: bucket non-absorbing entities by their sprite canvas;
 //     build a per-instance VBO of [x, y, w, h, ox, oy, alpha]; issue one
 //     instanced draw per bucket; if wrap mode is on and the entity
@@ -59,7 +61,7 @@
 //     scaled per setupCanvas in main.js.
 
 import { state } from './state.js';
-import { ensureEntitySprite } from './sprite-cache.js';
+import { ensureEntitySprite, onSpriteEvicted } from './sprite-cache.js';
 import { resolveDisplayColor } from './entities.js';
 import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
@@ -196,10 +198,29 @@ export function initWebGL(canvas) {
   }
   _gl = gl;
 
+  // Hook sprite-cache LRU eviction so we release the matching GL texture
+  // + _spriteTexMap entry instead of letting them linger until context
+  // loss / page refresh. Registered once per initWebGL — listener slot in
+  // sprite-cache is single-valued so re-init (post-context-loss) replaces
+  // any prior closure capturing a stale `_gl`.
+  onSpriteEvicted((canvas) => {
+    const info = _spriteTexMap.get(canvas);
+    if (!info) return;
+    if (_gl && info.tex) _gl.deleteTexture(info.tex);
+    _spriteTexMap.delete(canvas);
+  });
+
   // Listen for context-loss recovery so a GPU hiccup doesn't kill the canvas.
   canvas.addEventListener('webglcontextlost', (e) => {
     e.preventDefault();
     console.warn('[renderer-webgl] context lost');
+    // Null _gl during the lost window so the sprite-eviction listener
+    // (registered above) short-circuits on its `if (_gl && info.tex)` guard
+    // instead of calling deleteTexture on a stale context object. After
+    // contextrestored re-runs initWebGL, _gl is reassigned to the fresh
+    // context, and a new listener closure replaces the stale one in
+    // sprite-cache.js (its slot is single-valued).
+    _gl = null;
     _disabled = true;
   });
   canvas.addEventListener('webglcontextrestored', () => {
