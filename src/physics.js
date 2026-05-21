@@ -421,6 +421,32 @@ function _solvePositionConstraints(count, entities, dt) {
 // Sequential Impulses"; Planck.js's b2ContactSolver::SolveVelocityConstraints.
 const VELOCITY_ITERATIONS = 8;
 
+// Warm-start calibration for persistent (resting) contacts.
+//
+// Bug fix (2026-05-20): on hex-packed clusters straddling the Y wrap edge,
+// vertical jitter would build up substep-after-substep ("逐级递加"). Root
+// cause: the warm-start blindly applied the previous substep's full
+// converged impulse `j_prev`. For a resting contact `j_prev` was sized to
+// resist a large gravity-induced approach velocity, but by the next
+// substep the position solver had already separated the pair — so the
+// fresh approach velocity is small (only the differential-gravity push of
+// one substep). Applying the full `j_prev` to that small approach velocity
+// pushed the pair into a SEPARATING state; the accumulated-impulse clamp
+// (c.normalImpulse ≥ 0) then zeroed the net impulse for that substep,
+// leaving gravity's approach velocity completely unresisted. Position
+// solver then took the hit, and gravity re-injected energy unchecked
+// substep after substep — the runaway loop. Y-axis was hit harder because
+// flat-top hex packing has 4 diagonal contacts per body (large |ny|) vs
+// 2 in-row horizontal contacts (ny=0), so Y has ~4× more constraint
+// pressure than X.
+//
+// Fix: for persistent contacts, store a gravity-calibrated warm-start
+// (sized to resist exactly the next substep's expected approach velocity
+// from differential gravity), with a small floor of j_prev to handle
+// perturbations not captured by the gravity estimate. Fresh collisions
+// still get the full j_prev so they converge in ≤2 iterations as before.
+const WARM_START_PERSIST_FLOOR = 0.10;   // fraction of j_prev kept as floor
+
 function _solveContactVelocities(count) {
   if (count === 0) return;
   const e = state.elasticRestitution;
@@ -674,6 +700,31 @@ export function handleCollisions(entities) {
 // stepPBD (not handleCollisions, because handleCollisions runs BEFORE
 // the solver; we need post-solver impulse values).
 //
+// What we store depends on whether the contact was persistent or fresh:
+//
+//   FRESH (c.wasPersistent === false): the contact came into existence
+//     this substep. Store the full c.normalImpulse so next substep's
+//     warm-start can quickly re-converge if the pair stays in contact.
+//
+//   PERSISTENT (c.wasPersistent === true): the contact has been resting
+//     across substeps. The velocity solver has already driven vN to 0
+//     this substep; the only approach velocity NEXT substep will come
+//     from differential gravity along the normal. Sign convention:
+//     c.nx, c.ny point from a toward b (set in processCollisionPair
+//     as dx/dist where dx = b.x - a.x). The differential acceleration
+//     projected on n̂ is dvn_grav = (b.a - a.a) · n̂ · dt. When
+//     negative, gravity accelerates b TOWARD a (the pair is being
+//     pushed together) and we need a positive push-only impulse to
+//     resist it: jGrav = -dvn_grav / wSum (the conditional negation
+//     enforces ≥ 0). Stored impulse is max(jGrav, c.normalImpulse *
+//     10%) — the 10% floor of the just-converged impulse covers
+//     perturbations the gravity-only estimate misses (third-body
+//     effects, fast geometry changes; ~2-3 SI iterations of
+//     convergence headroom at typical rates). This prevents the
+//     warm-start overshoot → clamp-to-zero → unresisted-gravity
+//     feedback loop that caused escalating Y jitter on hex-packed
+//     clusters straddling the Y wrap edge.
+//
 // Keys with c.normalImpulse ≤ 0 are skipped to prevent unbounded Map
 // growth from transient brushing contacts that didn't accumulate
 // meaningful impulse. Normal direction is stored alongside the
@@ -684,8 +735,35 @@ function _rebuildPrevPairImpulses() {
   for (let k = 0; k < _contactCount; k++) {
     const c = _contacts[k];
     if (c.normalImpulse <= 0) continue;
+
+    let jStore = c.normalImpulse;                  // fresh-collision default
+
+    if (c.wasPersistent) {
+      const a = c.a, b = c.b;
+      const wA = a.pinned ? 0 : 1 / a.mass;
+      const wB = b.pinned ? 0 : 1 / b.mass;
+      const wSum = wA + wB;
+      if (wSum > 0) {
+        // dvn_grav = (b.a - a.a) · n̂ · dt — see the function header for
+        // sign convention. Pinned-body note: a.ax/a.ay (and b.ax/b.ay)
+        // are 0 for any pinned endpoint because step C skips pinned
+        // bodies; the formula correctly treats a pinned endpoint as
+        // contributing zero gravitational delta. Charge-zero bodies
+        // (asymmetric force model) keep whatever asymmetric a was
+        // received in step C — still correct because we use the actual
+        // per-body cached acceleration.
+        const dvn_grav = ((b.ax - a.ax) * c.nx + (b.ay - a.ay) * c.ny) * _currentSimDt;
+        const jGrav = dvn_grav < 0 ? -dvn_grav / wSum : 0;
+        jStore = Math.max(jGrav, c.normalImpulse * WARM_START_PERSIST_FLOOR);
+      }
+      // wSum === 0: both bodies pinned. _solveContactVelocities also
+      // skips (wSum === 0 → `continue`), so the stored impulse is never
+      // applied next substep — benign no-op. Keeping c.normalImpulse
+      // matches what would be written if we lifted the wSum guard.
+    }
+
     _prevPairImpulses.set(_pairKey(c.a, c.b), {
-      j: c.normalImpulse, nx: c.nx, ny: c.ny,
+      j: jStore, nx: c.nx, ny: c.ny,
     });
   }
 }
