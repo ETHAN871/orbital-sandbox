@@ -156,7 +156,13 @@ async function makeGpuBackend(device, wgslSources, onLost) {
         k6.readbackPseudoVels(N),
         k4.readback(),
       ]);
-      return { positions, velocities, nanCount, gpuVel, gpuPV, k4Read };
+      // dispatchedN lets the apply path detect "entities.length changed
+      // between submit and apply" (e.g. input.js push during the awaited
+      // readback, or a prior-substep splice from applyBoundary destroy /
+      // updateAbsorptions). Without it, applyK2OutputToEntities would walk
+      // a NEW entities array with an OLD-sized Float32Array → out-of-range
+      // reads return undefined → entity.x becomes NaN → renderer drops it.
+      return { positions, velocities, nanCount, gpuVel, gpuPV, k4Read, dispatchedN: N };
     })().catch(err => {
       if (teardown) return null;
       if (verbose) console.warn('[physics-backend] readback rejected:', err);
@@ -240,6 +246,28 @@ async function makeGpuBackend(device, wgslSources, onLost) {
         try { k2.destroy(); } catch {}
         try { gravity.destroy(); } catch {}
         onLost({ reason: 'nan-propagation', message: 'GPU produced NaN; restored CPU state' });
+        return;
+      }
+
+      // 2026-05-21 regression fix: entity count can change between the GPU
+      // submit and the awaited readback (input.js pointerup pushes a new
+      // entity in the microtask between submit and the next step's await,
+      // or a prior substep's applyBoundary destroy / updateAbsorptions
+      // spliced). Applying an old-N readback against the new entities array
+      // walks a Float32Array out of range → undefined → NaN positions →
+      // renderer hides the new entity. Symptom user reported: "放置后被
+      // 立刻清除掉". Fall back to a full CPU step this substep; next
+      // submitDispatch picks up the new N. One frame of CPU physics is
+      // a tolerable transient compared to losing the placed entity.
+      if (readback.dispatchedN !== entities.length) {
+        if (verbose) console.info('[physics-backend] entity count change ('
+          + readback.dispatchedN + ' → ' + entities.length + '); CPU step this substep');
+        cpuPrepareFrame(entities);
+        stepPBD(entities, dt);   // no options → full CPU pipeline
+        updateAbsorptions(entities, dt);
+        applyBoundary(entities, viewport, boundaryMode);
+        ensureCapacity(entities);
+        await submitDispatch(entities, dt);
         return;
       }
 
