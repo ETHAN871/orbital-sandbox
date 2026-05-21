@@ -15,7 +15,6 @@
 //     intercept them).
 
 import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
-import { stepPBD, updateAbsorptions, applyBoundary, prepareFrame } from './physics.js';
 import {
   initWebGL,
   drawScene as drawSceneGL,
@@ -26,6 +25,7 @@ import {
 } from './renderer-webgl.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
+import { createBackend } from './physics-backend.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
@@ -46,20 +46,38 @@ window.addEventListener('resize', setupCanvas);
 bindUI();
 attachInput(stageCanvas, _newId => syncFromSelection());
 
+// Phase 1 WebGPU: physics-backend.js selects CPU or WebGPU at startup based
+// on navigator.gpu + URL params (?backend=force-cpu / ?backend=verbose).
+// On `device.lost` the wrapper transparently swaps the active backend to CPU.
+// init() is async — adapter / device / pipeline / priming dispatch — so the
+// RAF loop is kicked off only after the backend resolves.
+const backend = await createBackend();
+await backend.init(state.entities);
+
 let lastTime = performance.now();
 let accumulator = 0;
 requestAnimationFrame(frame);
 
 // ─── Loop ──────────────────────────────────────────────────────────
+// RAF callbacks themselves are synchronous; the substep loop awaits the
+// backend (CPU resolves immediately; GPU awaits the pipelined mapAsync).
+// finally → requestAnimationFrame so a thrown error in runFrame still keeps
+// the loop alive (sliders remain reactive; the user sees the console error
+// rather than a silently frozen canvas).
 function frame(now) {
+  runFrame(now)
+    .catch(err => console.error('[main] frame failed:', err))
+    .finally(() => requestAnimationFrame(frame));
+}
+
+async function runFrame(now) {
   const realDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
   lastTime = now;
 
-  // V8.2: build the Barnes-Hut quadtree and spatial hash once per frame so
-  // all substeps share them. Worth up to 7x savings on tree-build cost at
-  // high substep count. Position drift between substeps is bounded by
-  // SIM_DT * |v| and stays within Verlet's existing integration tolerance.
-  prepareFrame(state.entities);
+  // V8.2 / Phase 1: backend.prepareFrame owns per-frame setup. CPU builds
+  // the Barnes-Hut quadtree; GPU skips it (exact O(N²) on-device). The
+  // spatial hash is built per-substep inside handleCollisions either way.
+  backend.prepareFrame(state.entities);
 
   // Effective time ratio = user's slider value, UNLESS edit mode is active
   // (then a fixed override applies, independent of the slider).
@@ -67,12 +85,12 @@ function frame(now) {
   accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
   let steps = 0;
   while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
-    // PBD: stepPBD now bundles broadphase (handleCollisions) inside its
-    // pipeline so contact detection happens at predicted positions, not
-    // at pre-step ones. main.js only sequences the higher-level phases.
-    stepPBD(state.entities, SIM_DT);
-    updateAbsorptions(state.entities, SIM_DT);
-    applyBoundary(state.entities, state.viewport, state.boundaryMode);
+    // Phase 2 G12 contract: isLast is true on the substep whose completion
+    // ends the current frame's substep loop. Backend uses this to gate the
+    // end-of-frame shadow-buffer copy + mapAsync (active at sub-phase 2e+
+    // when K7 wires in; currently a no-op).
+    const isLast = (accumulator - SIM_DT < SIM_DT) || (steps + 1 >= MAX_SUBSTEPS);
+    await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode, isLast);
     accumulator -= SIM_DT;
     steps++;
   }
@@ -102,7 +120,6 @@ function frame(now) {
   drawUI();
 
   updateEntityCount();
-  requestAnimationFrame(frame);
 }
 
 // ─── Canvas / DPR ──────────────────────────────────────────────────

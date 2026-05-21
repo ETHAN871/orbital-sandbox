@@ -237,67 +237,125 @@ function ensureScratch(n) {
 //     velocity solver now does the job naturally — resting contacts
 //     converge to their equilibrium impulse in 1–2 iterations when
 //     seeded from the previous substep's converged value.
-export function stepPBD(entities, dt) {
+//
+// Phase 1 + Phase 2a WebGPU integration. Optional 3rd arg `options`:
+//   - options.injectedAccels (Float32Array, Phase 1): interleaved (ax,ay)
+//     from K1's readback. When supplied, step B copies into _scratch instead
+//     of running CPU O(N²) computeAccelerations. Phase 1 dispatch model A2.α.
+//   - options.skipKickPredict (bool, Phase 2a): when true, steps B+C+D are
+//     skipped — K2 has already performed gravity kick + position predict on
+//     GPU and written results into entity.{vx, vy, x, y} (read back by
+//     physics-backend.js before this call). Step A (pseudoVel reset) STILL
+//     RUNS because CPU's _solvePositionConstraints (step G) reads entity._pvx
+//     which is a separate memory location from GPU's pseudoVels. Step I
+//     (pinned hard-reset) also always runs so CPU's entity.vx for pinned
+//     matches what K7 would produce. At 2e+ when K6/K7 also move to GPU,
+//     step A could additionally be skipped — revisit then.
+//
+// Backwards-compat: when 3rd arg is undefined, behavior is bit-identical to
+// the main branch (F1 acceptance).
+export function stepPBD(entities, dt, options) {
   const n = entities.length;
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
+
+  const injectedAccels         = options?.injectedAccels;
+  const skipKickPredict        = options?.skipKickPredict === true;
+  // Phase 2g flip: when GPU has run K5 (velocity solver) and K8 (warm-start
+  // rebuild) on the same contact set, skip CPU's F + F' steps. Caller must
+  // have already copied gpuVelScratchBuf → entity.vx/vy before this call.
+  const skipVelocitySolver     = options?.skipVelocitySolver === true;
+  // Phase 2g flip: when GPU has run K6 (position solver) and produced
+  // converged pseudo-velocities, skip CPU's G iteration loop. The _pv → x/y
+  // integration still runs unconditionally so the GPU's converged _pvx/_pvy
+  // are applied to position. Caller must have copied gpuPVScratchBuf →
+  // entity._pvx/_pvy before this call.
+  const skipPositionSolverIter = options?.skipPositionSolverIter === true;
+  // Phase 2g flip companion: when the caller has set entity._pvx/_pvy
+  // from K6's output before this call, skip step A's zero-reset. Otherwise
+  // step A would clobber the GPU-supplied values and the integration step
+  // would see zeros.
+  const skipPseudoVelReset     = options?.skipPseudoVelReset === true;
 
   // Cache dt for processCollisionPair's pre-kick velocity calculation
   // (used by the wasPersistent gate, NOT by any deleted refund code).
   _currentSimDt = dt;
 
   // ── A. Reset pseudo-velocity accumulator (for step G) ──────────
-  for (let i = 0; i < n; i++) {
-    entities[i]._pvx = 0;
-    entities[i]._pvy = 0;
+  // Always runs even when K2 zeroed GPU pseudoVels — CPU's entity._pvx is
+  // a separate JS field that the CPU position solver reads.
+  // Phase 2g flip: skip the reset when the caller has pre-loaded _pv from
+  // K6's output (skipPseudoVelReset). Otherwise the GPU-supplied values
+  // would be clobbered before the integrate step uses them.
+  if (!skipPseudoVelReset) {
+    for (let i = 0; i < n; i++) {
+      entities[i]._pvx = 0;
+      entities[i]._pvy = 0;
+    }
   }
 
-  // ── B. Compute accelerations at current positions ──────────────
-  computeAccelerations(entities, _scratch);
+  if (!skipKickPredict) {
+    // ── B. Compute accelerations at current positions ──────────────
+    if (injectedAccels !== undefined) {
+      for (let i = 0; i < n; i++) {
+        _scratch[i].ax = injectedAccels[i * 2];
+        _scratch[i].ay = injectedAccels[i * 2 + 1];
+      }
+    } else {
+      computeAccelerations(entities, _scratch);
+    }
 
-  // ── C. Gravity kick: v += a · dt ───────────────────────────────
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    const ax = _scratch[i].ax;
-    const ay = _scratch[i].ay;
-    e.vx += ax * dt;
-    e.vy += ay * dt;
-    // Cache a for downstream readers (prediction tooling).
-    e.ax = ax;
-    e.ay = ay;
-  }
+    // ── C. Gravity kick: v += a · dt ───────────────────────────────
+    for (let i = 0; i < n; i++) {
+      const e = entities[i];
+      if (e.pinned || e.absorbing) continue;
+      const ax = _scratch[i].ax;
+      const ay = _scratch[i].ay;
+      e.vx += ax * dt;
+      e.vy += ay * dt;
+      // Cache a for downstream readers (prediction tooling).
+      e.ax = ax;
+      e.ay = ay;
+    }
 
-  // ── D. Predict positions: x += v · dt ──────────────────────────
-  for (let i = 0; i < n; i++) {
-    const e = entities[i];
-    if (e.pinned || e.absorbing) continue;
-    e.x += e.vx * dt;
-    e.y += e.vy * dt;
-  }
+    // ── D. Predict positions: x += v · dt ──────────────────────────
+    for (let i = 0; i < n; i++) {
+      const e = entities[i];
+      if (e.pinned || e.absorbing) continue;
+      e.x += e.vx * dt;
+      e.y += e.vy * dt;
+    }
+  }   // end if (!skipKickPredict)
 
   // ── E. Detect contacts at predicted positions ──────────────────
   // handleCollisions: BH pairs → beginAbsorption immediately.
   // planet-planet pairs → push onto _contacts[] with warm-start lookup.
+  // Still runs even in Phase 2g flip because CPU is the absorption-event
+  // authority until K4 atomicOr lands (see blueprint §11.9 deferrals).
   handleCollisions(entities);
 
-  // ── F. Sequential-Impulses velocity solver (Box2D-style) ───────
-  // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
-  // clamp ≥ 0. Convergence on resting/stacked contacts comes from
-  // the previous substep's seeded normalImpulse.
-  _solveContactVelocities(_contactCount);
+  if (!skipVelocitySolver) {
+    // ── F. Sequential-Impulses velocity solver (Box2D-style) ───────
+    // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
+    // clamp ≥ 0. Convergence on resting/stacked contacts comes from
+    // the previous substep's seeded normalImpulse.
+    _solveContactVelocities(_contactCount);
 
-  // ── F'. Persist this substep's impulses for next substep's warm-start
-  _rebuildPrevPairImpulses();
+    // ── F'. Persist this substep's impulses for next substep's warm-start
+    _rebuildPrevPairImpulses();
+  }
 
   // ── G. Pseudo-velocity NGS position solver (Box2D-style) ───────
   // 3-iter Gauss-Seidel with Baumgarte slop + maxCorrection cap.
-  // Writes to body._pvx/_pvy; integrates into body.x/y at the end
-  // without touching real velocity. This is the key "split impulses"
-  // pattern that prevents position correction from injecting phantom
-  // PE into the gravity field — the failure mode the old _dxGrav
-  // energy-refund pass was patching after the fact.
-  _solvePositionConstraints(_contactCount, entities, dt);
+  // When skipPositionSolverIter is set (Phase 2g flip), K6 already
+  // converged the pseudo-velocities and the caller has copied them to
+  // entity._pvx/_pvy. We then only run the integration step (x += _pv*dt)
+  // — see _integratePseudoVelsOnly below.
+  if (skipPositionSolverIter) {
+    _integratePseudoVelsOnly(entities, dt);
+  } else {
+    _solvePositionConstraints(_contactCount, entities, dt);
+  }
 
   // ── I. Pinned bodies hard-reset ────────────────────────────────
   for (let i = 0; i < n; i++) {
@@ -395,6 +453,20 @@ function _solvePositionConstraints(count, entities, dt) {
 
   // Integrate pseudo-velocity into real position. Real velocity is
   // untouched — this is the whole point of split impulses.
+  for (let i = 0; i < entities.length; i++) {
+    const e = entities[i];
+    if (e.pinned || e.absorbing) continue;
+    e.x += e._pvx * dt;
+    e.y += e._pvy * dt;
+  }
+}
+
+// Phase 2g flip: when K6 converged the pseudo-velocities on GPU and the
+// caller has copied them into entity._pvx/_pvy, we skip the 3-iter NGS
+// loop and only run the integration step. Same semantics as the end of
+// _solvePositionConstraints above — pinned and absorbing entities are
+// skipped so their positions stay frozen.
+function _integratePseudoVelsOnly(entities, dt) {
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.pinned || e.absorbing) continue;
