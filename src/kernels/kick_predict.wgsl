@@ -73,7 +73,15 @@ fn kick_predict(
   let inert = (flags & (FLAG_ABSORBING | FLAG_PINNED)) != 0u;
 
   if (inert) {
-    outPositions[i] = positions[i];
+    // Inert pass-through still NaN-guards the input position (a stale NaN
+    // in positions[] from a prior bad frame would otherwise propagate into
+    // K3's broadphase via outPositions). Reviewer 2b MEDIUM-2 fix.
+    var pInert = positions[i];
+    if (pInert.x != pInert.x || pInert.y != pInert.y) {
+      pInert = vec2f(0.0, 0.0);
+      atomicAdd(&nanCheckBuf[0], 1u);
+    }
+    outPositions[i] = pInert;
     return;
   }
 
