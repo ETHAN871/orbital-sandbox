@@ -237,7 +237,13 @@ function ensureScratch(n) {
 //     velocity solver now does the job naturally — resting contacts
 //     converge to their equilibrium impulse in 1–2 iterations when
 //     seeded from the previous substep's converged value.
-export function stepPBD(entities, dt) {
+//
+// Phase 1 WebGPU integration (architect decision A2.α): optional 3rd arg
+// `injectedAccels` — a Float32Array of interleaved (ax_0, ay_0, ax_1, ay_1, …)
+// from K1's `outputBuf` staging readback. When supplied, step B copies it
+// into `_scratch` instead of running the CPU O(N²) computeAccelerations.
+// `undefined` keeps the CPU path bit-identical to main (F1 acceptance).
+export function stepPBD(entities, dt, injectedAccels) {
   const n = entities.length;
   if (n === 0 || dt === 0) return;
   ensureScratch(n);
@@ -253,7 +259,14 @@ export function stepPBD(entities, dt) {
   }
 
   // ── B. Compute accelerations at current positions ──────────────
-  computeAccelerations(entities, _scratch);
+  if (injectedAccels !== undefined) {
+    for (let i = 0; i < n; i++) {
+      _scratch[i].ax = injectedAccels[i * 2];
+      _scratch[i].ay = injectedAccels[i * 2 + 1];
+    }
+  } else {
+    computeAccelerations(entities, _scratch);
+  }
 
   // ── C. Gravity kick: v += a · dt ───────────────────────────────
   for (let i = 0; i < n; i++) {

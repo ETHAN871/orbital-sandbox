@@ -172,6 +172,11 @@ export const state = {
   // streamlines as a topographic-style "field flow" visualization. Default
   // OFF so the GPU work is fully gated (zero overhead when not displayed).
   showField: false,
+
+  // Active physics backend name — set by physics-backend.js after init.
+  // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
+  // Read-only outside physics-backend.js; useful for HUD/debug displays.
+  backendName: null,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────
