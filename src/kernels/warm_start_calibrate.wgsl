@@ -21,7 +21,11 @@ struct Contact {
   flags: u32, _p0: u32, _p1: u32, _p2: u32,
 }
 struct EntityMeta { mass: f32, chargeF: f32, radius: f32, flags: u32 }
-struct K5aParams { N: u32, contactCount: u32, dt: f32, G: f32 }
+struct PairCellMeta { keyA: u32, keyB: u32, j: f32, nx: f32, ny: f32 }
+struct K5aParams {
+  N: u32, contactCount: u32, dt: f32, G: f32,
+  tableSize: u32, tableMask: u32, _pad0: u32, _pad1: u32,
+}
 
 const FLAG_ABSORBING:  u32 = 1u;
 const FLAG_TOMBSTONE:  u32 = 8u;
@@ -33,7 +37,9 @@ const PERSIST_FLOOR:   f32 = 0.10;
 @group(0) @binding(0) var<storage, read_write> contacts   : array<Contact>;
 @group(0) @binding(1) var<storage, read>       metas      : array<EntityMeta>;
 @group(0) @binding(2) var<storage, read>       maxImpulse : array<i32>;
-@group(0) @binding(3) var<uniform>             params     : K5aParams;
+@group(0) @binding(3) var<storage, read>       pairCellMeta  : array<PairCellMeta>;
+@group(0) @binding(4) var<storage, read>       pairCellFlags : array<u32>;
+@group(0) @binding(5) var<uniform>             params        : K5aParams;
 
 @compute @workgroup_size(256)
 fn warm_start_calibrate(@builtin(global_invocation_id) gid: vec3u) {
@@ -61,8 +67,19 @@ fn warm_start_calibrate(@builtin(global_invocation_id) gid: vec3u) {
 
   var jStore: f32;
   if ((c.flags & CONTACT_PERSIST) != 0u) {
-    // 2f: replace 0.0 with pairImpulseTable lookup for j_prev.
-    let jPrev = 0.0;
+    // 2g — pairImpulseTable lookup (was literal 0.0 in 2d/2e/2f). Uses K8's
+    // hash from the previous substep. Identical hash + probe to K8 in
+    // rebuild_warm_start.wgsl. Miss → jPrev = 0 (cold-start path).
+    let lo = min(c.idxA, c.idxB);
+    let hi = max(c.idxA, c.idxB);
+    let hash = (lo * 1000003u) ^ (hi * 999983u);
+    var jPrev: f32 = 0.0;
+    for (var probe: u32 = 0u; probe < 8u; probe = probe + 1u) {
+      let slot = (hash + probe) & params.tableMask;
+      if ((pairCellFlags[slot] & 1u) == 0u) { break; }   // empty → miss
+      let m = pairCellMeta[slot];
+      if (m.keyA == lo && m.keyB == hi) { jPrev = m.j; break; }
+    }
     jStore = max(jGrav, jPrev * PERSIST_FLOOR);
   } else {
     let seedA = bitcast<f32>(maxImpulse[c.idxA]);

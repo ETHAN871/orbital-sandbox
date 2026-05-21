@@ -80,9 +80,9 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     k3c: wgslSources.k3c,
   }, gravity, k2);
   const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase);
-  const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4);
-  const k6 = await createK6GPU(device, wgslSources.k6, gravity, k2, k4);
   const k8 = await createK8GPU(device, wgslSources.k8, gravity, k4);
+  const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4, k8);
+  const k6 = await createK6GPU(device, wgslSources.k6, gravity, k2, k4);
   const verbose = isVerbose();
   let lastGridMeta = null;
   let prevContactCount = 32;   // blueprint §3.2 cold-start seed → 8 iters initially
@@ -170,9 +170,11 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     if (bpRealloc) k4.onBroadphaseRealloc();
     const k4Realloc = k4.growIfNeeded(N);
     if (k4Realloc) { k5.onK4Realloc(); k6.onK4Realloc(); k8.onK4Realloc(); }
-    const k5Realloc = k5.growIfNeeded(N);
-    const k6Realloc = k6.growIfNeeded(N);
+    // K8 grows BEFORE K5 so K5's bind group references fresh K8 buffers.
     const k8Realloc = k8.growIfNeeded(N);
+    const k5Realloc = k5.growIfNeeded(N);
+    if (k8Realloc && !k5Realloc) k5.onK8Realloc();   // K5a binds K8 table; rebuild if K5 didn't already
+    const k6Realloc = k6.growIfNeeded(N);
     if (gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc || k8Realloc) pendingReadback = null;
     return gravityRealloc || k2Realloc || bpRealloc || k4Realloc || k5Realloc || k6Realloc || k8Realloc;
   }

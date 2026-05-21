@@ -3,18 +3,20 @@
 // CPU stepPBD's velocity solver still authoritative until 2g flip.
 
 const WORKGROUP = 256;
-const K5A_PARAMS_SIZE = 16;
+const K5A_PARAMS_SIZE = 32;    // 8 × u32 — 2g: + tableSize, tableMask, 2×pad
 const K5_PARAMS_SIZE  = 16;
 
-export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle) {
+export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, k8Handle) {
   const modK5a = device.createShaderModule({ label: 'K5a', code: wgslSources.k5a });
   const modK5  = device.createShaderModule({ label: 'K5',  code: wgslSources.k5  });
 
   const k5aLayout = device.createBindGroupLayout({ label: 'K5a bgl', entries: [
-    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // contacts (rw)
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // metas
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // maxImpulse
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // pairCellMeta (K8 output)
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // pairCellFlags (K8 output)
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
   ]});
   const k5Layout = device.createBindGroupLayout({ label: 'K5 bgl', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -70,7 +72,9 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle) 
       { binding: 0, resource: { buffer: k4Handle.contactsBuf } },
       { binding: 1, resource: { buffer: gravityHandle.metasBuf } },
       { binding: 2, resource: { buffer: k4Handle.maxImpulseBuf } },
-      { binding: 3, resource: { buffer: k5aParamsBuf } },
+      { binding: 3, resource: { buffer: k8Handle.cellMetaBuf } },
+      { binding: 4, resource: { buffer: k8Handle.cellFlagsBuf } },
+      { binding: 5, resource: { buffer: k5aParamsBuf } },
     ]});
     bgK5 = device.createBindGroup({ label: 'K5 bg', layout: k5Layout, entries: [
       { binding: 0, resource: { buffer: k4Handle.contactsBuf } },
@@ -95,6 +99,12 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle) 
     k5aView.setUint32 ( 4, contactCount >>> 0, true);
     k5aView.setFloat32( 8, dt, true);
     k5aView.setFloat32(12, G, true);
+    // 2g: tableSize/tableMask for pairImpulseTable lookup.
+    const ts = k8Handle.tableSize;
+    k5aView.setUint32 (16, ts >>> 0, true);
+    k5aView.setUint32 (20, (ts > 0 ? ts - 1 : 0) >>> 0, true);
+    k5aView.setUint32 (24, 0, true);
+    k5aView.setUint32 (28, 0, true);
     device.queue.writeBuffer(k5aParamsBuf, 0, k5aScratch, 0, K5A_PARAMS_SIZE);
     k5View.setUint32 ( 0, N >>> 0, true);
     k5View.setUint32 ( 4, contactCount >>> 0, true);
@@ -132,6 +142,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle) 
     growIfNeeded, uploadParams, recordDispatch,
     onGravityRealloc() { if (capacity > 0) rebuildBindGroups(); },
     onK4Realloc()      { if (capacity > 0) rebuildBindGroups(); },
+    onK8Realloc()      { if (capacity > 0) rebuildBindGroups(); },
     destroy,
     get capacity() { return capacity; },
     get gpuVelScratchBuf() { return gpuVelScratchBuf; },
