@@ -50,15 +50,10 @@ function _recordEnergy(stage, entities, extra) {
   if (led.length >= __LEDGER_MAX) return;
   if (stage === 'ENTRY') __ledgerSubstepIdx++;
   const N = entities.length;
-  let KE = 0, Mtot = 0, Px = 0, Py = 0, Cx = 0, Cy = 0;
+  let KE = 0;
   for (let i = 0; i < N; i++) {
     const e = entities[i];
     KE += 0.5 * e.mass * (e.vx * e.vx + e.vy * e.vy);
-    Mtot += e.mass;
-    Px += e.mass * e.vx;
-    Py += e.mass * e.vy;
-    Cx += e.mass * e.x;
-    Cy += e.mass * e.y;
   }
   const G = state.G;
   const eps = state.effectiveEpsilon || state.epsilon;
@@ -76,12 +71,7 @@ function _recordEnergy(stage, entities, extra) {
       PE += -a.charge * b.charge * G * a.mass * b.mass / r;
     }
   }
-  const entry = {
-    substep: __ledgerSubstepIdx, stage, KE, PE, total: KE + PE, N,
-    Px, Py,                           // total linear momentum
-    Cx: Mtot > 0 ? Cx / Mtot : 0,     // CoM position
-    Cy: Mtot > 0 ? Cy / Mtot : 0,
-  };
+  const entry = { substep: __ledgerSubstepIdx, stage, KE, PE, total: KE + PE, N };
   if (extra) Object.assign(entry, extra);
   led.push(entry);
 }
