@@ -17,7 +17,7 @@
 // the far side, and dx/dy are min-image-corrected so the caller sees the
 // short-way delta.
 
-import { state } from './state.js?v=ovl1';
+import { state } from './state.js';
 
 // Per-axis cell size so cells exactly tile the viewport (no overflow).
 // See buildSpatialHash for the rationale — Y wrap-neighbor miss fix.

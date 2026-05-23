@@ -16,7 +16,7 @@
 // regardless of which backend is active. On `device.lost`, the wrapper
 // transparently swaps the active backend to CPU; no caller-side coordination.
 
-import { state } from './state.js?v=ovl1';
+import { state } from './state.js';
 import {
   prepareFrame as cpuPrepareFrame,
   stepPBD,

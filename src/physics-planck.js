@@ -16,7 +16,7 @@
 // untouched between stages.
 
 import * as pl from 'planck';
-import { state } from './state.js?v=ovl1';
+import { state } from './state.js';
 import { updateAbsorptions, applyBoundary } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';

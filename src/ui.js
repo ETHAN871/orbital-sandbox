@@ -11,7 +11,7 @@ import {
   state, DEFAULTS, DEFAULTS_TUNING,
   BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
-} from './state.js?v=ovl1';
+} from './state.js';
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
 import { clearContactState } from './physics.js';

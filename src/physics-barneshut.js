@@ -40,7 +40,7 @@
 //   the trade-off.
 
 import { quadtree } from 'd3-quadtree';
-import { state } from './state.js?v=ovl1';
+import { state } from './state.js';
 // V8.1c: G and EPSILON are now state fields (state.G, state.epsilon).
 // We read them once at computeAccelerationsBH entry into module-level
 // shadows so the recursive accumulate() inner loop hits locals.

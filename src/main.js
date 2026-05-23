@@ -14,7 +14,7 @@
 //   - Pointer events go straight to #stage (no separate overlay canvas to
 //     intercept them).
 
-import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js?v=ovl1';
+import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
 import {
   initWebGL,
   drawScene as drawSceneGL,

@@ -60,7 +60,7 @@
 //   - gl.viewport(0, 0, W*DPR, H*DPR) every frame; backing store is DPR-
 //     scaled per setupCanvas in main.js.
 
-import { state } from './state.js?v=ovl1';
+import { state } from './state.js';
 import { ensureEntitySprite, onSpriteEvicted } from './sprite-cache.js';
 import { resolveDisplayColor } from './entities.js';
 import {

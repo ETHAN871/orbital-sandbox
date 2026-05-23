@@ -1,7 +1,7 @@
 // entities.js — Entity factory and color rules.
 // Entities are plain objects (no class). Schema documented in state.js.
 
-import { nextEntityId } from './state.js?v=ovl1';
+import { nextEntityId } from './state.js';
 
 // ─── Color rules ──────────────────────────────────────────────────
 // Planets get a vivid random color (chosen once at creation).
