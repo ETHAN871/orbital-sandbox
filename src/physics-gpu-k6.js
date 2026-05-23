@@ -15,6 +15,7 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // K4 contactCount (live)
   ]});
 
   const [pipeAccum, pipeApply] = await Promise.all([
@@ -63,6 +64,7 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
       { binding: 3, resource: { buffer: pvDeltaBuf } },
       { binding: 4, resource: { buffer: gravityHandle.metasBuf } },
       { binding: 5, resource: { buffer: paramsBuf } },
+      { binding: 6, resource: { buffer: k4Handle.contactCountBuf } },
     ]});
   }
 
@@ -83,24 +85,27 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
     device.queue.writeBuffer(paramsBuf, 0, scratch, 0, K6_PARAMS_SIZE);
   }
 
-  function recordDispatch(encoder, N, contactCount) {
+  function recordDispatch(encoder, N, _ignoredPrevContactCount) {
     if (N === 0) return;
     // ALWAYS seed scratch from K2's zeroed pseudoVels and stage to staging.
     // Backend reads back unconditionally; without this copy, no-contact
     // substeps would readback stale/zero-init data and clobber entities.
     encoder.copyBufferToBuffer(k2Handle.pseudoVelsBuf, 0, gpuPVScratchBuf, 0, N * 8);
-    if (contactCount > 0) {
-      const cWg = Math.ceil(contactCount / WORKGROUP);
-      const eWg = Math.ceil(N / WORKGROUP);
-      encoder.clearBuffer(pvDeltaBuf, 0, capacity * 2 * 4);
-      for (let iter = 0; iter < POS_ITERATIONS; iter++) {
-        { const p = encoder.beginComputePass({ label: 'K6 accum' });
-          p.setPipeline(pipeAccum); p.setBindGroup(0, bindGroup);
-          p.dispatchWorkgroups(cWg); p.end(); }
-        { const p = encoder.beginComputePass({ label: 'K6 apply' });
-          p.setPipeline(pipeApply); p.setBindGroup(0, bindGroup);
-          p.dispatchWorkgroups(eWg); p.end(); }
-      }
+    // bug-fix-2026-05-23: same fix as K5 — always dispatch with safe upper
+    // bound (k4Handle.capacity * 3 contact slots), let WGSL bounds-check
+    // against K4's live contactCount[0]. Prevents 1-substep lag for new
+    // contacts and prevents stale-slot processing for ended contacts.
+    const safeMaxContacts = k4Handle.capacity * 3;
+    const cWg = Math.ceil(safeMaxContacts / WORKGROUP);
+    const eWg = Math.ceil(N / WORKGROUP);
+    encoder.clearBuffer(pvDeltaBuf, 0, capacity * 2 * 4);
+    for (let iter = 0; iter < POS_ITERATIONS; iter++) {
+      { const p = encoder.beginComputePass({ label: 'K6 accum' });
+        p.setPipeline(pipeAccum); p.setBindGroup(0, bindGroup);
+        p.dispatchWorkgroups(cWg); p.end(); }
+      { const p = encoder.beginComputePass({ label: 'K6 apply' });
+        p.setPipeline(pipeApply); p.setBindGroup(0, bindGroup);
+        p.dispatchWorkgroups(eWg); p.end(); }
     }
     encoder.copyBufferToBuffer(gpuPVScratchBuf, 0, pvStagingBuf, 0, N * 8);
   }

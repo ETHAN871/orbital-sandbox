@@ -61,7 +61,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
   function allocateBuffers(cap) {
     destroyOwn();
     capacity = cap;
-    contactsBuf     = device.createBuffer({ label: 'contacts',     size: cap * 3 * CONTACT_STRIDE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    contactsBuf     = device.createBuffer({ label: 'contacts',     size: cap * 3 * CONTACT_STRIDE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     contactCountBuf = device.createBuffer({ label: 'contactCount', size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     maxImpulseBuf   = device.createBuffer({ label: 'maxImpulse',   size: cap * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     rebuildBindGroup();
@@ -112,6 +112,15 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     encoder.clearBuffer(contactCountBuf, 0, 4);
     encoder.clearBuffer(absHeadBuf,      0, 4);
     encoder.clearBuffer(maxImpulseBuf,   0, capacity * 4);
+    // bug-fix-2026-05-23: also clear the contacts buffer itself. K4
+    // atomicAdd-writes contacts[0..currentCount); slots beyond that hold
+    // STALE data from previous substeps. K5/K6/K8 over-dispatch to a
+    // safe upper bound (live count read from contactCountBuf in WGSL),
+    // and any worker indexing a stale slot would feed garbage into the
+    // solver. Clearing zero-inits everything: dist=0 → solvers'
+    // dist²<1e-12 guard early-returns. Cost: capacity * 144 bytes per
+    // substep — negligible (e.g. capacity=1024 → 144KB clear).
+    encoder.clearBuffer(contactsBuf, 0, capacity * 3 * CONTACT_STRIDE);
     const pass = encoder.beginComputePass({ label: 'K4 contact_detect' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);

@@ -40,11 +40,13 @@ const PERSIST_FLOOR:   f32 = 0.10;
 @group(0) @binding(3) var<storage, read>       pairCellMeta  : array<PairCellMeta>;
 @group(0) @binding(4) var<storage, read>       pairCellFlags : array<u32>;
 @group(0) @binding(5) var<uniform>             params        : K5aParams;
+// bug-fix-2026-05-23: live contact count from K4. See velocity_solver.wgsl.
+@group(0) @binding(6) var<storage, read>       contactCount  : array<u32, 1>;
 
 @compute @workgroup_size(256)
 fn warm_start_calibrate(@builtin(global_invocation_id) gid: vec3u) {
   let t = gid.x;
-  if (t >= params.contactCount) { return; }
+  if (t >= contactCount[0]) { return; }
   let c = contacts[t];
   let miA = metas[c.idxA];
   let miB = metas[c.idxB];

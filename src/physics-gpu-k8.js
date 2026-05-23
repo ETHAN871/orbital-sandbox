@@ -33,6 +33,7 @@ export async function createK8GPU(device, wgslSource, gravityHandle, k4Handle) {
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // cellFlags (atomic)
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // statusFlags (atomic)
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },           // params
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // K4 contactCount (live)
   ]});
 
   const pipeline = await device.createComputePipelineAsync({
@@ -82,6 +83,7 @@ export async function createK8GPU(device, wgslSource, gravityHandle, k4Handle) {
       { binding: 3, resource: { buffer: cellFlagsBuf } },
       { binding: 4, resource: { buffer: statusFlagBuf } },
       { binding: 5, resource: { buffer: paramsBuf } },
+      { binding: 6, resource: { buffer: k4Handle.contactCountBuf } },
     ]});
   }
 
@@ -106,15 +108,18 @@ export async function createK8GPU(device, wgslSource, gravityHandle, k4Handle) {
     device.queue.writeBuffer(paramsBuf, 0, scratch, 0, K8_PARAMS_SIZE);
   }
 
-  function recordDispatch(encoder, contactCount) {
-    if (contactCount === 0 || tableSize === 0) return;
+  function recordDispatch(encoder, _ignoredPrevContactCount) {
+    if (tableSize === 0) return;
     // §3 K8 ¶: zero all occupancy bits each substep (no tombstone).
     encoder.clearBuffer(cellFlagsBuf, 0, tableSize * 4);
     encoder.clearBuffer(statusFlagBuf, 0, 4);
+    // bug-fix-2026-05-23: dispatch with safe upper bound; WGSL bounds-checks
+    // K4's live contactCount[0]. Drops the prev-stale dispatch sizing.
+    const safeMaxContacts = k4Handle.capacity * 3;
     const pass = encoder.beginComputePass({ label: 'K8 rebuild_warm_start' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(contactCount / WORKGROUP));
+    pass.dispatchWorkgroups(Math.ceil(safeMaxContacts / WORKGROUP));
     pass.end();
     encoder.copyBufferToBuffer(statusFlagBuf, 0, statusStaging, 0, 4);
   }

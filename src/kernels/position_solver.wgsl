@@ -30,17 +30,19 @@ const FLAG_ABSORBING: u32 = 1u;
 const FLAG_TOMBSTONE: u32 = 8u;
 const FLAG_PINNED:    u32 = 2u;
 
-@group(0) @binding(0) var<storage, read>       contacts   : array<Contact>;
-@group(0) @binding(1) var<storage, read>       positions  : array<vec2f>;
-@group(0) @binding(2) var<storage, read_write> pseudoVels : array<vec2f>;
-@group(0) @binding(3) var<storage, read_write> pvDelta    : array<atomic<i32>>;
-@group(0) @binding(4) var<storage, read>       metas      : array<EntityMeta>;
-@group(0) @binding(5) var<uniform>             params     : K6Params;
+@group(0) @binding(0) var<storage, read>       contacts     : array<Contact>;
+@group(0) @binding(1) var<storage, read>       positions    : array<vec2f>;
+@group(0) @binding(2) var<storage, read_write> pseudoVels   : array<vec2f>;
+@group(0) @binding(3) var<storage, read_write> pvDelta      : array<atomic<i32>>;
+@group(0) @binding(4) var<storage, read>       metas        : array<EntityMeta>;
+@group(0) @binding(5) var<uniform>             params       : K6Params;
+// bug-fix-2026-05-23: live contact count from K4. See velocity_solver.wgsl.
+@group(0) @binding(6) var<storage, read>       contactCount : array<u32, 1>;
 
 @compute @workgroup_size(256)
 fn ps_accumulate(@builtin(global_invocation_id) gid: vec3u) {
   let t = gid.x;
-  if (t >= params.contactCount) { return; }
+  if (t >= contactCount[0]) { return; }
   let c   = contacts[t];
   let miA = metas[c.idxA];
   let miB = metas[c.idxB];

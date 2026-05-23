@@ -17,6 +17,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // pairCellMeta (K8 output)
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // pairCellFlags (K8 output)
     { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // K4 contactCount (live)
   ]});
   const k5Layout = device.createBindGroupLayout({ label: 'K5 bgl', entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -24,6 +25,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // K4 contactCount (live)
   ]});
 
   const [pipeK5a, pipeAccum, pipeApply] = await Promise.all([
@@ -78,6 +80,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
       { binding: 3, resource: { buffer: k8Handle.cellMetaBuf } },
       { binding: 4, resource: { buffer: k8Handle.cellFlagsBuf } },
       { binding: 5, resource: { buffer: k5aParamsBuf } },
+      { binding: 6, resource: { buffer: k4Handle.contactCountBuf } },
     ]});
     bgK5 = device.createBindGroup({ label: 'K5 bg', layout: k5Layout, entries: [
       { binding: 0, resource: { buffer: k4Handle.contactsBuf } },
@@ -85,6 +88,7 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
       { binding: 2, resource: { buffer: velDeltaBuf } },
       { binding: 3, resource: { buffer: gravityHandle.metasBuf } },
       { binding: 4, resource: { buffer: k5ParamsBuf } },
+      { binding: 5, resource: { buffer: k4Handle.contactCountBuf } },
     ]});
   }
 
@@ -116,29 +120,35 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     device.queue.writeBuffer(k5ParamsBuf, 0, k5Scratch, 0, K5_PARAMS_SIZE);
   }
 
-  function recordDispatch(encoder, N, contactCount, iterCount) {
+  function recordDispatch(encoder, N, _ignoredPrevContactCount, iterCount) {
     if (N === 0) return;
-    // ALWAYS seed scratch from K2's post-kick velocity. Even when there are
-    // no contacts (contactCount===0), the backend reads back this staging
-    // buffer and applies it to entities — without this copy the buffer
-    // would hold stale/zero data and the readback would clobber the
-    // entities' velocities. Phase 2g flip correctness.
+    // ALWAYS seed scratch from K2's post-kick velocity. Backend reads back
+    // staging unconditionally; without this copy, no-contact substeps would
+    // readback stale/zero-init data and clobber entities' velocities.
     encoder.copyBufferToBuffer(gravityHandle.velocitiesBuf, 0, gpuVelScratchBuf, 0, N * 8);
-    if (contactCount > 0) {
-      const cWg = Math.ceil(contactCount / WORKGROUP);
-      const eWg = Math.ceil(N / WORKGROUP);
-      encoder.clearBuffer(velDeltaBuf, 0, capacity * 2 * 4);
-      { const p = encoder.beginComputePass({ label: 'K5a' });
-        p.setPipeline(pipeK5a); p.setBindGroup(0, bgK5a);
+    // bug-fix-2026-05-23: ALWAYS dispatch (even if prev=0 contacts). K4
+    // writes the current contactCount to GPU memory before K5 runs; WGSL
+    // bounds-check (`t >= contactCount[0]`) reads it dynamically so workers
+    // beyond the live count early-return. Dispatch size is a safe upper
+    // bound based on K4's contact buffer capacity. Previously we used the
+    // 1-substep-stale prevContactCount which caused: (a) new contacts
+    // skipped if prev<current → 1-substep lag, (b) stale slots processed
+    // if prev>current → spurious impulses. Both manifested as the user-
+    // visible "bodies drift into overlap before bouncing apart."
+    const safeMaxContacts = k4Handle.capacity * 3;
+    const cWg = Math.ceil(safeMaxContacts / WORKGROUP);
+    const eWg = Math.ceil(N / WORKGROUP);
+    encoder.clearBuffer(velDeltaBuf, 0, capacity * 2 * 4);
+    { const p = encoder.beginComputePass({ label: 'K5a' });
+      p.setPipeline(pipeK5a); p.setBindGroup(0, bgK5a);
+      p.dispatchWorkgroups(cWg); p.end(); }
+    for (let iter = 0; iter < iterCount; iter++) {
+      { const p = encoder.beginComputePass({ label: 'K5 accum' });
+        p.setPipeline(pipeAccum); p.setBindGroup(0, bgK5);
         p.dispatchWorkgroups(cWg); p.end(); }
-      for (let iter = 0; iter < iterCount; iter++) {
-        { const p = encoder.beginComputePass({ label: 'K5 accum' });
-          p.setPipeline(pipeAccum); p.setBindGroup(0, bgK5);
-          p.dispatchWorkgroups(cWg); p.end(); }
-        { const p = encoder.beginComputePass({ label: 'K5 apply' });
-          p.setPipeline(pipeApply); p.setBindGroup(0, bgK5);
-          p.dispatchWorkgroups(eWg); p.end(); }
-      }
+      { const p = encoder.beginComputePass({ label: 'K5 apply' });
+        p.setPipeline(pipeApply); p.setBindGroup(0, bgK5);
+        p.dispatchWorkgroups(eWg); p.end(); }
     }
     encoder.copyBufferToBuffer(gpuVelScratchBuf, 0, velStagingBuf, 0, N * 8);
   }

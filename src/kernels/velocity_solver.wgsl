@@ -33,16 +33,21 @@ const FLAG_TOMBSTONE:  u32 = 8u;
 const FLAG_PINNED:     u32 = 2u;
 const CONTACT_PERSIST: u32 = 1u;
 
-@group(0) @binding(0) var<storage, read_write> contacts   : array<Contact>;
-@group(0) @binding(1) var<storage, read_write> velocities : array<vec2f>;
-@group(0) @binding(2) var<storage, read_write> velDelta   : array<atomic<i32>>;
-@group(0) @binding(3) var<storage, read>       metas      : array<EntityMeta>;
-@group(0) @binding(4) var<uniform>             params     : K5Params;
+@group(0) @binding(0) var<storage, read_write> contacts     : array<Contact>;
+@group(0) @binding(1) var<storage, read_write> velocities   : array<vec2f>;
+@group(0) @binding(2) var<storage, read_write> velDelta     : array<atomic<i32>>;
+@group(0) @binding(3) var<storage, read>       metas        : array<EntityMeta>;
+@group(0) @binding(4) var<uniform>             params       : K5Params;
+// bug-fix-2026-05-23: live contact count from K4 (same substep). Replaces
+// params.contactCount which was 1-substep-stale (prevContactCount), causing
+// K5 to process old contacts that K4 didn't actually detect this substep
+// → visible collision-response lag.
+@group(0) @binding(5) var<storage, read>       contactCount : array<u32, 1>;
 
 @compute @workgroup_size(256)
 fn vs_accumulate(@builtin(global_invocation_id) gid: vec3u) {
   let t = gid.x;
-  if (t >= params.contactCount) { return; }
+  if (t >= contactCount[0]) { return; }
   let c   = contacts[t];
   let miA = metas[c.idxA];
   let miB = metas[c.idxB];
