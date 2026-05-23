@@ -26,6 +26,7 @@ import {
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 import { createBackend } from './physics-backend.js';
+import { createFpsMeter } from './fps-meter.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
@@ -56,6 +57,7 @@ await backend.init(state.entities);
 
 let lastTime = performance.now();
 let accumulator = 0;
+const fpsMeter = createFpsMeter();   // bottom-right widget + RAF-delta EWMA cross-check
 requestAnimationFrame(frame);
 
 // ─── Loop ──────────────────────────────────────────────────────────
@@ -65,9 +67,13 @@ requestAnimationFrame(frame);
 // the loop alive (sliders remain reactive; the user sees the console error
 // rather than a silently frozen canvas).
 function frame(now) {
+  fpsMeter.begin();
   runFrame(now)
     .catch(err => console.error('[main] frame failed:', err))
-    .finally(() => requestAnimationFrame(frame));
+    .finally(() => {
+      fpsMeter.end();
+      requestAnimationFrame(frame);
+    });
 }
 
 async function runFrame(now) {
