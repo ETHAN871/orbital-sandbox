@@ -74,13 +74,15 @@ export class AdaptiveOverlapManager {
     return [vi, pi];
   }
 
-  recordPostStep(world) {
+  // Engine-agnostic: caller passes the number of touching contact pairs
+  // computed this step. planck path uses world.getContactList() +
+  // isTouching(); rapier path iterates world.contactPairsWith.
+  // The state machine here doesn't care which engine produced the
+  // count — that's how the manager stays portable.
+  recordPostStep(touchingCount) {
     const threshold = this._state.overlapEscalateThreshold;
     const cooldown  = this._state.overlapCooldownFrames;
-    let count = 0;
-    for (let c = world.getContactList(); c; c = c.getNext()) {
-      if (c.isTouching()) count++;
-    }
+    const count = touchingCount | 0;
     this._liveTouchingCount = count;
     if (count > threshold) {
       this._cooldownRemaining = cooldown;

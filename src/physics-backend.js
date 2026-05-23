@@ -411,28 +411,44 @@ export async function createBackend() {
     async init(entities) {
       if (initialized) return;
       initialized = true;
-      // Engine selection (post-2026-05-23 stage 1 ship):
+      // Engine selection (post-2026-05-23 evening):
       //   ?engine=cpu    → legacy hand-ported Box2D-style PBD (physics.js)
       //   ?engine=webgpu → legacy K1-K8 GPU pipeline (physics-gpu-*.js)
+      //   ?engine=rapier → Rapier2D backend (physics-rapier.js)
+      //                   ⚠ WIP — integration still has a "bodies not
+      //                   stepped" trap under investigation. Opt-in for
+      //                   developer testing only. See task #87 in tracker.
       //   default OR ?engine=planck → planck.js backend (physics-planck.js)
-      // Planck is now the default — it has CCD/TOI which fixes the dense-
-      // cluster bug at high mass / small radius that K1-K8 couldn't handle.
-      // Legacy backends stay in tree for opt-in regression testing.
+      // Planck remains the production default while the Rapier swap is
+      // being debugged. Once rapier works end-to-end it will become
+      // default; the wrap-bug fix (destroy+recreate on teleport) is
+      // already implemented inside physics-rapier.js for that day.
       const params = new URLSearchParams(window.location.search);
       const engineParam = params.get('engine');
-      const wantPlanck = engineParam === 'planck' || (engineParam === null && params.get('backend') !== 'force-cpu');
-      let usingPlanck = false;
-      if (wantPlanck) {
+      const wantRapier = engineParam === 'rapier';
+      const wantPlanck = engineParam === 'planck' ||
+        (engineParam === null && params.get('backend') !== 'force-cpu');
+      let usingExternalEngine = false;
+      if (wantRapier) {
+        try {
+          const { makeRapierBackend } = await import('./physics-rapier.js');
+          active = makeRapierBackend();
+          await active.init(entities);
+          usingExternalEngine = true;
+        } catch (e) {
+          console.warn('[physics-backend] rapier init failed; falling back:', e);
+        }
+      } else if (wantPlanck) {
         try {
           const { makePlanckBackend } = await import('./physics-planck.js');
           active = makePlanckBackend();
           await active.init(entities);
-          usingPlanck = true;
+          usingExternalEngine = true;
         } catch (e) {
-          console.warn('[physics-backend] planck init failed; falling back to legacy backend:', e);
+          console.warn('[physics-backend] planck init failed; falling back:', e);
         }
       }
-      const onGpu = usingPlanck ? false : await tryInitGpu(entities);
+      const onGpu = usingExternalEngine ? false : await tryInitGpu(entities);
       state.backendName = active.name;
       if (isVerbose()) console.info('[physics-backend] active:', active.name, '(gpu init:', onGpu, ')');
     },

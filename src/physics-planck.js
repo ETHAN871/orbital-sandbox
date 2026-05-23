@@ -401,7 +401,11 @@ export function makePlanckBackend() {
 
       const [velIter, posIter] = overlapMgr.decideIterations();
       world.step(dt, velIter, posIter);
-      overlapMgr.recordPostStep(world);
+      let touchingCount = 0;
+      for (let c = world.getContactList(); c; c = c.getNext()) {
+        if (c.isTouching()) touchingCount++;
+      }
+      overlapMgr.recordPostStep(touchingCount);
 
       pullBodyStateToEntities(entities);
 

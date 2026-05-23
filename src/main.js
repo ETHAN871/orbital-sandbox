@@ -85,8 +85,6 @@ async function runFrame(now) {
   // spatial hash is built per-substep inside handleCollisions either way.
   backend.prepareFrame(state.entities);
 
-  // Effective time ratio = user's slider value, UNLESS edit mode is active
-  // (then a fixed override applies, independent of the slider).
   const effectiveRatio = state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale;
   accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
   let steps = 0;
