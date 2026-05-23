@@ -79,7 +79,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     k3b: wgslSources.k3b,
     k3c: wgslSources.k3c,
   }, gravity, k2);
-  const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase);
+  const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase, wgslSources.k4post);
   const k8 = await createK8GPU(device, wgslSources.k8, gravity, k4);
   const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4, k8);
   const k6 = await createK6GPU(device, wgslSources.k6, gravity, k2, k4);
@@ -356,19 +356,20 @@ export async function createBackend() {
     let wgslSources;
     try {
       // Phase 2a-2f: + K8 rebuild_warm_start.
-      const [k1, k2, k3, k3b, k3c, k4, k5a, k5, k6, k8] = await Promise.all([
+      const [k1, k2, k3, k3b, k3c, k4, k4post, k5a, k5, k6, k8] = await Promise.all([
         loadKernel('./kernels/gravity_accel.wgsl'),
         loadKernel('./kernels/kick_predict.wgsl'),
         loadKernel('./kernels/broadphase_count.wgsl'),
         loadKernel('./kernels/broadphase_prefix_sum.wgsl'),
         loadKernel('./kernels/broadphase_scatter.wgsl'),
         loadKernel('./kernels/contact_detect.wgsl'),
+        loadKernel('./kernels/compute_dispatch_args.wgsl'),
         loadKernel('./kernels/warm_start_calibrate.wgsl'),
         loadKernel('./kernels/velocity_solver.wgsl'),
         loadKernel('./kernels/position_solver.wgsl'),
         loadKernel('./kernels/rebuild_warm_start.wgsl'),
       ]);
-      wgslSources = { k1, k2, k3, k3b, k3c, k4, k5a, k5, k6, k8 };
+      wgslSources = { k1, k2, k3, k3b, k3c, k4, k4post, k5a, k5, k6, k8 };
     } catch (e) {
       if (isVerbose()) console.warn('[physics-backend] loadKernel failed:', e);
       detection.device.destroy();

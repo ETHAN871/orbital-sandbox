@@ -113,13 +113,11 @@ export async function createK8GPU(device, wgslSource, gravityHandle, k4Handle) {
     // §3 K8 ¶: zero all occupancy bits each substep (no tombstone).
     encoder.clearBuffer(cellFlagsBuf, 0, tableSize * 4);
     encoder.clearBuffer(statusFlagBuf, 0, 4);
-    // bug-fix-2026-05-23: dispatch with safe upper bound; WGSL bounds-checks
-    // K4's live contactCount[0]. Drops the prev-stale dispatch sizing.
-    const safeMaxContacts = k4Handle.capacity * 3;
+    // Indirect dispatch — see K5 for rationale.
     const pass = encoder.beginComputePass({ label: 'K8 rebuild_warm_start' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(safeMaxContacts / WORKGROUP));
+    pass.dispatchWorkgroupsIndirect(k4Handle.dispatchArgsBuf, 0);
     pass.end();
     encoder.copyBufferToBuffer(statusFlagBuf, 0, statusStaging, 0, 4);
   }

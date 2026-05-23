@@ -11,8 +11,13 @@ const K4_PARAMS_SIZE   = 32;
 const STATUS_ABS_OVERFLOW     = 0x2;
 const STATUS_CONTACT_OVERFLOW = 0x8;
 
-export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseHandle) {
+export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseHandle, postWgslSource) {
   const module = device.createShaderModule({ label: 'K4 contact_detect', code: wgslSource });
+  // Post-K4 1-workgroup kernel: reads contactCountBuf, writes dispatchArgsBuf
+  // = [ceil(count/256), 1, 1]. K5/K5a/K6/K8 use dispatchWorkgroupsIndirect
+  // off this buffer so per-contact workgroup count exactly matches K4's
+  // current-substep output. Replaces the prior CPU-side prevContactCount.
+  const postModule = device.createShaderModule({ label: 'K4post compute_dispatch_args', code: postWgslSource });
 
   const bgl = device.createBindGroupLayout({ label: 'K4 bgl', entries: [
     { binding:  0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -36,10 +41,28 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     compute: { module, entryPoint: 'contact_detect' },
   });
 
+  // Post-K4 pipeline + BGL. Separate bind group layout (only 2 bindings).
+  const postBgl = device.createBindGroupLayout({ label: 'K4post bgl', entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // contactCount
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // dispatchArgs
+  ]});
+  const postPipeline = await device.createComputePipelineAsync({
+    label: 'K4post', layout: device.createPipelineLayout({ bindGroupLayouts: [postBgl] }),
+    compute: { module: postModule, entryPoint: 'compute_dispatch_args' },
+  });
+
   const absEventBuf   = device.createBuffer({ label: 'absEvents',   size: ABS_CAPACITY * ABS_EVENT_STRIDE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   const absHeadBuf    = device.createBuffer({ label: 'absHead',     size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   const statusFlagBuf = device.createBuffer({ label: 'statusFlags', size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   const k4ParamsBuf   = device.createBuffer({ label: 'K4Params',    size: K4_PARAMS_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  // Dispatch indirect args buffer — 12 bytes = 3 × u32 = [wgX, wgY, wgZ].
+  // K4post fills this from contactCountBuf; K5/K5a/K6/K8 consume it via
+  // dispatchWorkgroupsIndirect. INDIRECT usage required for the consumer
+  // side; STORAGE + COPY_DST required for K4post to write it.
+  const dispatchArgsBuf = device.createBuffer({ label: 'K4 dispatchArgs', size: 12,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+  // postBindGroup is built inside rebuildBindGroup() because contactCountBuf
+  // is (re)allocated inside allocateBuffers and changes identity on grow.
 
   const absEventsStaging  = device.createBuffer({ label: 'absEvents staging', size: ABS_CAPACITY * ABS_EVENT_STRIDE, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const absHeadStaging    = device.createBuffer({ label: 'absHead staging',   size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -47,7 +70,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
   const statusStaging     = device.createBuffer({ label: 'status staging',    size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
   let capacity = 0;
-  let contactsBuf, contactCountBuf, maxImpulseBuf, bindGroup;
+  let contactsBuf, contactCountBuf, maxImpulseBuf, bindGroup, postBindGroup;
   const paramsScratch = new ArrayBuffer(K4_PARAMS_SIZE);
   const paramsView    = new DataView(paramsScratch);
 
@@ -56,6 +79,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     if (contactCountBuf) { contactCountBuf.destroy(); contactCountBuf = null; }
     if (maxImpulseBuf)   { maxImpulseBuf.destroy();   maxImpulseBuf = null; }
     bindGroup = null;
+    postBindGroup = null;
   }
 
   function allocateBuffers(cap) {
@@ -83,6 +107,10 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
       { binding: 11, resource: { buffer: maxImpulseBuf }   },
       { binding: 12, resource: { buffer: statusFlagBuf }   },
       { binding: 13, resource: { buffer: k4ParamsBuf }     },
+    ]});
+    postBindGroup = device.createBindGroup({ label: 'K4post bg', layout: postBgl, entries: [
+      { binding: 0, resource: { buffer: contactCountBuf } },
+      { binding: 1, resource: { buffer: dispatchArgsBuf } },
     ]});
   }
 
@@ -126,6 +154,13 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(Math.ceil(N / WORKGROUP_SIZE));
     pass.end();
+    // K4post: read contactCountBuf, write dispatchArgsBuf = [ceil(c/256), 1, 1].
+    // 1 workgroup, 1 thread. Synchronized by the next encoder pass boundary.
+    const postPass = encoder.beginComputePass({ label: 'K4post compute_dispatch_args' });
+    postPass.setPipeline(postPipeline);
+    postPass.setBindGroup(0, postBindGroup);
+    postPass.dispatchWorkgroups(1);
+    postPass.end();
     encoder.copyBufferToBuffer(absEventBuf,     0, absEventsStaging,  0, ABS_CAPACITY * ABS_EVENT_STRIDE);
     encoder.copyBufferToBuffer(absHeadBuf,      0, absHeadStaging,    0, 4);
     encoder.copyBufferToBuffer(contactCountBuf, 0, contactCntStaging, 0, 4);
@@ -154,7 +189,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
 
   function destroy() {
     destroyOwn();
-    for (const b of [absEventBuf, absHeadBuf, statusFlagBuf, k4ParamsBuf,
+    for (const b of [absEventBuf, absHeadBuf, statusFlagBuf, k4ParamsBuf, dispatchArgsBuf,
                      absEventsStaging, absHeadStaging, contactCntStaging, statusStaging]) {
       try { b.destroy(); } catch {}
     }
@@ -169,6 +204,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     get contactsBuf()     { return contactsBuf; },
     get contactCountBuf() { return contactCountBuf; },
     get maxImpulseBuf()   { return maxImpulseBuf; },
+    get dispatchArgsBuf() { return dispatchArgsBuf; },
     STATUS_ABS_OVERFLOW, STATUS_CONTACT_OVERFLOW,
   };
 }

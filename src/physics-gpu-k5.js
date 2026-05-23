@@ -126,26 +126,20 @@ export async function createK5GPU(device, wgslSources, gravityHandle, k4Handle, 
     // staging unconditionally; without this copy, no-contact substeps would
     // readback stale/zero-init data and clobber entities' velocities.
     encoder.copyBufferToBuffer(gravityHandle.velocitiesBuf, 0, gpuVelScratchBuf, 0, N * 8);
-    // bug-fix-2026-05-23: ALWAYS dispatch (even if prev=0 contacts). K4
-    // writes the current contactCount to GPU memory before K5 runs; WGSL
-    // bounds-check (`t >= contactCount[0]`) reads it dynamically so workers
-    // beyond the live count early-return. Dispatch size is a safe upper
-    // bound based on K4's contact buffer capacity. Previously we used the
-    // 1-substep-stale prevContactCount which caused: (a) new contacts
-    // skipped if prev<current → 1-substep lag, (b) stale slots processed
-    // if prev>current → spurious impulses. Both manifested as the user-
-    // visible "bodies drift into overlap before bouncing apart."
-    const safeMaxContacts = k4Handle.capacity * 3;
-    const cWg = Math.ceil(safeMaxContacts / WORKGROUP);
+    // Indirect dispatch for per-contact passes: K4post wrote [ceil(c/256),1,1]
+    // to k4Handle.dispatchArgsBuf in the same encoder before K5 starts.
+    // Workgroup count exactly matches K4's live contactCount — no over-
+    // dispatch, no skipped contacts. Per-entity passes (vs_apply) still use
+    // direct dispatch since N is known on CPU.
     const eWg = Math.ceil(N / WORKGROUP);
     encoder.clearBuffer(velDeltaBuf, 0, capacity * 2 * 4);
     { const p = encoder.beginComputePass({ label: 'K5a' });
       p.setPipeline(pipeK5a); p.setBindGroup(0, bgK5a);
-      p.dispatchWorkgroups(cWg); p.end(); }
+      p.dispatchWorkgroupsIndirect(k4Handle.dispatchArgsBuf, 0); p.end(); }
     for (let iter = 0; iter < iterCount; iter++) {
       { const p = encoder.beginComputePass({ label: 'K5 accum' });
         p.setPipeline(pipeAccum); p.setBindGroup(0, bgK5);
-        p.dispatchWorkgroups(cWg); p.end(); }
+        p.dispatchWorkgroupsIndirect(k4Handle.dispatchArgsBuf, 0); p.end(); }
       { const p = encoder.beginComputePass({ label: 'K5 apply' });
         p.setPipeline(pipeApply); p.setBindGroup(0, bgK5);
         p.dispatchWorkgroups(eWg); p.end(); }

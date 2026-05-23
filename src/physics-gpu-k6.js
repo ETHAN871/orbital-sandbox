@@ -91,18 +91,13 @@ export async function createK6GPU(device, wgslSource, gravityHandle, k2Handle, k
     // Backend reads back unconditionally; without this copy, no-contact
     // substeps would readback stale/zero-init data and clobber entities.
     encoder.copyBufferToBuffer(k2Handle.pseudoVelsBuf, 0, gpuPVScratchBuf, 0, N * 8);
-    // bug-fix-2026-05-23: same fix as K5 — always dispatch with safe upper
-    // bound (k4Handle.capacity * 3 contact slots), let WGSL bounds-check
-    // against K4's live contactCount[0]. Prevents 1-substep lag for new
-    // contacts and prevents stale-slot processing for ended contacts.
-    const safeMaxContacts = k4Handle.capacity * 3;
-    const cWg = Math.ceil(safeMaxContacts / WORKGROUP);
+    // Indirect dispatch for per-contact passes — see K5 for rationale.
     const eWg = Math.ceil(N / WORKGROUP);
     encoder.clearBuffer(pvDeltaBuf, 0, capacity * 2 * 4);
     for (let iter = 0; iter < POS_ITERATIONS; iter++) {
       { const p = encoder.beginComputePass({ label: 'K6 accum' });
         p.setPipeline(pipeAccum); p.setBindGroup(0, bindGroup);
-        p.dispatchWorkgroups(cWg); p.end(); }
+        p.dispatchWorkgroupsIndirect(k4Handle.dispatchArgsBuf, 0); p.end(); }
       { const p = encoder.beginComputePass({ label: 'K6 apply' });
         p.setPipeline(pipeApply); p.setBindGroup(0, bindGroup);
         p.dispatchWorkgroups(eWg); p.end(); }
