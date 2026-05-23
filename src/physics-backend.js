@@ -411,22 +411,26 @@ export async function createBackend() {
     async init(entities) {
       if (initialized) return;
       initialized = true;
-      // Engine override (?engine=planck): swap to planck.js backend before
-      // GPU init runs. Planck handles its own integration/contacts/CCD; we
-      // only inject charge-asymmetric gravity via applyForceToCenter. See
-      // physics-planck.js. Loaded dynamically so the planck dep is opt-in
-      // (default backends don't pay the import cost).
+      // Engine selection (post-2026-05-23 stage 1 ship):
+      //   ?engine=cpu    → legacy hand-ported Box2D-style PBD (physics.js)
+      //   ?engine=webgpu → legacy K1-K8 GPU pipeline (physics-gpu-*.js)
+      //   default OR ?engine=planck → planck.js backend (physics-planck.js)
+      // Planck is now the default — it has CCD/TOI which fixes the dense-
+      // cluster bug at high mass / small radius that K1-K8 couldn't handle.
+      // Legacy backends stay in tree for opt-in regression testing.
+      const params = new URLSearchParams(window.location.search);
+      const engineParam = params.get('engine');
+      const wantPlanck = engineParam === 'planck' || (engineParam === null && params.get('backend') !== 'force-cpu');
       let usingPlanck = false;
-      try {
-        const params = new URLSearchParams(window.location.search);
-        if (params.get('engine') === 'planck') {
+      if (wantPlanck) {
+        try {
           const { makePlanckBackend } = await import('./physics-planck.js');
           active = makePlanckBackend();
           await active.init(entities);
           usingPlanck = true;
+        } catch (e) {
+          console.warn('[physics-backend] planck init failed; falling back to legacy backend:', e);
         }
-      } catch (e) {
-        console.warn('[physics-backend] planck init failed; falling back to CPU:', e);
       }
       const onGpu = usingPlanck ? false : await tryInitGpu(entities);
       state.backendName = active.name;

@@ -18,19 +18,78 @@
 import * as pl from 'planck';
 import { state } from './state.js';
 import { updateAbsorptions, applyBoundary } from './physics.js';
+import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
+import { createGravityGPU } from './physics-gpu-gravity.js';
 
 let world = null;
 let bodyById = new Map();   // entity.id (u32) → planck Body
 
-// ── Stage 1 gravity computation (CPU O(N²)) ──────────────────────────
-// Mirrors physics.js:computeAccelerations (charge-asymmetric Plummer).
-// Returns Float32Array of (ax, ay) pairs, length 2N. Stage 2 will swap
-// this for a GPU K1 dispatch returning the same Float32Array layout.
+// ── Stage 2: GPU K1 gravity acceleration ─────────────────────────────
+// At backend init we attempt to bring up a WebGPU device + K1 pipeline.
+// If successful, computeGravity() dispatches the existing K1 kernel
+// (physics-gpu-gravity.js + gravity_accel.wgsl) for N ≥ GPU_THRESHOLD
+// and reads back the Float32Array of accels. Below threshold the CPU
+// O(N²) loop is faster because mapAsync round-trip dominates.
+//
+// Stage 1 → Stage 2 contract: this is the ONLY hook that changed. The
+// rest of physics-planck.js — body sync, applyForceToCenter, world.step,
+// absorption pipeline — is unchanged.
+const GPU_THRESHOLD = 200;
+let gpuDevice = null;
+let gpuGravityHandle = null;
+
+async function tryInitGpuGravity() {
+  try {
+    const detection = await detectBackend();
+    if (detection.backend !== 'webgpu') {
+      if (isVerbose()) console.info('[physics-planck] no WebGPU, gravity stays on CPU:', detection.reason);
+      return false;
+    }
+    const wgslSource = await loadKernel('./kernels/gravity_accel.wgsl');
+    gpuDevice = detection.device;
+    gpuGravityHandle = await createGravityGPU(gpuDevice, wgslSource);
+    if (isVerbose()) console.info('[physics-planck] GPU K1 gravity ready');
+    return true;
+  } catch (e) {
+    if (isVerbose()) console.warn('[physics-planck] GPU init failed; staying on CPU gravity:', e);
+    return false;
+  }
+}
+
 async function computeGravity(entities) {
   const n = entities.length;
   const out = new Float32Array(n * 2);
   if (n < 2) return out;
+  // Below threshold the CPU loop wins (mapAsync overhead dominates GPU
+  // dispatch for tiny N). Above threshold the GPU O(N²) tile is faster.
+  if (gpuGravityHandle && n >= GPU_THRESHOLD) {
+    try {
+      return await computeGravityGPU(entities, n);
+    } catch (e) {
+      if (isVerbose()) console.warn('[physics-planck] GPU gravity dispatch failed; CPU fallback:', e);
+      // Fall through to CPU.
+    }
+  }
+  return computeGravityCPU(entities, n, out);
+}
 
+async function computeGravityGPU(entities, n) {
+  gpuGravityHandle.growIfNeeded(n);
+  const wrap = state.boundaryMode === 'wrap';
+  gpuGravityHandle.uploadPositions(entities, n);
+  gpuGravityHandle.uploadMetaAll(entities, n);
+  gpuGravityHandle.uploadParams(
+    n, state.G, state.epsilon,
+    wrap ? state.viewport.width  : 0,
+    wrap ? state.viewport.height : 0,
+  );
+  const enc = gpuDevice.createCommandEncoder({ label: 'planck stage2 gravity' });
+  gpuGravityHandle.recordDispatch(enc, n, 0);
+  gpuDevice.queue.submit([enc.finish()]);
+  return await gpuGravityHandle.readbackStaging(0, n);
+}
+
+function computeGravityCPU(entities, n, out) {
   const G = state.G;
   const eps = state.epsilon;
   const wrap = state.boundaryMode === 'wrap';
@@ -38,7 +97,6 @@ async function computeGravity(entities) {
   const H = wrap ? state.viewport.height : 0;
   const halfW = W * 0.5;
   const halfH = H * 0.5;
-
   for (let i = 0; i < n; i++) {
     const a = entities[i];
     if (a.absorbing) continue;
@@ -214,6 +272,9 @@ export function makePlanckBackend() {
         allowSleep: false,
       });
       bodyById = new Map();
+      // Stage 2: try to bring up GPU K1 gravity. Non-fatal if it fails —
+      // computeGravity() falls back to the CPU loop transparently.
+      await tryInitGpuGravity();
       syncWorldToEntities(entities);
     },
 
@@ -254,6 +315,8 @@ export function makePlanckBackend() {
       for (const [, b] of bodyById) { try { world.destroyBody(b); } catch {} }
       bodyById.clear();
       world = null;
+      if (gpuGravityHandle) { try { gpuGravityHandle.destroy(); } catch {} gpuGravityHandle = null; }
+      if (gpuDevice)        { try { gpuDevice.destroy();        } catch {} gpuDevice        = null; }
     },
   };
 }
