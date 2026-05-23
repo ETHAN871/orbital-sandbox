@@ -411,7 +411,24 @@ export async function createBackend() {
     async init(entities) {
       if (initialized) return;
       initialized = true;
-      const onGpu = await tryInitGpu(entities);
+      // Engine override (?engine=planck): swap to planck.js backend before
+      // GPU init runs. Planck handles its own integration/contacts/CCD; we
+      // only inject charge-asymmetric gravity via applyForceToCenter. See
+      // physics-planck.js. Loaded dynamically so the planck dep is opt-in
+      // (default backends don't pay the import cost).
+      let usingPlanck = false;
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('engine') === 'planck') {
+          const { makePlanckBackend } = await import('./physics-planck.js');
+          active = makePlanckBackend();
+          await active.init(entities);
+          usingPlanck = true;
+        }
+      } catch (e) {
+        console.warn('[physics-backend] planck init failed; falling back to CPU:', e);
+      }
+      const onGpu = usingPlanck ? false : await tryInitGpu(entities);
       state.backendName = active.name;
       if (isVerbose()) console.info('[physics-backend] active:', active.name, '(gpu init:', onGpu, ')');
     },
