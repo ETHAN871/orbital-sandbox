@@ -14,12 +14,6 @@
 //
 // 2e dark-launch: writes to gpuPVScratchBuf (separate from K2's
 // pseudoVelsBuf). CPU stepPBD's position solver remains authoritative.
-//
-// JACOBI_RELAX (bug-fix-2026-05-21): Jacobi over-correction damping —
-// same rationale as velocity_solver.wgsl. K6 Jacobi adds atomic
-// contributions from all simultaneous contacts on a body; without
-// relaxation, dense clusters see K-fold overcorrection. 0.5 matches K5.
-// Orthogonal to the CFL pseudo-vel cap in physics.js (energy guard).
 
 struct Contact {
   idxA: u32, idxB: u32, rSum: f32, dist: f32,
@@ -71,9 +65,7 @@ fn ps_accumulate(@builtin(global_invocation_id) gid: vec3u) {
   let want = overlap - linearSlop;
   if (want <= 0.0) { return; }
   let maxCorr = MAX_CORRECTION_FRAC * c.rSum;
-  let correctionRaw = select(want, maxCorr, want > maxCorr);
-  const JACOBI_RELAX: f32 = 0.5;
-  let correction = correctionRaw * JACOBI_RELAX;
+  let correction = select(want, maxCorr, want > maxCorr);
   let nx = dxy.x / dist;
   let ny = dxy.y / dist;
   let lambdaOverDt = correction / wSum / dt;

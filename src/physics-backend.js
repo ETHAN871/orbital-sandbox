@@ -33,49 +33,6 @@ import { createK5GPU, computeVelIter } from './physics-gpu-k5.js';
 import { createK6GPU } from './physics-gpu-k6.js';
 import { createK8GPU } from './physics-gpu-k8.js';
 
-// ── Energy ledger probe (opt-in diagnostic) ────────────────────────
-// Pumping window.__energyLedger = [] from devtools/test eval enables
-// per-substep recording of KE + PE at 7 stages of step():
-//   ENTRY → after-K2-apply → after-K5-apply → after-K6-apply →
-//   after-stepPBD-integrate → after-updateAbsorptions → after-applyBoundary
-// The dense-cluster explosion bug was localized by reading the delta
-// between after-K6-apply and after-stepPBD-integrate: that's the moment
-// _integratePseudoVelsOnly writes _pvx*dt into entity.x, shifting PE.
-// Disabled by default — no overhead until externally enabled.
-let __ledgerSubstepIdx = 0;
-const __LEDGER_MAX = 10000;   // ~5 sec at 60 fps × 8 substeps × 7 stages; bounds memory growth
-function _recordEnergy(stage, entities, extra) {
-  const led = (typeof window !== 'undefined') ? window.__energyLedger : null;
-  if (!Array.isArray(led)) return;
-  if (led.length >= __LEDGER_MAX) return;
-  if (stage === 'ENTRY') __ledgerSubstepIdx++;
-  const N = entities.length;
-  let KE = 0;
-  for (let i = 0; i < N; i++) {
-    const e = entities[i];
-    KE += 0.5 * e.mass * (e.vx * e.vx + e.vy * e.vy);
-  }
-  const G = state.G;
-  const eps = state.effectiveEpsilon || state.epsilon;
-  let PE = 0;
-  for (let i = 0; i < N; i++) {
-    const a = entities[i];
-    if (a.absorbing) continue;
-    for (let j = i + 1; j < N; j++) {
-      const b = entities[j];
-      if (b.absorbing) continue;
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const minR = Math.max(a.radius + b.radius, eps);
-      const r = Math.sqrt(dx * dx + dy * dy + minR * minR);
-      PE += -a.charge * b.charge * G * a.mass * b.mass / r;
-    }
-  }
-  const entry = { substep: __ledgerSubstepIdx, stage, KE, PE, total: KE + PE, N };
-  if (extra) Object.assign(entry, extra);
-  led.push(entry);
-}
-
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
 // branch (F1 acceptance). No GPU resources, no async work.
@@ -279,11 +236,6 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       // buffer activation. In 2a, K7 isn't yet wired into the substep loop
       // and the shadow buffer isn't activated; this arg is currently a no-op.
       if (teardown) return;
-      // Energy ledger probe — opt-in via window.__energyLedger=[].
-      // Records KE+PE at each stage so the dense-cluster PE-injection
-      // mechanism in K6 can be located precisely. O(N²) cost — only enabled
-      // when the global array is initialized externally.
-      _recordEnergy('ENTRY', entities);
       ensureCapacity(entities);
       if (pendingReadback === null) {
         await submitDispatch(entities, dt);
@@ -339,7 +291,6 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       // K5's converged output; pre-load _pvx/_pvy with K6's converged
       // pseudo-velocities so stepPBD's integrate-only path consumes them.
       applyK2OutputToEntities(entities, N, readback.positions, readback.velocities);
-      _recordEnergy('after-K2-apply', entities, { contactCount: readback.k4Read?.contactCount });
       const haveGpuVel = readback.gpuVel && readback.gpuVel.length >= N * 2;
       const haveGpuPV  = readback.gpuPV  && readback.gpuPV.length  >= N * 2;
       if (haveGpuVel) {
@@ -348,14 +299,12 @@ async function makeGpuBackend(device, wgslSources, onLost) {
           entities[i].vy = readback.gpuVel[i * 2 + 1];
         }
       }
-      _recordEnergy('after-K5-apply', entities);
       if (haveGpuPV) {
         for (let i = 0; i < N; i++) {
           entities[i]._pvx = readback.gpuPV[i * 2];
           entities[i]._pvy = readback.gpuPV[i * 2 + 1];
         }
       }
-      _recordEnergy('after-K6-apply', entities, { haveGpuPV });
       // stepPBD runs:
       //   A (skipped via skipPseudoVelReset — GPU values preserved)
       //   B+C+D (skipped via skipKickPredict — K2 did them)
@@ -371,11 +320,8 @@ async function makeGpuBackend(device, wgslSources, onLost) {
         skipPositionSolverIter: haveGpuPV,
         skipPseudoVelReset:     haveGpuPV,
       });
-      _recordEnergy('after-stepPBD-integrate', entities);
       updateAbsorptions(entities, dt);
-      _recordEnergy('after-updateAbsorptions', entities);
       applyBoundary(entities, viewport, boundaryMode);
-      _recordEnergy('after-applyBoundary', entities);
 
       // Update prevContactCount for next substep's K5 iter ramp.
       if (readback.k4Read && readback.k4Read.contactCount !== undefined) {
