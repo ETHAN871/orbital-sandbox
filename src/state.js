@@ -177,6 +177,14 @@ export const state = {
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
   // Read-only outside physics-backend.js; useful for HUD/debug displays.
   backendName: null,
+
+  // Diagnostic: when ?solver=simple URL param is set, stepPBD's F/G stages
+  // use a 1-iteration direct math solver (no warm-start, no pseudo-velocity,
+  // no Baumgarte, no impulse clamp) instead of the production Box2D split-
+  // impulse code. GPU pipeline still runs K1-K8 but its K5/K6 outputs are
+  // ignored — CPU's simple solver works off entity state after K2 readback.
+  // Used to bisect the dense-cluster bug.
+  simpleSolver: false,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────

@@ -339,10 +339,15 @@ export function stepPBD(entities, dt, options) {
     // 8-iter Gauss-Seidel with warm-starting + accumulated-impulse
     // clamp ≥ 0. Convergence on resting/stacked contacts comes from
     // the previous substep's seeded normalImpulse.
-    _solveContactVelocities(_contactCount);
+    // Diagnostic mode: simpleSolver → 1-iter direct write, no warm-start.
+    if (state.simpleSolver) {
+      _solveContactVelocitiesSimple(_contactCount);
+    } else {
+      _solveContactVelocities(_contactCount);
+    }
 
     // ── F'. Persist this substep's impulses for next substep's warm-start
-    _rebuildPrevPairImpulses();
+    if (!state.simpleSolver) _rebuildPrevPairImpulses();
   }
 
   // ── G. Pseudo-velocity NGS position solver (Box2D-style) ───────
@@ -351,7 +356,11 @@ export function stepPBD(entities, dt, options) {
   // converged the pseudo-velocities and the caller has copied them to
   // entity._pvx/_pvy. We then only run the integration step (x += _pv*dt)
   // — see _integratePseudoVelsOnly below.
-  if (skipPositionSolverIter) {
+  // Diagnostic mode: simpleSolver → 1-iter direct positional separation
+  // (no pseudo-velocity, no Baumgarte slop, no maxCorrection cap).
+  if (state.simpleSolver) {
+    _solvePositionConstraintsSimple(_contactCount, entities);
+  } else if (skipPositionSolverIter) {
     _integratePseudoVelsOnly(entities, dt);
   } else {
     _solvePositionConstraints(_contactCount, entities, dt);
@@ -472,6 +481,77 @@ function _integratePseudoVelsOnly(entities, dt) {
     if (e.pinned || e.absorbing) continue;
     e.x += e._pvx * dt;
     e.y += e._pvy * dt;
+  }
+}
+
+// ─── Diagnostic: simple-solver reference implementations ──────────
+// Activated only when state.simpleSolver = true (URL param ?solver=simple).
+// 1-iteration direct math, no warm-start, no impulse accumulator, no
+// pseudo-velocity, no Baumgarte slop, no maxCorrection cap. Used to bisect
+// the dense-cluster bug — if behavior matches the production solver,
+// the bug is upstream of the contact solver (K1/K2/K4 or fundamental
+// substep CFL). If behavior differs significantly, the production
+// solver's iterative/warm-start machinery is responsible.
+
+function _solveContactVelocitiesSimple(count) {
+  if (count === 0) return;
+  const e = state.elasticRestitution;
+  for (let k = 0; k < count; k++) {
+    const c = _contacts[k];
+    const a = c.a, b = c.b;
+    if (a.absorbing || b.absorbing) continue;
+    const wA = a.pinned ? 0 : 1 / a.mass;
+    const wB = b.pinned ? 0 : 1 / b.mass;
+    const wSum = wA + wB;
+    if (wSum === 0) continue;
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    const vn = rvx * c.nx + rvy * c.ny;
+    const vnTarget = c.wasPersistent ? 0 : -e * c.vnApproach;
+    const dvn = vnTarget - vn;
+    const j = dvn / wSum;
+    if (j <= 0) continue;   // push-only: don't pull bodies together
+    a.vx -= j * c.nx * wA;
+    a.vy -= j * c.ny * wA;
+    b.vx += j * c.nx * wB;
+    b.vy += j * c.ny * wB;
+  }
+}
+
+function _solvePositionConstraintsSimple(count, entities) {
+  if (count === 0) return;
+  const wrap = state.boundaryMode === 'wrap';
+  const W = wrap ? state.viewport.width : 0;
+  const H = wrap ? state.viewport.height : 0;
+  const halfW = W * 0.5;
+  const halfH = H * 0.5;
+  for (let k = 0; k < count; k++) {
+    const c = _contacts[k];
+    const a = c.a, b = c.b;
+    if (a.absorbing || b.absorbing) continue;
+    const wA = a.pinned ? 0 : 1 / a.mass;
+    const wB = b.pinned ? 0 : 1 / b.mass;
+    const wSum = wA + wB;
+    if (wSum === 0) continue;
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    if (wrap) {
+      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
+      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+    }
+    const dist2 = dx * dx + dy * dy;
+    if (dist2 < 1e-12) continue;
+    const dist = Math.sqrt(dist2);
+    const overlap = c.rSum - dist;
+    if (overlap <= 0) continue;
+    const nx = dx / dist;
+    const ny = dy / dist;
+    const corrA = overlap * (wA / wSum);
+    const corrB = overlap * (wB / wSum);
+    a.x -= corrA * nx;
+    a.y -= corrA * ny;
+    b.x += corrB * nx;
+    b.y += corrB * ny;
   }
 }
 

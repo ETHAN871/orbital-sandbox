@@ -32,6 +32,15 @@ import { createK5GPU, computeVelIter } from './physics-gpu-k5.js';
 import { createK6GPU } from './physics-gpu-k6.js';
 import { createK8GPU } from './physics-gpu-k8.js';
 
+// Diagnostic URL param parse: ?solver=simple switches stepPBD's contact
+// solver to a 1-iteration direct-math version. See state.js for rationale.
+(function parseSimpleSolverFlag() {
+  try {
+    const sp = new URLSearchParams(window.location.search);
+    if (sp.get('solver') === 'simple') state.simpleSolver = true;
+  } catch {}
+})();
+
 // ── CPU backend ────────────────────────────────────────────────────
 // Thin pass-through to existing physics.js. Bit-identical to the main
 // branch (F1 acceptance). No GPU resources, no async work.
@@ -277,8 +286,13 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       // K5's converged output; pre-load _pvx/_pvy with K6's converged
       // pseudo-velocities so stepPBD's integrate-only path consumes them.
       applyK2OutputToEntities(entities, N, readback.positions, readback.velocities);
-      const haveGpuVel = readback.gpuVel && readback.gpuVel.length >= N * 2;
-      const haveGpuPV  = readback.gpuPV  && readback.gpuPV.length  >= N * 2;
+      // Diagnostic: in simple-solver mode, IGNORE K5/K6 readback and let CPU
+      // stepPBD run its own contact solvers (which internally branch to the
+      // simple version when state.simpleSolver is set). This isolates the
+      // bug to the iterative/warm-start machinery vs upstream K1/K2/K4.
+      const useGpuSolvers = !state.simpleSolver;
+      const haveGpuVel = useGpuSolvers && readback.gpuVel && readback.gpuVel.length >= N * 2;
+      const haveGpuPV  = useGpuSolvers && readback.gpuPV  && readback.gpuPV.length  >= N * 2;
       if (haveGpuVel) {
         for (let i = 0; i < N; i++) {
           entities[i].vx = readback.gpuVel[i * 2];
