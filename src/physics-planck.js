@@ -34,7 +34,13 @@ import { AdaptiveOverlapManager } from './physics-planck-overlap.js';
 // are NOT user-tunable — changing them re-introduces the mechanism each
 // was set to suppress. See the 2026-05-23 over-penetration triage doc.
 //
-//   linearSlop=0.5          — allowed residual overlap (≈2% of smallest r=8 body)
+//   linearSlop=1.0          — allowed residual overlap. Doubled from 0.5
+//                             (2026-05-23 pm) so micro-penetration inside
+//                             gravitationally-loaded aggregates is in the
+//                             solver's dead zone — eliminates the perpetual
+//                             jitter that prevents clusters from coming to
+//                             rest. Approximately 6% of smallest body
+//                             radius — visually undetectable.
 //   maxLinearCorrection=8.0 — per-contact per-iter correction cap (5.7× headroom
 //                             over measured worst-case 1.4 px/substep penetration
 //                             in the m=1000,r=0.4 dense cluster bug case)
@@ -44,20 +50,35 @@ import { AdaptiveOverlapManager } from './physics-planck-overlap.js';
 //                             contacts treated as resting). 0.5 is comfortably
 //                             above float noise but low enough that grazing
 //                             contacts still get elastic treatment.
+//   baumgarte=0.1           — Position-correction rate. Halved from default
+//                             0.2 to soften the corrective impulse on every
+//                             solver iteration, removing high-frequency
+//                             ringing in resting contacts.
+//   linearSleepTolerance=1.0 — Speed threshold below which a body is eligible
+//                              for sleep. Default 0.01 is sub-pixel/sec —
+//                              unreachable in our scene where solver residuals
+//                              produce ~0.1-1 px/s noise. 1.0 px/s allows
+//                              gravitationally-pinned aggregates to truly
+//                              freeze; planck's per-body sleep flag is
+//                              respected by world.step.
 const PLANCK_SETTINGS_OVERRIDE = Object.freeze({
-  linearSlop:          0.5,
-  maxLinearCorrection: 8.0,
-  maxTranslation:      50.0,
-  velocityThreshold:   0.5,
+  linearSlop:           1.0,
+  maxLinearCorrection:  8.0,
+  maxTranslation:       50.0,
+  velocityThreshold:    0.5,
+  baumgarte:            0.1,
+  linearSleepTolerance: 1.0,
 });
 
 // Restored at destroy() so a future planck re-init starts from a clean baseline
 // (idempotency safety for tests / device-lost reload scenarios).
 const PLANCK_SETTINGS_DEFAULT = Object.freeze({
-  linearSlop:          0.005,
-  maxLinearCorrection: 0.2,
-  maxTranslation:      2.0,
-  velocityThreshold:   1.0,
+  linearSlop:           0.005,
+  maxLinearCorrection:  0.2,
+  maxTranslation:       2.0,
+  velocityThreshold:    1.0,
+  baumgarte:            0.2,
+  linearSleepTolerance: 0.01,
 });
 
 let world = null;
@@ -181,7 +202,7 @@ function createBodyForEntity(e) {
     linearVelocity: pl.Vec2(e.vx || 0, e.vy || 0),
     bullet:         wantsBullet,
     fixedRotation:  true,    // we don't model rotational dynamics
-    allowSleep:     false,   // gravity is always non-zero, sleeping breaks our model
+    allowSleep:     true,    // see World.allowSleep comment in init()
     userData:       { id: e.id, isBullet: wantsBullet },
   });
   const r = Math.max(e.radius, 0.01);
@@ -317,14 +338,22 @@ export function makePlanckBackend() {
     name: 'planck',
 
     async init(entities) {
-      pl.Settings.linearSlop          = PLANCK_SETTINGS_OVERRIDE.linearSlop;
-      pl.Settings.maxLinearCorrection = PLANCK_SETTINGS_OVERRIDE.maxLinearCorrection;
-      pl.Settings.maxTranslation      = PLANCK_SETTINGS_OVERRIDE.maxTranslation;
-      pl.Settings.velocityThreshold   = PLANCK_SETTINGS_OVERRIDE.velocityThreshold;
+      pl.Settings.linearSlop           = PLANCK_SETTINGS_OVERRIDE.linearSlop;
+      pl.Settings.maxLinearCorrection  = PLANCK_SETTINGS_OVERRIDE.maxLinearCorrection;
+      pl.Settings.maxTranslation       = PLANCK_SETTINGS_OVERRIDE.maxTranslation;
+      pl.Settings.velocityThreshold    = PLANCK_SETTINGS_OVERRIDE.velocityThreshold;
+      pl.Settings.baumgarte            = PLANCK_SETTINGS_OVERRIDE.baumgarte;
+      pl.Settings.linearSleepTolerance = PLANCK_SETTINGS_OVERRIDE.linearSleepTolerance;
 
       world = pl.World({
         gravity:    pl.Vec2(0, 0),  // we apply our own pairwise gravity via applyForceToCenter
-        allowSleep: false,
+        // 2026-05-23 pm: allowSleep flipped to true. Previously false on the
+        // assumption "gravity is always non-zero", which is wrong for bodies
+        // in a stable cluster where gravity is balanced by contact normal
+        // force. Stable aggregates can now genuinely freeze (and skip solver
+        // work). Gravity application loop in step() reads body.isAwake() to
+        // avoid waking sleeping bodies every substep with redundant forces.
+        allowSleep: true,
       });
       bodyById = new Map();
       overlapMgr = new AdaptiveOverlapManager(state);
@@ -348,6 +377,14 @@ export function makePlanckBackend() {
         if (e.absorbing || e.pinned) continue;
         const b = bodyById.get(e.id);
         if (!b) continue;
+        // Sleeping bodies are in stable equilibrium (contact normal force
+        // already balances gravity from previous applies). Skipping the
+        // applyForceToCenter call leaves them asleep — they'll wake via
+        // contact propagation if a non-sleeping body intrudes the cluster.
+        // Without this guard, every applyForceToCenter call wakes the body
+        // (default wake=true), defeating sleep entirely on gravitational
+        // aggregates.
+        if (!b.isAwake()) continue;
         b.applyForceToCenter(pl.Vec2(e.mass * accels[i * 2], e.mass * accels[i * 2 + 1]));
       }
 
@@ -376,10 +413,12 @@ export function makePlanckBackend() {
       if (overlapMgr) { overlapMgr.reset(); overlapMgr = null; }
       if (gpuGravityHandle) { try { gpuGravityHandle.destroy(); } catch {} gpuGravityHandle = null; }
       if (gpuDevice)        { try { gpuDevice.destroy();        } catch {} gpuDevice        = null; }
-      pl.Settings.linearSlop          = PLANCK_SETTINGS_DEFAULT.linearSlop;
-      pl.Settings.maxLinearCorrection = PLANCK_SETTINGS_DEFAULT.maxLinearCorrection;
-      pl.Settings.maxTranslation      = PLANCK_SETTINGS_DEFAULT.maxTranslation;
-      pl.Settings.velocityThreshold   = PLANCK_SETTINGS_DEFAULT.velocityThreshold;
+      pl.Settings.linearSlop           = PLANCK_SETTINGS_DEFAULT.linearSlop;
+      pl.Settings.maxLinearCorrection  = PLANCK_SETTINGS_DEFAULT.maxLinearCorrection;
+      pl.Settings.maxTranslation       = PLANCK_SETTINGS_DEFAULT.maxTranslation;
+      pl.Settings.velocityThreshold    = PLANCK_SETTINGS_DEFAULT.velocityThreshold;
+      pl.Settings.baumgarte            = PLANCK_SETTINGS_DEFAULT.baumgarte;
+      pl.Settings.linearSleepTolerance = PLANCK_SETTINGS_DEFAULT.linearSleepTolerance;
     },
   };
 }
