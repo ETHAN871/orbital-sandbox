@@ -1396,7 +1396,7 @@ function _drawEquipotential() {
   for (let i = 0; i < _PHI_SAMPLE_FRACS.length; i++) {
     const sx = _PHI_SAMPLE_FRACS[i][0] * _vpW;
     const sy = _PHI_SAMPLE_FRACS[i][1] * _vpH;
-    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.effectiveEpsilon, boundary);
+    const phi = computePotentialAt(sx, sy, state.entities, state.G, state.epsilon, boundary);
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
@@ -1404,7 +1404,7 @@ function _drawEquipotential() {
     const e = state.entities[i];
     if (e.absorbing) continue;
     if (e.charge * e.mass === 0) continue;
-    const phi = computePotentialAt(e.x, e.y, state.entities, state.G, state.effectiveEpsilon, boundary);
+    const phi = computePotentialAt(e.x, e.y, state.entities, state.G, state.epsilon, boundary);
     if (phi < phiMin) phiMin = phi;
     if (phi > phiMax) phiMax = phi;
   }
@@ -1472,10 +1472,7 @@ function _drawEquipotential() {
   gl.uniform2f(_progEquipotential.uViewport, _vpW, _vpH);
   gl.uniform4fv(_progEquipotential.uEntities, _fieldEntityData);
   gl.uniform1i(_progEquipotential.uEntityCount, _fieldEntityCount);
-  // Field viz uses the auto-bumped effectiveEpsilon so the rendered
-  // potential matches the simulation's actual force law (dense-cluster
-  // safety floor — see physics.js prepareFrame).
-  gl.uniform1f(_progEquipotential.uEpsilon, state.effectiveEpsilon);
+  gl.uniform1f(_progEquipotential.uEpsilon, state.epsilon);
   gl.uniform1f(_progEquipotential.uLogK, _smoothedLogK);
   gl.uniform1f(_progEquipotential.uContourThreshold, _smoothedContourThreshold);
   gl.uniform1f(_progEquipotential.uContourLineW, UI_CONTOUR_LINE_W_PX);
@@ -1513,7 +1510,7 @@ function _drawStreamlines() {
   for (let i = 0; i < N; i++) {
     const sx = _streamlineSeeds[i * 2];
     const sy = _streamlineSeeds[i * 2 + 1];
-    const f = computeForceDirAt(sx, sy, state.entities, state.G, state.effectiveEpsilon, boundary);
+    const f = computeForceDirAt(sx, sy, state.entities, state.G, state.epsilon, boundary);
     if (f.mag === 0) continue;                // skip null-field seeds
     // Use log-scale to map force magnitude to brightness, then clamp.
     // mag near a heavy entity can be huge; far-field is tiny. Log compresses.

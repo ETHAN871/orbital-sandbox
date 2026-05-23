@@ -221,12 +221,8 @@ export function clearBHTree() {
 
 export function computeAccelerationsBH(entities, accels) {
   // V8.1c: refresh module-level shadows from runtime-tunable state.
-  // Bug-fix-2026-05-21: read the auto-bumped effectiveEpsilon (see
-  // physics.js prepareFrame) so the BH path stays in sync with the direct
-  // path on dense-cluster softening. Without this, BH-path scenes
-  // (N ≥ bhThreshold) would still explode when the direct path didn't.
   G = state.G;
-  EPSILON = state.effectiveEpsilon;
+  EPSILON = state.epsilon;
 
   const n = entities.length;
   for (let i = 0; i < n; i++) { accels[i].ax = 0; accels[i].ay = 0; }
