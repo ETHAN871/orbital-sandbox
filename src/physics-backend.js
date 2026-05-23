@@ -88,7 +88,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     k3b: wgslSources.k3b,
     k3c: wgslSources.k3c,
   }, gravity, k2);
-  const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase, wgslSources.k4post);
+  const k4 = await createK4GPU(device, wgslSources.k4, gravity, broadphase, wgslSources.k4post, k2);
   const k8 = await createK8GPU(device, wgslSources.k8, gravity, k4);
   const k5 = await createK5GPU(device, { k5a: wgslSources.k5a, k5: wgslSources.k5 }, gravity, k4, k8);
   const k6 = await createK6GPU(device, wgslSources.k6, gravity, k2, k4);
@@ -184,7 +184,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
     const gravityRealloc = gravity.growIfNeeded(N);
     if (gravityRealloc) { k2.onGravityRealloc(); broadphase.onGravityRealloc(); k4.onGravityRealloc(); k5.onGravityRealloc(); k6.onGravityRealloc(); k8.onGravityRealloc(); }
     const k2Realloc = k2.growIfNeeded(N);
-    if (k2Realloc) { broadphase.onK2Realloc(); k6.onK2Realloc(); }
+    if (k2Realloc) { broadphase.onK2Realloc(); k4.onK2Realloc(); k6.onK2Realloc(); }
     const bpRealloc = broadphase.growIfNeeded(N);
     if (bpRealloc) k4.onBroadphaseRealloc();
     const k4Realloc = k4.growIfNeeded(N);

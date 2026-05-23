@@ -67,6 +67,11 @@ const STATUS_ABS_OVERFLOW:     u32 = 2u;
 const STATUS_CONTACT_OVERFLOW: u32 = 8u;
 const ABS_CAPACITY: u32 = 128u;
 
+// bug-fix-2026-05-23 tunneling-suspect: positions (binding 0) is K2's
+// outPositionsBuf (post-predict). Previously this was gravityHandle.
+// positionsBuf (pre-predict), but broadphase (K3) already uses post-
+// predict for cell bucketing — K4 must match so it walks the right cells
+// AND catches new contacts formed during this substep's predict step.
 @group(0) @binding(0)  var<storage, read>       positions    : array<vec2f>;
 @group(0) @binding(1)  var<storage, read>       velocities   : array<vec2f>;
 @group(0) @binding(2)  var<storage, read>       accels       : array<vec2f>;

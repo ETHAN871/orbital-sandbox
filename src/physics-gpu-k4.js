@@ -11,7 +11,7 @@ const K4_PARAMS_SIZE   = 32;
 const STATUS_ABS_OVERFLOW     = 0x2;
 const STATUS_CONTACT_OVERFLOW = 0x8;
 
-export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseHandle, postWgslSource) {
+export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseHandle, postWgslSource, k2Handle) {
   const module = device.createShaderModule({ label: 'K4 contact_detect', code: wgslSource });
   // Post-K4 1-workgroup kernel: reads contactCountBuf, writes dispatchArgsBuf
   // = [ceil(count/256), 1, 1]. K5/K5a/K6/K8 use dispatchWorkgroupsIndirect
@@ -93,7 +93,12 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
 
   function rebuildBindGroup() {
     bindGroup = device.createBindGroup({ label: 'K4 bg', layout: bgl, entries: [
-      { binding:  0, resource: { buffer: gravityHandle.positionsBuf  } },
+      // bug-fix-2026-05-23 tunneling: switched from gravityHandle.positionsBuf
+      // (pre-predict) to k2Handle.outPositionsBuf (post-predict). Broadphase
+      // (K3) already uses post-predict for cell bucketing; K4 must match so
+      // it walks the right cells AND catches new contacts formed during
+      // this substep's predict step.
+      { binding:  0, resource: { buffer: k2Handle.outPositionsBuf } },
       { binding:  1, resource: { buffer: gravityHandle.velocitiesBuf } },
       { binding:  2, resource: { buffer: gravityHandle.accelsBuf     } },
       { binding:  3, resource: { buffer: gravityHandle.metasBuf      } },
@@ -199,6 +204,7 @@ export async function createK4GPU(device, wgslSource, gravityHandle, broadphaseH
     growIfNeeded, uploadParams, recordDispatch, readback, resetStatusFlags,
     onGravityRealloc()    { if (capacity > 0) rebuildBindGroup(); },
     onBroadphaseRealloc() { if (capacity > 0) rebuildBindGroup(); },
+    onK2Realloc()         { if (capacity > 0) rebuildBindGroup(); },
     destroy,
     get capacity() { return capacity; },
     get contactsBuf()     { return contactsBuf; },
