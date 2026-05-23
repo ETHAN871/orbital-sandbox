@@ -16,13 +16,53 @@
 // untouched between stages.
 
 import * as pl from 'planck';
-import { state } from './state.js';
+import { state } from './state.js?v=ovl1';
 import { updateAbsorptions, applyBoundary } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';
+import { AdaptiveOverlapManager } from './physics-planck-overlap.js';
+
+// ── Unit-scale Settings overrides ─────────────────────────────────────
+// planck's defaults are tuned for "1 unit = 1 meter, body radii ~1m,
+// velocities ≤ 2 m/s". We feed pixel coords directly so every constant
+// below was silently mis-scaled by ~1-100×, with consequences ranging
+// from imperceptible (linearSlop) to catastrophic (maxTranslation silently
+// clamped a 258 px/s body to 114 px/s within 1 sec; live-tested 2026-05-23).
+//
+// These values are derived from our typical scene geometry (radii 8-30 px,
+// viewport ~1000-2000 px, intended velocity range up to ~1000 px/s) and
+// are NOT user-tunable — changing them re-introduces the mechanism each
+// was set to suppress. See the 2026-05-23 over-penetration triage doc.
+//
+//   linearSlop=0.5          — allowed residual overlap (≈2% of smallest r=8 body)
+//   maxLinearCorrection=8.0 — per-contact per-iter correction cap (5.7× headroom
+//                             over measured worst-case 1.4 px/substep penetration
+//                             in the m=1000,r=0.4 dense cluster bug case)
+//   maxTranslation=50.0     — per-substep displacement cap (= 3000 px/s velocity
+//                             ceiling, 3× over our stated 1000 px/s use range)
+//   velocityThreshold=0.5   — below this px/s, restitution is suppressed (i.e.
+//                             contacts treated as resting). 0.5 is comfortably
+//                             above float noise but low enough that grazing
+//                             contacts still get elastic treatment.
+const PLANCK_SETTINGS_OVERRIDE = Object.freeze({
+  linearSlop:          0.5,
+  maxLinearCorrection: 8.0,
+  maxTranslation:      50.0,
+  velocityThreshold:   0.5,
+});
+
+// Restored at destroy() so a future planck re-init starts from a clean baseline
+// (idempotency safety for tests / device-lost reload scenarios).
+const PLANCK_SETTINGS_DEFAULT = Object.freeze({
+  linearSlop:          0.005,
+  maxLinearCorrection: 0.2,
+  maxTranslation:      2.0,
+  velocityThreshold:   1.0,
+});
 
 let world = null;
 let bodyById = new Map();   // entity.id (u32) → planck Body
+let overlapMgr = null;       // AdaptiveOverlapManager — built in init()
 
 // ── Stage 2: GPU K1 gravity acceleration ─────────────────────────────
 // At backend init we attempt to bring up a WebGPU device + K1 pipeline.
@@ -133,14 +173,16 @@ function computeGravityCPU(entities, n, out) {
 // ── Body lifecycle ───────────────────────────────────────────────────
 
 function createBodyForEntity(e) {
+  const initSpeed = Math.hypot(e.vx || 0, e.vy || 0);
+  const wantsBullet = initSpeed > state.overlapBulletThreshold;
   const body = world.createBody({
     type:           e.pinned ? 'kinematic' : 'dynamic',
     position:       pl.Vec2(e.x, e.y),
     linearVelocity: pl.Vec2(e.vx || 0, e.vy || 0),
-    bullet:         true,    // CCD/TOI — defends against dense-cluster tunneling
+    bullet:         wantsBullet,
     fixedRotation:  true,    // we don't model rotational dynamics
     allowSleep:     false,   // gravity is always non-zero, sleeping breaks our model
-    userData:       e.id,
+    userData:       { id: e.id, isBullet: wantsBullet },
   });
   const r = Math.max(e.radius, 0.01);
   const density = e.mass / (Math.PI * r * r);
@@ -197,6 +239,7 @@ function syncWorldToEntities(entities) {
 }
 
 function pushEntityStateToBodies(entities) {
+  const bulletThr = state.overlapBulletThreshold;
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.absorbing) continue;
@@ -206,6 +249,13 @@ function pushEntityStateToBodies(entities) {
     if (pos.x !== e.x || pos.y !== e.y) b.setPosition(pl.Vec2(e.x, e.y));
     const vel = b.getLinearVelocity();
     if (vel.x !== e.vx || vel.y !== e.vy) b.setLinearVelocity(pl.Vec2(e.vx || 0, e.vy || 0));
+    const ud = b.getUserData();
+    const speed = Math.hypot(e.vx || 0, e.vy || 0);
+    const wantBullet = speed > bulletThr;
+    if (ud && ud.isBullet !== wantBullet) {
+      b.setBullet(wantBullet);
+      ud.isBullet = wantBullet;
+    }
   }
 }
 
@@ -267,11 +317,17 @@ export function makePlanckBackend() {
     name: 'planck',
 
     async init(entities) {
+      pl.Settings.linearSlop          = PLANCK_SETTINGS_OVERRIDE.linearSlop;
+      pl.Settings.maxLinearCorrection = PLANCK_SETTINGS_OVERRIDE.maxLinearCorrection;
+      pl.Settings.maxTranslation      = PLANCK_SETTINGS_OVERRIDE.maxTranslation;
+      pl.Settings.velocityThreshold   = PLANCK_SETTINGS_OVERRIDE.velocityThreshold;
+
       world = pl.World({
         gravity:    pl.Vec2(0, 0),  // we apply our own pairwise gravity via applyForceToCenter
         allowSleep: false,
       });
       bodyById = new Map();
+      overlapMgr = new AdaptiveOverlapManager(state);
       // Stage 2: try to bring up GPU K1 gravity. Non-fatal if it fails —
       // computeGravity() falls back to the CPU loop transparently.
       await tryInitGpuGravity();
@@ -295,7 +351,9 @@ export function makePlanckBackend() {
         b.applyForceToCenter(pl.Vec2(e.mass * accels[i * 2], e.mass * accels[i * 2 + 1]));
       }
 
-      world.step(dt);
+      const [velIter, posIter] = overlapMgr.decideIterations();
+      world.step(dt, velIter, posIter);
+      overlapMgr.recordPostStep(world);
 
       pullBodyStateToEntities(entities);
 
@@ -315,8 +373,13 @@ export function makePlanckBackend() {
       for (const [, b] of bodyById) { try { world.destroyBody(b); } catch {} }
       bodyById.clear();
       world = null;
+      if (overlapMgr) { overlapMgr.reset(); overlapMgr = null; }
       if (gpuGravityHandle) { try { gpuGravityHandle.destroy(); } catch {} gpuGravityHandle = null; }
       if (gpuDevice)        { try { gpuDevice.destroy();        } catch {} gpuDevice        = null; }
+      pl.Settings.linearSlop          = PLANCK_SETTINGS_DEFAULT.linearSlop;
+      pl.Settings.maxLinearCorrection = PLANCK_SETTINGS_DEFAULT.maxLinearCorrection;
+      pl.Settings.maxTranslation      = PLANCK_SETTINGS_DEFAULT.maxTranslation;
+      pl.Settings.velocityThreshold   = PLANCK_SETTINGS_DEFAULT.velocityThreshold;
     },
   };
 }

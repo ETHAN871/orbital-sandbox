@@ -15,7 +15,7 @@ import {
   state,
   PREDICT_DT, PREDICT_STEPS_MAX,
   BOUNDARY_BUFFER_FACTOR,
-} from './state.js';
+} from './state.js?v=ovl1';
 import { prepareBHTree, computeAccelerationsBH } from './physics-barneshut.js';
 import { buildSpatialHash, forEachCollisionPair } from './physics-spatial-hash.js';
 

@@ -14,7 +14,7 @@
 //
 // We use pointer events so mouse, touch, and pen all work.
 
-import { state } from './state.js';
+import { state } from './state.js?v=ovl1';
 import { createEntity, randomPlanetColor } from './entities.js';
 import { predictTrajectory } from './physics.js';
 

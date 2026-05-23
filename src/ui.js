@@ -11,7 +11,7 @@ import {
   state, DEFAULTS, DEFAULTS_TUNING,
   BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
-} from './state.js';
+} from './state.js?v=ovl1';
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
 import { clearContactState } from './physics.js';
@@ -65,6 +65,7 @@ export function bindUI() {
   bindRangeSlider('tune-absorb',      val => { state.absorptionDuration = val; }, 1);
   bindRangeSlider('tune-eps',         val => { state.epsilon = val; },            1);
   bindRangeSlider('tune-predict',     val => { state.predictHorizon = val; },     1);
+  bindRangeSlider('tune-overlap',     val => { state.overlapEscalateThreshold = val; }, 0);
   els.tuneResetBtn.addEventListener('click', resetTuning);
 
   // Initial sync — populate slider-side labels from state defaults so the HTML
@@ -122,13 +123,14 @@ function cacheElements() {
   // For the bulk-reset button, list each advanced-tuning slider with its
   // input/valEl/decimals/stateKey so resetTuning() can iterate uniformly.
   els.tuneInputs = [
-    { id: 'tune-G',           stateKey: 'G',                  decimals: 0 },
-    { id: 'tune-restitution', stateKey: 'elasticRestitution', decimals: 2 },
-    { id: 'tune-K',           stateKey: 'launchSpeedK',       decimals: 2 },
-    { id: 'tune-bh',          stateKey: 'bhThreshold',        decimals: 0 },
-    { id: 'tune-absorb',      stateKey: 'absorptionDuration', decimals: 1 },
-    { id: 'tune-eps',         stateKey: 'epsilon',            decimals: 1 },
-    { id: 'tune-predict',     stateKey: 'predictHorizon',     decimals: 1 },
+    { id: 'tune-G',           stateKey: 'G',                        decimals: 0 },
+    { id: 'tune-restitution', stateKey: 'elasticRestitution',       decimals: 2 },
+    { id: 'tune-K',           stateKey: 'launchSpeedK',             decimals: 2 },
+    { id: 'tune-bh',          stateKey: 'bhThreshold',              decimals: 0 },
+    { id: 'tune-absorb',      stateKey: 'absorptionDuration',       decimals: 1 },
+    { id: 'tune-eps',         stateKey: 'epsilon',                  decimals: 1 },
+    { id: 'tune-predict',     stateKey: 'predictHorizon',           decimals: 1 },
+    { id: 'tune-overlap',     stateKey: 'overlapEscalateThreshold', decimals: 0 },
   ].map(spec => ({
     ...spec,
     input: document.getElementById(spec.id),

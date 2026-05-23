@@ -151,6 +151,10 @@
           <span class="row"><span>预测时长</span><span class="val" id="tune-predict-val">5.0 秒</span></span>
           <input type="range" id="tune-predict" min="1" max="15" step="0.5" value="5" />
         </label>
+        <label title="同时接触对超过此值时，求解器自动加倍迭代次数；0 = 永远加倍；20 = 实际不会触发。默认 4 适合典型场景。">
+          <span class="row"><span>过穿自适应阈值</span><span class="val" id="tune-overlap-val">4</span></span>
+          <input type="range" id="tune-overlap" min="0" max="20" step="1" value="4" />
+        </label>
         <div class="btn-row" style="margin-top: 8px;">
           <button id="tune-reset-btn" class="btn" type="button">恢复默认</button>
         </div>
@@ -173,6 +177,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260523-fps"></script>
+  <script type="module" src="src/main.js?v=20260523-overlap-2"></script>
 </body>
 </html>

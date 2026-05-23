@@ -44,6 +44,29 @@ export const DEFAULTS_TUNING = Object.freeze({
   // spatial-hash collision broadphase (which is correct, but coupled to
   // the same switch); only the gravity side has the documented drift.
   bhThreshold: 256,
+
+  // ─── Adaptive overlap-correction tunables (planck backend) ──────
+  // Background: planck.js Settings are calibrated for "1 unit = 1 meter,
+  // bodies ~1m radius, velocities ≤ 2 m/s". We feed pixel coordinates so
+  // its defaults silently corrupt large-scale physics (e.g. maxTranslation
+  // clamps velocity at 120 px/s, maxLinearCorrection caps overlap recovery
+  // at 0.2 px/substep). physics-planck.js overrides those four named
+  // constants directly at init; this trio is for the on-top adaptive
+  // policy that ramps solver iterations only when overlap is detected.
+  //
+  // - overlapEscalateThreshold: above this many simultaneously-touching
+  //   contact pairs, the next step uses heavier velocity+position
+  //   iteration counts. 0 contacts → baseline (8,3) iters → zero overhead.
+  // - overlapCooldownFrames: once escalated, stay heavy for at least this
+  //   many frames to prevent 2-frame oscillation as overlap clears then
+  //   gravity reintroduces it.
+  // - overlapBulletThreshold: bodies with |v| above this px/s get CCD/TOI
+  //   (bullet=true). Below it, bullet=false → planck skips its expensive
+  //   TOI sub-stepper. Tunneling minimum speed is 2 × r_min / SIM_DT ≈
+  //   960 px/s for r=8; threshold is 3× safer than that floor.
+  overlapEscalateThreshold: 4,
+  overlapCooldownFrames:    6,
+  overlapBulletThreshold:   500,
 });
 
 // Slider semantics: the time-scale and radius sliders display *ratios* — the
@@ -151,13 +174,16 @@ export const state = {
 
   // Tunable physics params — driven by 高级调参 sliders; reset via
   // DEFAULTS_TUNING.
-  G:                  DEFAULTS_TUNING.G,
-  epsilon:            DEFAULTS_TUNING.epsilon,
-  predictHorizon:     DEFAULTS_TUNING.predictHorizon,
-  launchSpeedK:       DEFAULTS_TUNING.launchSpeedK,
-  absorptionDuration: DEFAULTS_TUNING.absorptionDuration,
-  elasticRestitution: DEFAULTS_TUNING.elasticRestitution,
-  bhThreshold:        DEFAULTS_TUNING.bhThreshold,
+  G:                        DEFAULTS_TUNING.G,
+  epsilon:                  DEFAULTS_TUNING.epsilon,
+  predictHorizon:           DEFAULTS_TUNING.predictHorizon,
+  launchSpeedK:             DEFAULTS_TUNING.launchSpeedK,
+  absorptionDuration:       DEFAULTS_TUNING.absorptionDuration,
+  elasticRestitution:       DEFAULTS_TUNING.elasticRestitution,
+  bhThreshold:              DEFAULTS_TUNING.bhThreshold,
+  overlapEscalateThreshold: DEFAULTS_TUNING.overlapEscalateThreshold,
+  overlapCooldownFrames:    DEFAULTS_TUNING.overlapCooldownFrames,
+  overlapBulletThreshold:   DEFAULTS_TUNING.overlapBulletThreshold,
 
   // Canvas background color — toggled by the 深/浅 button.
   // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.
