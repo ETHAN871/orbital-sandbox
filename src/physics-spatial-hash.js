@@ -45,8 +45,8 @@ export function buildSpatialHash(entities) {
   // Y direction; X was fine because viewport.width / cellSize happened to
   // overflow less, putting bodies near the right edge into the cell the
   // modular wrap correctly pointed to). User-visible symptom: bodies
-  // overlapping at top/bottom of viewport, escalating Y jitter when BH is
-  // enabled (BH dispatch also gates the spatial hash via state.bhThreshold).
+  // overlapping at top/bottom of viewport, escalating Y jitter on dense
+  // wrap-spanning clusters.
   //
   // Fix: count cells with FLOOR(viewport / minCellSize) so each cell is
   // ≥ minCellSize (the 2×maxR guarantee is preserved), then compute the

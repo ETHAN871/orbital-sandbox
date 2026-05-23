@@ -16,26 +16,18 @@ import {
   PREDICT_DT, PREDICT_STEPS_MAX,
   BOUNDARY_BUFFER_FACTOR,
 } from './state.js';
-import { prepareBHTree, computeAccelerationsBH } from './physics-barneshut.js';
 import { buildSpatialHash, forEachCollisionPair } from './physics-spatial-hash.js';
 
-// V8.1c: BH dispatch threshold is now user-tunable via state.bhThreshold.
-// Functions read state.bhThreshold at call time so the slider takes
-// effect immediately on the next frame.
-
-// V8.3: prepare per-frame data structures. main.js calls this before the
-// substep loop. The BH quadtree is built ONCE per frame — gravity is a
-// continuous force (∝ 1/r²) and tolerates the SIM_DT × |v| position drift
-// between substeps within Verlet's integration tolerance. The spatial hash
-// is NOT built here (V8.3 fix): unlike gravity, the broadphase is a binary
-// classifier — a 0.5 px drift that crosses a cell boundary causes a 100%
-// miss for that pair, not a small numerical error. So the hash is rebuilt
+// 2026-05-23: Barnes-Hut deleted. Gravity is always O(N²) exact on CPU
+// (and on GPU via the K1 wrapper); BH was a CPU-era compromise that
+// broke Newton's 3rd law via per-target tree traversal and amplified
+// the residual 9× in wrap mode via ghost-stacking. On GPU O(N²) at
+// 5000+ bodies is sub-millisecond, so BH's O(N log N) advantage is
+// irrelevant going forward. prepareFrame is now a no-op for the CPU
+// backend; the spatial hash for collision broadphase is rebuilt
 // per-substep inside handleCollisions (see comment there).
-export function prepareFrame(entities) {
-  if (entities.length >= state.bhThreshold) {
-    prepareBHTree(entities);
-    // buildSpatialHash moved to handleCollisions for per-substep freshness.
-  }
+export function prepareFrame(_entities) {
+  // No-op (formerly built the BH quadtree).
 }
 
 // ─── Minimum-image distance helpers (wrap mode) ───────────────────
@@ -58,12 +50,6 @@ function minImageDelta(d, span) {
 
 export function computeAccelerations(entities, accels) {
   const n = entities.length;
-  // V8.2: dispatch to Barnes-Hut for large N. The direct O(N²) sum below
-  // wins at small N due to lower constant factor + cache locality.
-  if (n >= state.bhThreshold) {
-    computeAccelerationsBH(entities, accels);
-    return;
-  }
   for (let i = 0; i < n; i++) { accels[i].ax = 0; accels[i].ay = 0; }
 
   // V7 perf: hoist wrap/viewport reads out of the N² hot path and inline
@@ -835,54 +821,14 @@ export function handleCollisions(entities) {
   // _solvePositionConstraints (run later inside stepPBD) drains it.
   _contactCount = 0;
 
-  // V8.3: large-N path uses wrap-aware spatial hash for O(N·k) broadphase.
-  // The hash is rebuilt HERE (per-substep), not in prepareFrame (V8.2's
-  // per-frame approach caused Type-1 misses: bodies that drifted across
-  // cell boundaries during the gravity-kick + predict steps would still be
-  // registered in their old bucket, invisible to queries targeting their
-  // new neighborhood — observable as persistent overlaps at the Y wrap
-  // edge on dense BH-active clusters). After applyBoundary teleport at the
-  // end of the previous substep, positions are baked in here and the hash
-  // matches reality. BH tree stays per-frame (continuous force, tolerant
-  // of drift) — see prepareFrame.
-  if (n >= state.bhThreshold) {
-    buildSpatialHash(entities);
-    forEachCollisionPair(entities, processCollisionPair);
-    return;
-  }
-
-  // Direct O(N²) path for small N. V7 perf: same hoisting as
-  // computeAccelerations to avoid per-pair property reads.
-  const wrap = state.boundaryMode === 'wrap';
-  const W = wrap ? state.viewport.width  : 0;
-  const H = wrap ? state.viewport.height : 0;
-  const halfW = W * 0.5;
-  const halfH = H * 0.5;
-
-  for (let i = 0; i < n - 1; i++) {
-    const a = entities[i];
-    if (a.absorbing) continue;
-    for (let j = i + 1; j < n; j++) {
-      // Re-check `a` every iteration — it can have become prey earlier in
-      // this same inner loop (e.g., when this is a dense cluster). Without
-      // this break, a frozen absorbing body could receive a second
-      // beginAbsorption() or an elastic impulse and "wake up".
-      if (a.absorbing) break;
-      const b = entities[j];
-      if (b.absorbing) continue;
-      let dx = b.x - a.x;
-      let dy = b.y - a.y;
-      if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
-      }
-      // V8.2: dispatch through shared helper so both small-N (direct) and
-      // large-N (spatial-hash) paths run identical collision logic. The
-      // dispatch boundary is state.bhThreshold (default 256 — see state.js
-      // for the rationale and how to tune).
-      processCollisionPair(a, b, dx, dy);
-    }
-  }
+  // Spatial hash is the canonical broadphase — wrap-aware (modular cells)
+  // and O(N·k) where k is the per-body neighbour count. At N=2 it degenerates
+  // to a 1×1 cell with all bodies inside, which is correct (just one Map
+  // lookup of overhead per call). 2026-05-23: removed the small-N direct
+  // O(N²) fast path; the perf delta at typical scene sizes is in noise and
+  // not worth a parallel implementation that has to stay in sync.
+  buildSpatialHash(entities);
+  forEachCollisionPair(entities, processCollisionPair);
 }
 
 // Rebuild _prevPairImpulses from the just-populated _contacts AFTER

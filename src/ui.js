@@ -15,7 +15,6 @@ import {
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
 import { clearContactState } from './physics.js';
-import { clearBHTree } from './physics-barneshut.js';
 
 const els = {};
 
@@ -39,9 +38,8 @@ export function bindUI() {
     // every removed entity until they're overwritten next substep —
     // which never happens when the user pauses + clears, so memory
     // accumulates across long sessions. See physics.js clearContactState
-    // and physics-barneshut.js clearBHTree for the full rationale.
+    // for the full rationale.
     clearContactState();
-    clearBHTree();
     syncFromSelection();
   });
   els.editBtn.addEventListener('click', toggleEditMode);
@@ -61,7 +59,6 @@ export function bindUI() {
   bindRangeSlider('tune-G',           val => { state.G = val; },                  0);
   bindRangeSlider('tune-restitution', val => { state.elasticRestitution = val; }, 2);
   bindRangeSlider('tune-K',           val => { state.launchSpeedK = val; },       2);
-  bindRangeSlider('tune-bh',          val => { state.bhThreshold = val; },        0);
   bindRangeSlider('tune-absorb',      val => { state.absorptionDuration = val; }, 1);
   bindRangeSlider('tune-eps',         val => { state.epsilon = val; },            1);
   bindRangeSlider('tune-predict',     val => { state.predictHorizon = val; },     1);
@@ -126,7 +123,6 @@ function cacheElements() {
     { id: 'tune-G',           stateKey: 'G',                        decimals: 0 },
     { id: 'tune-restitution', stateKey: 'elasticRestitution',       decimals: 2 },
     { id: 'tune-K',           stateKey: 'launchSpeedK',             decimals: 2 },
-    { id: 'tune-bh',          stateKey: 'bhThreshold',              decimals: 0 },
     { id: 'tune-absorb',      stateKey: 'absorptionDuration',       decimals: 1 },
     { id: 'tune-eps',         stateKey: 'epsilon',                  decimals: 1 },
     { id: 'tune-predict',     stateKey: 'predictHorizon',           decimals: 1 },
