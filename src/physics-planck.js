@@ -372,20 +372,31 @@ export function makePlanckBackend() {
       pushEntityStateToBodies(entities);
 
       const accels = await computeGravity(entities);
+      // 2026-05-23: User clarified — sleep is NOT a force-rejection mode.
+      // A sleeping body still receives forces; it just stays asleep when
+      // the applied force is too weak to push its velocity above the
+      // sleep tolerance in one substep. This preserves the "no resistance"
+      // contract: any meaningful external force wakes the body and
+      // computes normally; only negligible forces are ignored (and they'd
+      // be discarded by Box2D's applyForceToCenter on a sleeping body
+      // anyway, so the gate just lets us skip the call cleanly).
+      //
+      // Threshold derivation: |Δv| over one substep = |accel| × dt. The
+      // body sleeps when |v| < linearSleepTolerance. If the applied accel
+      // would produce |Δv| above tolerance, that's a non-negligible force.
+      const sleepTol = pl.Settings.linearSleepTolerance;
       for (let i = 0; i < entities.length; i++) {
         const e = entities[i];
         if (e.absorbing || e.pinned) continue;
         const b = bodyById.get(e.id);
         if (!b) continue;
-        // Sleeping bodies are in stable equilibrium (contact normal force
-        // already balances gravity from previous applies). Skipping the
-        // applyForceToCenter call leaves them asleep — they'll wake via
-        // contact propagation if a non-sleeping body intrudes the cluster.
-        // Without this guard, every applyForceToCenter call wakes the body
-        // (default wake=true), defeating sleep entirely on gravitational
-        // aggregates.
-        if (!b.isAwake()) continue;
-        b.applyForceToCenter(pl.Vec2(e.mass * accels[i * 2], e.mass * accels[i * 2 + 1]));
+        const ax = accels[i * 2];
+        const ay = accels[i * 2 + 1];
+        if (!b.isAwake()) {
+          const dv = Math.hypot(ax, ay) * dt;
+          if (dv <= sleepTol) continue;
+        }
+        b.applyForceToCenter(pl.Vec2(e.mass * ax, e.mass * ay));
       }
 
       const [velIter, posIter] = overlapMgr.decideIterations();
