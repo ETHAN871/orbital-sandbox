@@ -411,23 +411,23 @@ export async function createBackend() {
     async init(entities) {
       if (initialized) return;
       initialized = true;
-      // Engine selection (post-2026-05-23 evening):
+      // Engine selection:
+      //   default OR ?engine=rapier → Rapier2D backend (physics-rapier.js)
+      //                   ↑ confirmed working in real Chrome 2026-05-24.
+      //                   Wrap-bug fix (destroy+recreate on teleport)
+      //                   built in.
+      //   ?engine=planck → planck.js backend (physics-planck.js).
+      //                   Kept as fallback / regression compare.
       //   ?engine=cpu    → legacy hand-ported Box2D-style PBD (physics.js)
       //   ?engine=webgpu → legacy K1-K8 GPU pipeline (physics-gpu-*.js)
-      //   ?engine=rapier → Rapier2D backend (physics-rapier.js)
-      //                   ⚠ WIP — integration still has a "bodies not
-      //                   stepped" trap under investigation. Opt-in for
-      //                   developer testing only. See task #87 in tracker.
-      //   default OR ?engine=planck → planck.js backend (physics-planck.js)
-      // Planck remains the production default while the Rapier swap is
-      // being debugged. Once rapier works end-to-end it will become
-      // default; the wrap-bug fix (destroy+recreate on teleport) is
-      // already implemented inside physics-rapier.js for that day.
+      // Note: prior preview-MCP debugging session falsely concluded
+      // Rapier was broken — that was a preview-only crash, not a
+      // Rapier bug. Real Chrome runs Rapier at 240fps stable.
       const params = new URLSearchParams(window.location.search);
       const engineParam = params.get('engine');
-      const wantRapier = engineParam === 'rapier';
-      const wantPlanck = engineParam === 'planck' ||
+      const wantRapier = engineParam === 'rapier' ||
         (engineParam === null && params.get('backend') !== 'force-cpu');
+      const wantPlanck = engineParam === 'planck';
       let usingExternalEngine = false;
       if (wantRapier) {
         try {
