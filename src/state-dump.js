@@ -20,50 +20,46 @@ let writeIdx = 0;
 let totalRecorded = 0;
 
 let _state = null;
-let _backendRef = null;     // backend wrapper from physics-backend.js (must have snapshot() method)
 let _getTunables = null;    // () → object snapshot of all state tunables
 
-export function installRecorder(state, backend, getTunables) {
+export function installRecorder(state, getTunables) {
   _state = state;
-  _backendRef = backend;
   _getTunables = getTunables;
 }
 
-export function recordFrame(frameMeta) {
+// Substep trace — called from inside backend.step(), once per substep,
+// AFTER pull-back to entities. The trace argument carries the substep's
+// pre-state (before gravity), gravity vectors per entity, post-state
+// (after world.step), contact details (normal/depth from the engine),
+// and any wrap-rebuild events. We log raw inputs and outputs only —
+// derived quantities (kinetic energy, momentum, Δv_solver, tangential
+// decomposition, etc.) are computed offline from these by the analysis
+// pass, per "VSCode-debug-trace" diagnostic philosophy.
+//
+// Schema per ring slot:
+//   {
+//     substep:       monotonic substep index
+//     wallTimeMs:    DOMHighResTimestamp at record moment
+//     dt:            integrator timestep this substep used (SIM_DT)
+//     solverIters:   { velocity, pgs }    — backend's current iter counts
+//     pre:           [ { id, x, y, vx, vy, sleeping } ]
+//     gravity:       [ { id, ax, ay } ]   — accel from computeGravity
+//     post:          [ { id, x, y, vx, vy, sleeping } ]
+//     contacts:      [ { aId, bId, nx, ny, depth } ]
+//     wrappedEntityIds: ids destroyed+recreated by wrap-boundary
+//   }
+export function recordSubstep(trace) {
   if (!_state) return;
-  const backendSnapshot = (_backendRef && typeof _backendRef.snapshot === 'function')
-    ? _backendRef.snapshot()
-    : null;
-  const sleepingMap = backendSnapshot?.bodyStates || {};
-  const entities = _state.entities;
-  const out = new Array(entities.length);
-  for (let i = 0; i < entities.length; i++) {
-    const e = entities[i];
-    const bs = sleepingMap[e.id];
-    out[i] = {
-      id: e.id,
-      type: e.type,
-      x: +e.x.toFixed(3),
-      y: +e.y.toFixed(3),
-      vx: +(e.vx || 0).toFixed(3),
-      vy: +(e.vy || 0).toFixed(3),
-      mass: e.mass,
-      radius: +(e.radius || 0).toFixed(3),
-      charge: e.charge,
-      pinned: !!e.pinned,
-      absorbing: e.absorbing !== null,
-      sleeping: bs ? !!bs.sleeping : null,
-      ccd:      bs ? !!bs.ccd      : null,
-    };
-  }
   ring[writeIdx] = {
-    frame: totalRecorded,
-    wallTimeMs: +performance.now().toFixed(1),
-    substepsRun: frameMeta?.substepsRun ?? 0,
-    wrappedEntityIds: frameMeta?.wrappedEntityIds || [],
-    entities: out,
-    contacts: backendSnapshot?.contacts || [],
-    solverIters: backendSnapshot?.solverIters || null,
+    substep: totalRecorded,
+    wallTimeMs: +performance.now().toFixed(2),
+    dt: trace.dt,
+    solverIters: trace.solverIters || null,
+    pre: trace.pre || [],
+    gravity: trace.gravity || [],
+    post: trace.post || [],
+    contacts: trace.contacts || [],
+    wrappedEntityIds: trace.wrappedEntityIds || [],
   };
   writeIdx = (writeIdx + 1) % RING_SIZE;
   totalRecorded++;
@@ -80,14 +76,34 @@ export async function dumpToServer(label = 'manual') {
     const slot = ring[(oldest + i) % RING_SIZE];
     if (slot) ringOrdered.push(slot);
   }
+  // Static identification of every entity that touched the ring window
+  // (id → mass / radius / charge / type / pinned). Pulled OUT of the
+  // per-substep slots so they don't repeat 180 × N times.
+  const idMeta = {};
+  for (const slot of ringOrdered) {
+    for (const e of (slot.pre || [])) {
+      if (!idMeta[e.id]) {
+        const ent = _state.entities.find(x => x.id === e.id);
+        if (ent) idMeta[e.id] = {
+          type: ent.type,
+          mass: ent.mass,
+          radius: +ent.radius.toFixed(3),
+          charge: ent.charge,
+          pinned: !!ent.pinned,
+        };
+      }
+    }
+  }
   const payload = {
     label,
     timestamp: new Date().toISOString(),
+    schemaVersion: 2,
     viewport: { ..._state.viewport },
     boundaryMode: _state.boundaryMode,
     backendName: _state.backendName,
     entityCount: _state.entities.length,
     tunables: _getTunables ? _getTunables() : null,
+    idMeta,
     ringSize: RING_SIZE,
     ringFrames: ringOrdered.length,
     ringBuffer: ringOrdered,

@@ -31,7 +31,6 @@ import {
   installRecorder,
   installKeyHandler as installDumpKeyHandler,
   installPersistentHint as installDumpHint,
-  recordFrame as recordDumpFrame,
 } from './state-dump.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
@@ -61,12 +60,13 @@ attachInput(stageCanvas, _newId => syncFromSelection());
 const backend = await createBackend();
 await backend.init(state.entities);
 
-// state-dump.js: keyboard D + UI button. The recorder needs the backend
-// reference so it can call snapshot() each frame for per-body sleeping +
-// contact-pair data. The tunables getter just snapshots the runtime
-// physics knobs (G, epsilon, etc.) at dump time so the saved JSON is
-// self-contained for offline analysis.
-installRecorder(state, backend, () => ({
+// state-dump.js: keyboard D + UI button. The ring buffer is now
+// substep-granular — physics-rapier.js calls recordSubstep() at the
+// end of each backend.step(), capturing pre-state, gravity vectors,
+// post-state, and contact manifolds. The tunables getter just
+// snapshots the runtime physics knobs at dump time so the saved JSON
+// is self-contained for offline analysis.
+installRecorder(state, () => ({
   G:                        state.G,
   epsilon:                  state.epsilon,
   elasticRestitution:       state.elasticRestitution,
@@ -126,12 +126,6 @@ async function runFrame(now) {
     steps++;
   }
   if (steps >= MAX_SUBSTEPS) accumulator = 0;
-
-  // Record this frame's outcome into the state-dump ring buffer. The
-  // recorder queries backend.snapshot() for engine-internal data
-  // (sleep / contacts / iters) so the dump captures both our entity
-  // array and the physics-engine view at the same instant.
-  recordDumpFrame({ substepsRun: steps, wrappedEntityIds: [] });
 
   // V8.1: update the phosphor-decay trail FBO once per visual frame.
   // The fade rate is keyed on simulation time (not wall time), so pausing

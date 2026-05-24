@@ -57,6 +57,7 @@ import { updateAbsorptions, applyBoundary } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';
 import { AdaptiveOverlapManager } from './physics-planck-overlap.js';
+import { recordSubstep } from './state-dump.js';
 
 // ── Unit-scale + solver knobs ─────────────────────────────────────────
 // lengthUnit converts pixel coordinates to physics-engine "meters" so
@@ -367,10 +368,10 @@ function detectAndStartBHAbsorptions(entities) {
 function applyBoundaryAndRebuildOnWrap(entities, viewport, boundaryMode) {
   if (boundaryMode !== 'wrap') {
     applyBoundary(entities, viewport, boundaryMode);
-    return;
+    return [];
   }
   const W = viewport.width, H = viewport.height;
-  if (W <= 0 || H <= 0) return;
+  if (W <= 0 || H <= 0) return [];
   const wrappedIds = [];
   for (const e of entities) {
     if (e.absorbing) continue;
@@ -390,6 +391,7 @@ function applyBoundaryAndRebuildOnWrap(entities, viewport, boundaryMode) {
     destroyBody(id);
     createBodyForEntity(e);
   }
+  return wrappedIds;
 }
 
 // ── Backend factory ──────────────────────────────────────────────────
@@ -428,7 +430,33 @@ export function makeRapierBackend() {
       syncWorldToEntities(entities);
       pushEntityStateToBodies(entities);
 
+      // ── state-dump trace capture: pre-state ──────────────────────
+      // Records every entity's exact position/velocity/sleep flag at
+      // the start of this substep, BEFORE gravity is applied. Combined
+      // with the gravity vectors below and the post-state after
+      // world.step, an offline analyzer can compute Δv_solver per
+      // entity and decompose it onto the contact normal to detect
+      // tangential-impulse leaks.
+      const pre = entities.map(e => {
+        const b = bodyById.get(e.id);
+        return {
+          id: e.id,
+          x:  +e.x.toFixed(3),
+          y:  +e.y.toFixed(3),
+          vx: +(e.vx || 0).toFixed(3),
+          vy: +(e.vy || 0).toFixed(3),
+          sleeping: b ? !!b.isSleeping() : null,
+        };
+      });
+
       const accels = await computeGravity(entities);
+
+      // Per-entity gravity vector this substep (before addForce).
+      const gravity = entities.map((e, i) => ({
+        id: e.id,
+        ax: +accels[i * 2].toFixed(6),
+        ay: +accels[i * 2 + 1].toFixed(6),
+      }));
       const sleepTol = SLEEP_LINEAR_THRESHOLD_PX_PER_S;
       for (let i = 0; i < entities.length; i++) {
         const e = entities[i];
@@ -459,33 +487,77 @@ export function makeRapierBackend() {
 
       world.step();
 
-      // Post-step: count touching contact pairs for next-step iteration
-      // decision. Rapier doesn't have a direct "all touching pairs"
-      // iterator; we walk per-collider and count, dedup'd by stable
-      // collider handle ordering.
-      let touchingCount = 0;
-      const seen = _contactCounterSeen;
-      seen.clear();
+      // Single contact-iteration pass: counts touching pairs for the
+      // adaptive overlap manager AND extracts manifold details (normal,
+      // depth) for the state-dump trace. Dedup'd by sorted handle pair.
+      const contactsTrace = [];
+      const seenPairs = _contactCounterSeen;
+      seenPairs.clear();
       world.forEachCollider(c => {
-        const handleA = c.handle;
+        const aHandle = c.handle;
+        const aBody = c.parent();
+        const aId = aBody ? aBody.userData : null;
         world.contactPairsWith(c, (other) => {
-          const handleB = other.handle;
-          const pairKey = handleA < handleB
-            ? handleA * 0x100000000 + handleB
-            : handleB * 0x100000000 + handleA;
-          if (seen.has(pairKey)) return;
-          seen.add(pairKey);
-          touchingCount++;
+          const bHandle = other.handle;
+          const key = aHandle < bHandle
+            ? aHandle * 0x100000000 + bHandle
+            : bHandle * 0x100000000 + aHandle;
+          if (seenPairs.has(key)) return;
+          seenPairs.add(key);
+          const bBody = other.parent();
+          const bId = bBody ? bBody.userData : null;
+          let nx = null, ny = null, depth = null;
+          try {
+            const manifold = world.contactPair(c, other);
+            if (manifold && manifold.numContacts && manifold.numContacts() > 0) {
+              const n1 = manifold.localNormal1 ? manifold.localNormal1() : null;
+              if (n1) { nx = +n1.x.toFixed(4); ny = +n1.y.toFixed(4); }
+              if (manifold.solverContactDepth) {
+                depth = +manifold.solverContactDepth(0).toFixed(4);
+              }
+            }
+          } catch {}
+          contactsTrace.push({ aId, bId, nx, ny, depth });
         });
       });
-      overlapMgr.recordPostStep(touchingCount);
+      overlapMgr.recordPostStep(contactsTrace.length);
 
       pullBodyStateToEntities(entities);
 
       detectAndStartBHAbsorptions(entities);
       updateAbsorptions(entities, dt);
-      applyBoundaryAndRebuildOnWrap(entities, viewport, boundaryMode);
+      const wrappedIds = applyBoundaryAndRebuildOnWrap(entities, viewport, boundaryMode);
       syncWorldToEntities(entities);
+
+      // ── state-dump trace: post-state ─────────────────────────────
+      // After pull-back + absorption + boundary + sync. This is the
+      // "final" entity state for the substep. The recorder's offline
+      // pass takes (pre.v, gravity.a, post.v) and computes
+      //   Δv_solver = post.v - pre.v - gravity.a * dt
+      // which isolates Rapier's solver contribution per substep.
+      const post = entities.map(e => {
+        const b = bodyById.get(e.id);
+        return {
+          id: e.id,
+          x:  +e.x.toFixed(3),
+          y:  +e.y.toFixed(3),
+          vx: +(e.vx || 0).toFixed(3),
+          vy: +(e.vy || 0).toFixed(3),
+          sleeping: b ? !!b.isSleeping() : null,
+        };
+      });
+      recordSubstep({
+        dt,
+        solverIters: {
+          velocity: world.numSolverIterations,
+          pgs: world.numInternalPgsIterations,
+        },
+        pre,
+        gravity,
+        post,
+        contacts: contactsTrace,
+        wrappedEntityIds: wrappedIds,
+      });
     },
 
     onEntityMetaMaybeChanged() {
