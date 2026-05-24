@@ -465,6 +465,16 @@ export async function createBackend() {
       active.onEntityMetaMaybeChanged();
     },
 
+    // Optional engine introspection used by state-dump.js to capture
+    // sleep/contact/iteration data into the per-frame ring buffer.
+    // Backends that don't implement it get null returned (the dump
+    // module degrades gracefully — entity x/y/v are still captured).
+    snapshot() {
+      return (active && typeof active.snapshot === 'function')
+        ? active.snapshot()
+        : null;
+    },
+
     destroy() {
       active.destroy();
     },

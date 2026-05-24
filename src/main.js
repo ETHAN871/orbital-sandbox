@@ -27,6 +27,12 @@ import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
+import {
+  installRecorder,
+  installKeyHandler as installDumpKeyHandler,
+  installPersistentHint as installDumpHint,
+  recordFrame as recordDumpFrame,
+} from './state-dump.js';
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
@@ -54,6 +60,27 @@ attachInput(stageCanvas, _newId => syncFromSelection());
 // RAF loop is kicked off only after the backend resolves.
 const backend = await createBackend();
 await backend.init(state.entities);
+
+// state-dump.js: keyboard D + UI button. The recorder needs the backend
+// reference so it can call snapshot() each frame for per-body sleeping +
+// contact-pair data. The tunables getter just snapshots the runtime
+// physics knobs (G, epsilon, etc.) at dump time so the saved JSON is
+// self-contained for offline analysis.
+installRecorder(state, backend, () => ({
+  G:                        state.G,
+  epsilon:                  state.epsilon,
+  elasticRestitution:       state.elasticRestitution,
+  launchSpeedK:             state.launchSpeedK,
+  absorptionDuration:       state.absorptionDuration,
+  predictHorizon:           state.predictHorizon,
+  overlapEscalateThreshold: state.overlapEscalateThreshold,
+  overlapCooldownFrames:    state.overlapCooldownFrames,
+  overlapBulletThreshold:   state.overlapBulletThreshold,
+  timeScale:                state.timeScale,
+  trailLength:              state.trailLength,
+}));
+installDumpKeyHandler();
+installDumpHint();
 
 let lastTime = performance.now();
 let accumulator = 0;
@@ -99,6 +126,12 @@ async function runFrame(now) {
     steps++;
   }
   if (steps >= MAX_SUBSTEPS) accumulator = 0;
+
+  // Record this frame's outcome into the state-dump ring buffer. The
+  // recorder queries backend.snapshot() for engine-internal data
+  // (sleep / contacts / iters) so the dump captures both our entity
+  // array and the physics-engine view at the same instant.
+  recordDumpFrame({ substepsRun: steps, wrappedEntityIds: [] });
 
   // V8.1: update the phosphor-decay trail FBO once per visual frame.
   // The fade rate is keyed on simulation time (not wall time), so pausing

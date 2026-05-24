@@ -492,6 +492,50 @@ export function makeRapierBackend() {
       // TODO support live radius/mass edits (matches planck stage 1).
     },
 
+    // Engine-side snapshot for the state-dump module. Returns:
+    //   bodyStates: { [entityId]: { sleeping, ccd } }
+    //   contacts:   [{ a: entityIdA, b: entityIdB }, ...]
+    //   solverIters: { velocity, pgs }
+    // contactPairsWith fires once per (collider, pair) so we dedup via
+    // a sorted pair-key. Entity ids come from body.userData (set in
+    // createBodyForEntity).
+    snapshot() {
+      if (!world) return null;
+      const bodyStates = {};
+      for (const [id, b] of bodyById) {
+        bodyStates[id] = {
+          sleeping: b.isSleeping(),
+          ccd: !!b._isCcdEnabled,
+        };
+      }
+      const contacts = [];
+      const seen = new Set();
+      world.forEachCollider(c => {
+        const aHandle = c.handle;
+        const aBody = c.parent();
+        const aId = aBody ? aBody.userData : null;
+        world.contactPairsWith(c, (other) => {
+          const bHandle = other.handle;
+          const key = aHandle < bHandle
+            ? aHandle * 0x100000000 + bHandle
+            : bHandle * 0x100000000 + aHandle;
+          if (seen.has(key)) return;
+          seen.add(key);
+          const bBody = other.parent();
+          const bId = bBody ? bBody.userData : null;
+          contacts.push({ a: aId, b: bId });
+        });
+      });
+      return {
+        bodyStates,
+        contacts,
+        solverIters: {
+          velocity: world.numSolverIterations,
+          pgs: world.numInternalPgsIterations,
+        },
+      };
+    },
+
     destroy() {
       for (const id of [...bodyById.keys()]) destroyBody(id);
       bodyById.clear();

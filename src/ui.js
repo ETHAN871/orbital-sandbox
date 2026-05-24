@@ -12,6 +12,7 @@ import {
   BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
+import { dumpToServer as dumpStateToServer } from './state-dump.js';
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
 import { clearContactState } from './physics.js';
@@ -49,6 +50,9 @@ export function bindUI() {
   els.boundaryBtn.addEventListener('click', toggleBoundaryMode);
   els.fieldBtn.addEventListener('click', toggleFieldMode);
   els.bgThemeBtn.addEventListener('click', toggleBgTheme);
+  if (els.dumpStateBtn) {
+    els.dumpStateBtn.addEventListener('click', () => dumpStateToServer('button click'));
+  }
 
   // Trail-width slider (collapsible "线宽设置" section).
   bindRangeSlider('trail-width', val => { state.trailWidth = val; }, 1);
@@ -114,6 +118,7 @@ function cacheElements() {
   els.fieldBtn      = document.getElementById('field-btn');
   // Background theme + trail width + advanced tuning panel.
   els.bgThemeBtn      = document.getElementById('bg-theme-btn');
+  els.dumpStateBtn    = document.getElementById('dump-state-btn');
   els.trailWidthInput = document.getElementById('trail-width');
   els.trailWidthVal   = document.getElementById('trail-width-val');
   els.tuneResetBtn    = document.getElementById('tune-reset-btn');

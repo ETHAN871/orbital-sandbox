@@ -1,23 +1,33 @@
-"""Dev-only HTTP server that disables HTTP caching.
+"""Dev-only HTTP server: no-cache + state-dump receiver.
 
-Python's stdlib http.server emits Last-Modified but no Cache-Control. Chrome
-then heuristically caches JS modules for 10% of (now - Last-Modified), which
-means recently-edited files can stay stale in the browser for several minutes
-after they're written to disk. For an ESM-no-bundler workflow this corrupts
-the dev loop — edits silently no-op until cache lifetime expires.
+Two responsibilities:
 
-This wrapper subclasses SimpleHTTPRequestHandler and prepends headers that
-tell the browser to revalidate every request. It's used only by the dev
-preview server (see .claude/launch.json); the production GitHub Pages deploy
-is unaffected.
+1. Subclass SimpleHTTPRequestHandler to prepend Cache-Control: no-store
+   to every response, so Chrome doesn't heuristically cache ESM modules
+   (which has bitten this codebase repeatedly during development).
+
+2. Accept POST requests to /dump — the page sends a JSON snapshot of
+   the physics ring buffer when the user presses D (or clicks the dump
+   button). The server writes the body to
+   `<server_dir>/.claude/dumps/dump_<ms>.json` so Claude can read it
+   via the Read tool and diagnose runtime bugs the user observes.
+
+Used only by the dev preview server (see .claude/launch.json); the
+production GitHub Pages deploy is unaffected.
 
 Usage:
   python .claude/nocache_server.py <port> --directory <dir>
 """
 
+import json
+import os
 import sys
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from functools import partial
+
+
+DUMP_SUBDIR = ".claude/dumps"
 
 
 class NoCacheHandler(SimpleHTTPRequestHandler):
@@ -25,7 +35,53 @@ class NoCacheHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
+        # Allow the page to POST JSON without a CORS preflight hiccup.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
+    def do_POST(self):
+        if not self.path.startswith("/dump"):
+            self.send_error(404, "Only /dump is a POST endpoint")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            # Sanity-check JSON before persisting.
+            try:
+                json.loads(body.decode("utf-8"))
+            except Exception as e:
+                self.send_error(400, f"Invalid JSON: {e}")
+                return
+
+            dump_dir = os.path.join(self.directory, DUMP_SUBDIR)
+            os.makedirs(dump_dir, exist_ok=True)
+            ts_ms = int(time.time() * 1000)
+            filename = f"dump_{ts_ms}.json"
+            path = os.path.join(dump_dir, filename)
+            with open(path, "wb") as f:
+                f.write(body)
+
+            rel = os.path.relpath(path, self.directory).replace("\\", "/")
+            print(f"[dump] wrote {rel} ({len(body)} bytes)", flush=True)
+
+            resp = json.dumps({
+                "ok": True,
+                "path": rel,
+                "size": len(body),
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+        except Exception as e:
+            self.send_error(500, f"Server error: {e}")
 
 
 def main():
@@ -46,7 +102,8 @@ def main():
     handler = partial(NoCacheHandler, directory=directory)
     server = HTTPServer(("", port), handler)
     print(f"nocache-server listening on http://localhost:{port}/ "
-          f"(directory={directory})", flush=True)
+          f"(directory={directory}; POST /dump -> {DUMP_SUBDIR}/)",
+          flush=True)
     server.serve_forever()
 
 
