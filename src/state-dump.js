@@ -10,9 +10,11 @@
 // dev can see the lead-up + the bug moment + the immediate aftermath.
 //
 // Engine-agnostic: this module knows nothing about Rapier or planck.
-// The caller passes in a `backendSnapshot` per frame which the
-// backend constructs in its own snapshot() method (contact pairs,
-// sleeping state, internal solver counters, etc.).
+// The backend pushes data here via recordSubstep() directly, which is
+// invoked from inside the backend's per-substep loop. (An earlier
+// design had the backend expose a pull-style snapshot() method that
+// this module would call; that path is gone — recordSubstep() is the
+// only data ingress.)
 
 // Ring length = 360 substeps ≈ 6 s at 60 Hz substep cadence. Doubled from
 // 180 so contact moments that fall just outside a 3-second window still
@@ -105,6 +107,10 @@ export function installRecorder(state, getTunables) {
 //   }
 export function recordSubstep(trace) {
   if (!_state) return;
+  // Gate: only record when the runtime toggle is ON. Avoids GC pressure
+  // from ~10 object allocs per entity per substep when not actively
+  // diagnosing. UI button in 操作 panel flips state.stateDumpEnabled.
+  if (!_state.stateDumpEnabled) return;
   ring[writeIdx] = {
     substep: totalRecorded,
     wallTimeMs: +performance.now().toFixed(2),
@@ -226,6 +232,14 @@ export function installKeyHandler() {
     if (t && t.matches && t.matches('input, textarea, select')) return;
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     ev.preventDefault();
+    // Only dump when recording is enabled. If the toggle is off there's
+    // nothing useful in the ring (recordSubstep was a no-op). Show a
+    // small toast so the user knows the press registered but did
+    // nothing.
+    if (!_state || !_state.stateDumpEnabled) {
+      flashHint('状态录制未开启', '#fa4');
+      return;
+    }
     dumpToServer('keyboard D');
   });
 }
@@ -267,7 +281,8 @@ function flashHint(text, color = '#4f4') {
   }, 1500);
 }
 
-// Persistent "press D" hint near the FPS widget. Drawn once at startup.
+// Persistent "press D" hint near the FPS widget. Created hidden;
+// setStateDumpEnabled(true) reveals it. Drawn once at startup.
 let _persistentHintEl = null;
 export function installPersistentHint() {
   if (_persistentHintEl) return;
@@ -284,7 +299,29 @@ export function installPersistentHint() {
     font: '11px monospace',
     zIndex: '9999',
     pointerEvents: 'none',
+    display: 'none',  // hidden until state-dump toggle flips ON
   });
   _persistentHintEl.textContent = '按 D 抓取状态';
   document.body.appendChild(_persistentHintEl);
+  // Sync visibility with the current toggle state (in case the user
+  // already enabled before this function ran — unlikely but cheap).
+  if (_state && _state.stateDumpEnabled) {
+    _persistentHintEl.style.display = '';
+  }
+}
+
+// UI callable: toggles state.stateDumpEnabled AND the persistent hint
+// visibility in one place so the two stay in sync. Also flashes a
+// short status toast so the user gets feedback on the click.
+export function setStateDumpEnabled(enabled) {
+  if (!_state) return;
+  const newValue = !!enabled;
+  _state.stateDumpEnabled = newValue;
+  if (_persistentHintEl) {
+    _persistentHintEl.style.display = newValue ? '' : 'none';
+  }
+  flashHint(
+    newValue ? '状态录制：开 — 按 D 截图' : '状态录制：关',
+    newValue ? '#4f4' : '#888',
+  );
 }

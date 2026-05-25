@@ -719,8 +719,21 @@ function _ensureSpriteTexture(canvas) {
 // ─── Color parsing ────────────────────────────────────────────────
 
 const _colorRgbCache = new Map();
+// Mid-gray fallback when an entity reaches the renderer without a color
+// field. Prevents the entire runFrame() pipeline from throwing — see
+// the long comment inside _colorToRgbNorm for the historical bug context.
+const _COLOR_DEFAULT_RGB = [0.5, 0.5, 0.5];
 
 function _colorToRgbNorm(c) {
+  // Defensive: if an entity reaches the renderer without a color field
+  // (e.g., constructed by external code that bypassed entities.createEntity),
+  // fall back to mid-gray instead of throwing TypeError on charCodeAt.
+  // Historical context: the crash was catastrophic — runFrame()'s catch
+  // was rescheduling RAF without endFrame ever firing, so perf-mon /
+  // state-dump showed "FPS 218" (raw RAF callback rate) while no actual
+  // render or physics state-pull completed. Discovered 2026-05-25 while
+  // diagnosing user-reported stalls.
+  if (c == null) return _COLOR_DEFAULT_RGB;
   const cached = _colorRgbCache.get(c);
   if (cached) return cached;
   let r, g, b;

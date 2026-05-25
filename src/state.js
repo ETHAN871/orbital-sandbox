@@ -37,17 +37,38 @@ export const DEFAULTS_TUNING = Object.freeze({
   //
   // - overlapEscalateThreshold: above this many simultaneously-touching
   //   contact pairs, the next step uses heavier velocity+position
-  //   iteration counts. 0 contacts → baseline (8,3) iters → zero overhead.
+  //   iteration counts. 0 contacts → baseline iters → zero overhead.
+  //   Baseline differs per backend: Rapier passes (4,2), planck passes
+  //   (8,3). See physics-rapier.js SOLVER_ITERATIONS_* / PGS_ITERATIONS_*.
   // - overlapCooldownFrames: once escalated, stay heavy for at least this
   //   many frames to prevent 2-frame oscillation as overlap clears then
   //   gravity reintroduces it.
   // - overlapBulletThreshold: bodies with |v| above this px/s get CCD/TOI
   //   (bullet=true). Below it, bullet=false → planck skips its expensive
   //   TOI sub-stepper. Tunneling minimum speed is 2 × r_min / SIM_DT ≈
-  //   960 px/s for r=8; threshold is 3× safer than that floor.
+  //   960 px/s for r=8; threshold is 2.4× safer than that floor.
   overlapEscalateThreshold: 4,
   overlapCooldownFrames:    6,
-  overlapBulletThreshold:   500,
+  overlapBulletThreshold:   400,
+
+  // Contact spring stiffness: angular natural frequency ω₀ for the
+  // TGS-Soft contact constraint. Effective spring k = m·ω₀² (the F=kx
+  // form the user asked for). Higher → snappier rebounds, faster
+  // overlap resolution, more rigid feel. Lower → softer, gummier.
+  //
+  // Rapier default ω₀ = 377 (= 2π × 60) is near-instantaneous and
+  // produces a catastrophic spawn explosion (corrective velocity
+  // ≈ 3000 px/s for r=30 spawn-overlap). We expose ω₀ ∈ [2, 60].
+  //
+  // SAFETY INVARIANT (2026-05-25 semantic redesign): this setting
+  // applies ONLY to bodies that are either (a) pre-existing, (b)
+  // newly-spawned with no initial overlap, or (c) newly-spawned and
+  // already resolved out of overlap. While ANY body is still in
+  // active spawn-overlap resolution, physics-rapier.js clamps the
+  // world contact_natural_frequency to a safe ceiling (6) — making
+  // spawn-explosion physically impossible regardless of the slider
+  // position. See physics-rapier.js's prepareFrame gate.
+  contactStiffness: 6,
 });
 
 // Slider semantics: the time-scale and radius sliders display *ratios* — the
@@ -164,6 +185,7 @@ export const state = {
   overlapEscalateThreshold: DEFAULTS_TUNING.overlapEscalateThreshold,
   overlapCooldownFrames:    DEFAULTS_TUNING.overlapCooldownFrames,
   overlapBulletThreshold:   DEFAULTS_TUNING.overlapBulletThreshold,
+  contactStiffness:         DEFAULTS_TUNING.contactStiffness,
 
   // Canvas background color — toggled by the 深/浅 button.
   // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.
@@ -191,6 +213,13 @@ export const state = {
   // ignored — CPU's simple solver works off entity state after K2 readback.
   // Used to bisect the dense-cluster bug.
   simpleSolver: false,
+
+  // state-dump runtime toggle. Default OFF — the per-substep trace
+  // recording is expensive (allocates ~10 JS objects per entity per
+  // substep into a 360-slot ring buffer = significant GC pressure).
+  // UI button in 操作 panel flips this. When ON, the persistent "按 D
+  // 抓取" hint is shown and the D-key handler is armed.
+  stateDumpEnabled: false,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────

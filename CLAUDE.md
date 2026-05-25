@@ -97,3 +97,122 @@ Single mutable `state` object — every other module imports and mutates through
 - **Zero build / zero npm.** If you find yourself wanting to add a dep, first try inlining what you need. The import map in `index.html` is the only allowed dep mechanism, and it's currently used only for `d3-quadtree`.
 - **`prepareFrame` is the per-frame setup hook.** New per-frame data structures (anything that can be reused across substeps without violating correctness) go there. Per-substep state goes inside `stepPBD`.
 - The workspace `CLAUDE.md` (one level up) covers agent/slash-command etiquette, delegation matrix, and the workspace-wide rules. Read it once if you haven't.
+
+## Preview MCP — recurring-mistake checklist (READ BEFORE TOUCHING PREVIEW)
+
+This trap has been hit **at least 5 times** across sessions. The lesson decays between sessions. Follow this checklist verbatim.
+
+### Symptom
+
+`preview_eval` reports `url: "chrome-error://chromewebdata/"`, dynamic imports fail with `Failed to fetch dynamically imported module: chrome-error://chromewebdata/src/state.js`, HUD/DOM probes return null/false.
+
+### Correct recovery (in order)
+
+1. **Navigate via `window.open(url, '_self')` — NOT `location.href = ...`, NOT `location.reload()`**. Chrome-error pages disable `location.*` assignments for security.
+2. **Append a UNIQUE query (e.g., `?perf=1&t=${Date.now()}`)** so the navigation isn't a same-URL no-op.
+3. **Wait AT LEAST 3-5 seconds** in the SAME eval before checking. Rapier WASM init alone is 130-160 ms; module fetch + parse adds another 500-1500 ms.
+4. **If the eval returns `"Inspected target navigated or closed"` — THAT IS THE SUCCESS SIGNAL**, not an error. It means the page navigated away mid-eval, which is what we wanted. **Issue a FRESH eval to query the now-loaded state**.
+5. **DO NOT `preview_stop` then `preview_start`** unless `preview_list` shows the server is genuinely dead. Stop+start orphans the browser tab and forces it deeper into chrome-error. The fix for "tab stuck" is window.open, not server restart.
+
+### Mistakes I keep making (call them out before repeating)
+
+- Treating `"Inspected target navigated or closed"` as failure → it's success.
+- Checking `location.href` ≤ 500 ms after `window.open` → navigation hasn't finished. Wait longer.
+- Calling `preview_stop` + `preview_start` when the page is just stuck → makes it worse, not better.
+- Using `location.href = ...`, `location.assign(...)`, `location.replace(...)`, or `<a>.click()` from chrome-error → all of these silently no-op in that context.
+- Forgetting that ESM module cache is keyed by URL **without query string** — main.js cache-buster `?v=X` does NOT invalidate sub-module imports. If a sub-module change isn't taking effect, hard-reload via window.open with new query on the entry URL, not by bumping main.js version.
+
+### One-shot probe template (always use this)
+
+```js
+(async () => {
+  window.open('http://localhost:8123/?perf=1&t=' + Date.now(), '_self');
+  await new Promise(r => setTimeout(r, 5000));   // patience — Rapier WASM init
+  return { url: location.href, hud: !!document.getElementById('perf-hud') };
+})();
+// If eval rejects with "Inspected target navigated or closed" — it WORKED.
+// Issue a fresh eval to read state. Don't conclude failure from that error.
+```
+
+## Optimization-loop methodology (LEARN FROM PAST WINS)
+
+The session ending 2026-05-25 had a **6-stage thrash** (Stages 0-6 produced
+modest gains despite many changes) followed by a **3-iteration breakthrough**
+(Iter 1-3 achieved 7-8× FPS improvement at the user's target scenario,
+30 → 233 FPS at N = 200 dense). What flipped wasn't WHAT was changed but
+HOW. These are the engineering-method lessons, not the specific facts.
+
+### Methodology principles
+
+1. **Build the right instrumentation before changing anything.** The
+   thrash phase had a "FPS meter" that measured RAF callback rate —
+   meaningless when every frame was throwing inside a try / catch. The
+   wins started when perf-monitor got per-phase breakdown + `interFrame`
+   capture + `worstFrames` attribution. Without finer measurement, you
+   are guessing — and guesses compound badly across many iterations.
+
+2. **Verify the measurement is honest before trusting any data.** A
+   silent renderer crash made the FPS read 218 while no frame actually
+   completed. Sanity check: when a metric correlates badly with the
+   user's lived experience, suspect the metric first — not the code
+   under measurement.
+
+3. **One iteration = one hypothesis from one piece of data → one
+   targeted fix → one verification.** Don't bundle multiple guesses.
+   Iter 1: "where is the 49 ms unaccounted gap?" → add interFrame →
+   confirmed browser-side. Iter 2: "what's 27 ms of contactsTrace?" →
+   split full readManifold vs fast count → 27 → 0.3 ms. Iter 3: "why
+   is gravity 17 ms with GPU enabled?" → measure CPU equivalent → raise
+   threshold → 17 → 0.6 ms. Each step reversible; each verifies the
+   hypothesis before the next moves.
+
+4. **When the measurement-loop friction is high, fix the loop first.**
+   Lost ~3 cycles fighting preview-MCP chrome-error before recognizing
+   the recovery pattern was already documented. Slow / broken inner
+   loop costs compound exponentially across many iterations — drop
+   physics work and fix the loop instead.
+
+5. **Recognize "metric vs reality" mismatches early.** "Inspected
+   target navigated or closed" looks like an error, is actually a
+   success signal (page navigated mid-eval — what you wanted).
+   "longTaskCount = 0" doesn't mean "no stalls" — a 79 ms frame can
+   split across multiple short tasks via await boundaries.
+
+6. **Small composable steps beat big architectural reaches.** Three
+   ~30-min iterations produced 7-8× speedup. The "big" alternatives
+   (Stage 7 Worker, ~2-week rewrite) weren't needed yet. Don't reach
+   for the structural refactor while small targeted fixes still produce
+   measurable wins. The path is: small-cheap-fix → measure → if the
+   metric stops improving, THEN reach bigger.
+
+7. **Stop iterating when the algorithmic floor is the wall.** At
+   N = 700, CPU O(N²/2) gravity hit ~10 ms and Rapier internal solver
+   hit ~10 ms. Both are physics-layer floors, not JS overhead. Honest
+   acknowledgment > another speculative tweak. The next move from
+   there is structural (worker, different engine), not parametric.
+
+### When to escalate to `code-architect`
+
+- **Don't** call it for measurement instrumentation, data-driven
+  one-line constant changes, or surgical bug fixes. Those are
+  mechanical and well-served by self-plan.
+- **Do** call it for structural decisions: changing the threading
+  model (Worker), switching physics engines, redesigning the substep
+  loop. These have wide blast radius and the architect's "would this
+  break X / Y / Z" surfacing is genuinely valuable.
+- Iter 1-3 used zero architect calls because data was clear and fixes
+  were targeted. Over-using architect for small surgical changes is a
+  stalling tactic disguised as caution.
+
+### Just-in-time pivot patterns (recognize these signals)
+
+| Signal | Pivot to |
+|---|---|
+| All metrics look fine but user reports breakage | The meter is lying. Verify what each number REPRESENTS, not what it looks like. |
+| Optimization X "should" help but doesn't | Hypothesis was based on a phase you're not measuring. Add finer instrumentation, retest. |
+| Inner loop (preview / build / test) takes > 30 s | Stop pushing changes; spend 1 hour fixing the loop. |
+| Multiple consecutive iterations show diminishing returns | You hit the floor — admit it and document. Don't fake a 0.1 % win. |
+| A measured phase is < 1 ms but the frame is 30 ms | Work is happening in unmeasured space (GC, browser, sub-modules). Add a catch-all phase like `interFrame`. |
+| Eval / probe error message looks like failure | Disambiguate by reading the actual error text. Some look bad but mean success. |
+| You're tempted to call architect for a 5-line change | Just do it. Architect is for "what breaks across X / Y / Z" not "should I lower this constant." |
+| Same problem appears N+1 times with N already > 2 | Add the lesson to CLAUDE.md as METHOD (not fact) before doing the work. Decay is real. |

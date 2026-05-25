@@ -24,13 +24,12 @@ import {
   applyBoundary,
 } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
-import { createGravityGPU } from './physics-gpu-gravity.js';
-import { createK2GPU } from './physics-gpu-k2.js';
-import { createBroadphaseGPU } from './physics-gpu-broadphase.js';
-import { createK4GPU } from './physics-gpu-k4.js';
-import { createK5GPU, computeVelIter } from './physics-gpu-k5.js';
-import { createK6GPU } from './physics-gpu-k6.js';
-import { createK8GPU } from './physics-gpu-k8.js';
+// Legacy K1-K8 WebGPU pipeline imports moved INSIDE makeGpuBackend()
+// (2026-05-25 cleanup). When Rapier is the active backend (default),
+// these modules never load — saves ~5-10 ms startup parse time and
+// the 7 JS-file fetches the user's browser would otherwise do for
+// dead code. The legacy-WebGPU path (?engine=webgpu, no Rapier) pays
+// a one-time dynamic-import cost during makeGpuBackend.
 
 // Diagnostic URL param parse: ?solver=simple switches stepPBD's contact
 // solver to a 1-iteration direct-math version. See state.js for rationale.
@@ -81,6 +80,28 @@ function makeCpuBackend() {
 // at the next substep boundary — triggers swapToCpu('nan-propagation').
 
 async function makeGpuBackend(device, wgslSources, onLost) {
+  // Lazy-load the K1-K8 modules. Parallel fetch via Promise.all so the
+  // round-trip cost is one RTT not seven. Falls into the closures below
+  // via destructuring (computeVelIter is in K5's module).
+  const [
+    { createGravityGPU },
+    { createK2GPU },
+    { createBroadphaseGPU },
+    { createK4GPU },
+    k5Module,
+    { createK6GPU },
+    { createK8GPU },
+  ] = await Promise.all([
+    import('./physics-gpu-gravity.js'),
+    import('./physics-gpu-k2.js'),
+    import('./physics-gpu-broadphase.js'),
+    import('./physics-gpu-k4.js'),
+    import('./physics-gpu-k5.js'),
+    import('./physics-gpu-k6.js'),
+    import('./physics-gpu-k8.js'),
+  ]);
+  const { createK5GPU, computeVelIter } = k5Module;
+
   const gravity = await createGravityGPU(device, wgslSources.k1);
   const k2 = await createK2GPU(device, wgslSources.k2, gravity);
   const broadphase = await createBroadphaseGPU(device, {
@@ -99,6 +120,7 @@ async function makeGpuBackend(device, wgslSources, onLost) {
   let dispatchIdx = 0;
   let pendingReadback = null;     // resolves to { positions, velocities, nanCount }
   let teardown = false;
+  let _readbackWarnedOnce = false;   // throttle for the readback-rejection log
 
   device.lost.then(info => {
     if (teardown) return;
@@ -174,7 +196,19 @@ async function makeGpuBackend(device, wgslSources, onLost) {
       return { positions, velocities, nanCount, gpuVel, gpuPV, k4Read, dispatchedN: N };
     })().catch(err => {
       if (teardown) return null;
-      if (verbose) console.warn('[physics-backend] readback rejected:', err);
+      // Log non-teardown readback failures, but only ONCE per session to
+      // avoid console spam under transient WebGPU stalls (tab backgrounding,
+      // GPU scheduler hiccups). Returning null causes step() to silently
+      // skip the substep — the warning is critical for diagnosing freezes
+      // but doesn't need repeating every frame. The verbose gate ALSO logs
+      // every occurrence for the deep-diagnostic path.
+      // Code-review HIGH 2026-05-25 (silent-failure-hunter + code-reviewer).
+      if (!_readbackWarnedOnce) {
+        _readbackWarnedOnce = true;
+        console.warn('[physics-backend] readback rejected — substep skipped, entities will not move this frame (further occurrences suppressed; pass ?backend=verbose for full log):', err);
+      } else if (verbose) {
+        console.warn('[physics-backend] readback rejected (repeat):', err);
+      }
       return null;
     });
   }
@@ -463,16 +497,6 @@ export async function createBackend() {
 
     onEntityMetaMaybeChanged() {
       active.onEntityMetaMaybeChanged();
-    },
-
-    // Optional engine introspection used by state-dump.js to capture
-    // sleep/contact/iteration data into the per-frame ring buffer.
-    // Backends that don't implement it get null returned (the dump
-    // module degrades gracefully — entity x/y/v are still captured).
-    snapshot() {
-      return (active && typeof active.snapshot === 'function')
-        ? active.snapshot()
-        : null;
     },
 
     destroy() {

@@ -23,11 +23,41 @@ import json
 import os
 import sys
 import time
+import traceback
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from functools import partial
 
 
 DUMP_SUBDIR = ".claude/dumps"
+
+
+class ResilientHTTPServer(HTTPServer):
+    """HTTPServer hardened for dev-loop survivability.
+
+    - allow_reuse_address bypasses Windows' TIME_WAIT lockout when the
+      preview MCP restarts the server quickly (default Python behavior
+      can leave the port unbindable for ~30 s after kill, manifesting as
+      "Address already in use" on restart).
+    - handle_error swallows benign socket-disconnect errors (Chrome
+      aggressively closes mid-response during fast reloads). Without
+      this, an EPIPE or ECONNRESET during e.g. a hot-reload race could
+      propagate up and kill the serve_forever loop, leaving the page
+      stranded on chrome-error://.
+    """
+    allow_reuse_address = True
+    # daemon_threads ensures lingering request handlers don't keep the
+    # process alive past serve_forever exit. Not strictly required for
+    # HTTPServer (single-threaded) but harmless and future-proof if we
+    # ever switch to ThreadingHTTPServer.
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc_type, exc_val, _ = sys.exc_info()
+        if exc_type in (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            return
+        print(f"[server-error] {client_address}: {exc_type.__name__}: {exc_val}",
+              file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
 
 
 class NoCacheHandler(SimpleHTTPRequestHandler):
@@ -100,11 +130,21 @@ def main():
             port = int(args[i])
             i += 1
     handler = partial(NoCacheHandler, directory=directory)
-    server = HTTPServer(("", port), handler)
+    server = ResilientHTTPServer(("", port), handler)
     print(f"nocache-server listening on http://localhost:{port}/ "
-          f"(directory={directory}; POST /dump -> {DUMP_SUBDIR}/)",
+          f"(directory={directory}; POST /dump -> {DUMP_SUBDIR}/) "
+          f"[resilient: allow_reuse_address + handle_error guard]",
           flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        # Clean exit on Ctrl-C / SIGINT — release the port immediately
+        # instead of leaving TIME_WAIT residue (which would have already
+        # been mitigated by allow_reuse_address, but explicit shutdown
+        # is still cleaner).
+        print("\n[shutdown] SIGINT received; closing server.", flush=True)
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

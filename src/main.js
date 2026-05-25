@@ -28,13 +28,40 @@ import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {
+  initPerfMonitor,
+  markPhase as perfMarkPhase,
+  endFrame as perfEndFrame,
+  setContext as perfSetContext,
+} from './perf-monitor.js';
+import { tickQuality, getQualityKnobs, setEnabled as setAqmEnabled } from './quality-manager.js';
+
+// URL escape hatch: `?aqm=off` disables AQM (full quality always).
+// Useful when debugging physics artifacts — confirms whether an issue
+// stems from AQM's iter/substep clamping or from physics itself.
+try {
+  if (new URLSearchParams(window.location.search).get('aqm') === 'off') {
+    setAqmEnabled(false);
+    console.info('[main] AQM disabled via ?aqm=off');
+  }
+} catch {}
+import {
   installRecorder,
   installKeyHandler as installDumpKeyHandler,
   installPersistentHint as installDumpHint,
 } from './state-dump.js';
 
+initPerfMonitor();
+
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
+// Phase C: when last frame was visibly slow (>30 ms = below 33 FPS),
+// throttle this frame to a single substep. Prevents the heavy-frame
+// chain reaction where one expensive dense-cluster frame inflates
+// realDt → accumulator overflow → more substeps next frame → spiral.
+// Cost: physics runs at half real-time while load persists (visible
+// slo-mo). Benefit: cursor stays responsive instead of stuttering.
+const SLOW_FRAME_THRESHOLD_MS = 30;
+let _lastFrameWasSlow = false;
 
 const stageCanvas = document.getElementById('stage');
 
@@ -107,33 +134,37 @@ async function runFrame(now) {
   const realDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
   lastTime = now;
 
-  // V8.2 / Phase 1: backend.prepareFrame owns per-frame setup. CPU builds
-  // the Barnes-Hut quadtree; GPU skips it (exact O(N²) on-device). The
-  // spatial hash is built per-substep inside handleCollisions either way.
+  perfMarkPhase('prepareFrame');
   backend.prepareFrame(state.entities);
 
   const effectiveRatio = state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale;
   accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
+  // Substep cap is the floor of three signals:
+  //   (1) MAX_SUBSTEPS (8) — hard safety net
+  //   (2) _lastFrameWasSlow → 1 (binary spiral-of-death guard)
+  //   (3) AQM substepBudget → 1-2 (smooth quality knob: at quality=0
+  //       we cap at 1 substep, at quality=1 we allow up to 2)
+  // AQM gives finer-grained control than the binary (2) guard; both
+  // can fire simultaneously, the tighter wins.
+  const aqmKnobs = getQualityKnobs();
+  const aqmSubstepCap = Math.max(1, Math.round(aqmKnobs.substepBudget));
+  const maxSubstepsThisFrame = _lastFrameWasSlow
+    ? 1
+    : Math.min(MAX_SUBSTEPS, aqmSubstepCap);
   let steps = 0;
-  while (accumulator >= SIM_DT && steps < MAX_SUBSTEPS) {
-    // Phase 2 G12 contract: isLast is true on the substep whose completion
-    // ends the current frame's substep loop. Backend uses this to gate the
-    // end-of-frame shadow-buffer copy + mapAsync (active at sub-phase 2e+
-    // when K7 wires in; currently a no-op).
-    const isLast = (accumulator - SIM_DT < SIM_DT) || (steps + 1 >= MAX_SUBSTEPS);
+  while (accumulator >= SIM_DT && steps < maxSubstepsThisFrame) {
+    const isLast = (accumulator - SIM_DT < SIM_DT) || (steps + 1 >= maxSubstepsThisFrame);
+    perfMarkPhase('worldStep');
     await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode, isLast);
     accumulator -= SIM_DT;
     steps++;
   }
-  if (steps >= MAX_SUBSTEPS) accumulator = 0;
+  if (steps >= maxSubstepsThisFrame) accumulator = 0;
 
-  // V8.1: update the phosphor-decay trail FBO once per visual frame.
-  // The fade rate is keyed on simulation time (not wall time), so pausing
-  // freezes trails and 3× time-scale fades 3× faster.
+  perfMarkPhase('post');
   const simDelta = steps * SIM_DT;
   updateTrailCanvas(simDelta);
 
-  // Drop selection silently if the selected entity is gone OR mid-absorption.
   if (state.selectedId !== null) {
     const sel = state.entities.find(e => e.id === state.selectedId);
     if (!sel || sel.absorbing) {
@@ -142,15 +173,27 @@ async function runFrame(now) {
     }
   }
 
-  // V9.0b: WebGL draws everything. drawScene clears, blits trail, draws
-  // entity sprites. V9.1 inserts drawField between scene and UI (gated by
-  // state.showField → zero cost when off). drawUI then overlays hover /
-  // drag / prediction / selection / absorbing on the same framebuffer.
+  perfMarkPhase('render');
   drawSceneGL();
   drawField();
   drawUI();
 
   updateEntityCount();
+  perfSetContext({
+    N: state.entities.length,
+    substepsThisFrame: steps,
+    backend: state.backendName,
+  });
+  // Track whether this frame was slow → next frame will throttle to 1
+  // substep to prevent chained slow frames. performance.now() - now is
+  // the entire RAF callback duration (includes physics + render + post).
+  const frameMs = performance.now() - now;
+  _lastFrameWasSlow = frameMs > SLOW_FRAME_THRESHOLD_MS;
+  // Feed AQM for adaptive quality ramping. AQM observes p95 dt over
+  // a 60-frame rolling window and adjusts iter caps / substep budget
+  // / contactsTrace sampling to keep dt close to target FPS.
+  tickQuality(frameMs);
+  perfEndFrame();
 }
 
 // ─── Canvas / DPR ──────────────────────────────────────────────────

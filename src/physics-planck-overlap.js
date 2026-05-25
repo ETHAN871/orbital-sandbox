@@ -23,6 +23,11 @@
 // internals need updating; the iteration-count state machine and the
 // public surface stay identical.
 
+// Default (planck-era) iteration range — exported for backward compat.
+// Callers SHOULD pass engine-specific values via the constructor's
+// `iters` parameter (Rapier path passes SOLVER_ITERATIONS_* / PGS_*).
+// Constructors that omit `iters` fall through to these defaults so
+// pre-existing planck call sites keep their original 8/3 baseline.
 export const OVERLAP_VEL_ITER_BASE = 8;
 export const OVERLAP_VEL_ITER_MAX  = 24;
 export const OVERLAP_POS_ITER_BASE = 3;
@@ -43,8 +48,18 @@ export const OVERLAP_POS_ITER_MAX  = 12;
 //                         entire cooldown.
 
 export class AdaptiveOverlapManager {
-  constructor(state) {
+  // `iters` (optional) overrides the engine-specific iteration range:
+  //   { velBase, velMax, posBase, posMax }
+  // When omitted, defaults to the planck-era 8/24/3/12 range so
+  // existing planck-backend constructions keep their original baseline.
+  // Rapier backend passes 4/8/2/4 — see SOLVER_ITERATIONS_* and
+  // PGS_ITERATIONS_* in physics-rapier.js.
+  constructor(state, iters) {
     this._state = state;
+    this._velBase = iters?.velBase ?? OVERLAP_VEL_ITER_BASE;
+    this._velMax  = iters?.velMax  ?? OVERLAP_VEL_ITER_MAX;
+    this._posBase = iters?.posBase ?? OVERLAP_POS_ITER_BASE;
+    this._posMax  = iters?.posMax  ?? OVERLAP_POS_ITER_MAX;
     this._liveTouchingCount = 0;
     this._peakDuringCooldown = 0;
     this._cooldownRemaining = 0;
@@ -59,17 +74,17 @@ export class AdaptiveOverlapManager {
     if (this._cooldownRemaining > 0) {
       return this._scale(this._peakDuringCooldown);
     }
-    return [OVERLAP_VEL_ITER_BASE, OVERLAP_POS_ITER_BASE];
+    return [this._velBase, this._posBase];
   }
 
   _scale(count) {
     const vi = Math.min(
-      OVERLAP_VEL_ITER_MAX,
-      OVERLAP_VEL_ITER_BASE + Math.floor(count / 4),
+      this._velMax,
+      this._velBase + Math.floor(count / 4),
     );
     const pi = Math.min(
-      OVERLAP_POS_ITER_MAX,
-      OVERLAP_POS_ITER_BASE + Math.floor(count / 8),
+      this._posMax,
+      this._posBase + Math.floor(count / 8),
     );
     return [vi, pi];
   }

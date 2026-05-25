@@ -12,7 +12,7 @@ import {
   BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
-import { dumpToServer as dumpStateToServer } from './state-dump.js';
+import { setStateDumpEnabled } from './state-dump.js';
 import { refreshEntityColor } from './entities.js';
 import { resetTrailCanvas } from './renderer-webgl.js';
 import { clearContactState } from './physics.js';
@@ -51,7 +51,11 @@ export function bindUI() {
   els.fieldBtn.addEventListener('click', toggleFieldMode);
   els.bgThemeBtn.addEventListener('click', toggleBgTheme);
   if (els.dumpStateBtn) {
-    els.dumpStateBtn.addEventListener('click', () => dumpStateToServer('button click'));
+    refreshStateDumpBtn();
+    els.dumpStateBtn.addEventListener('click', () => {
+      setStateDumpEnabled(!state.stateDumpEnabled);
+      refreshStateDumpBtn();
+    });
   }
 
   // Trail-width slider (collapsible "线宽设置" section).
@@ -67,6 +71,7 @@ export function bindUI() {
   bindRangeSlider('tune-eps',         val => { state.epsilon = val; },            1);
   bindRangeSlider('tune-predict',     val => { state.predictHorizon = val; },     1);
   bindRangeSlider('tune-overlap',     val => { state.overlapEscalateThreshold = val; }, 0);
+  bindRangeSlider('tune-stiffness',   val => { state.contactStiffness = val; },   0);
   els.tuneResetBtn.addEventListener('click', resetTuning);
 
   // Initial sync — populate slider-side labels from state defaults so the HTML
@@ -132,6 +137,7 @@ function cacheElements() {
     { id: 'tune-eps',         stateKey: 'epsilon',                  decimals: 1 },
     { id: 'tune-predict',     stateKey: 'predictHorizon',           decimals: 1 },
     { id: 'tune-overlap',     stateKey: 'overlapEscalateThreshold', decimals: 0 },
+    { id: 'tune-stiffness',   stateKey: 'contactStiffness',         decimals: 0 },
   ].map(spec => ({
     ...spec,
     input: document.getElementById(spec.id),
@@ -417,4 +423,13 @@ function refreshFieldBtn() {
   if (!els.fieldBtn) return;
   els.fieldBtn.classList.toggle('active', state.showField);
   els.fieldBtn.textContent = state.showField ? '隐藏场' : '显示场';
+}
+
+function refreshStateDumpBtn() {
+  if (!els.dumpStateBtn) return;
+  const on = !!state.stateDumpEnabled;
+  els.dumpStateBtn.classList.toggle('active', on);
+  els.dumpStateBtn.textContent = on
+    ? '状态录制：开 (按 D 截图)'
+    : '状态录制：关 (点击开启)';
 }
