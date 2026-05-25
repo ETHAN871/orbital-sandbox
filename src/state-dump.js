@@ -14,13 +14,27 @@
 // backend constructs in its own snapshot() method (contact pairs,
 // sleeping state, internal solver counters, etc.).
 
-const RING_SIZE = 180;
+// Ring length = 360 substeps ≈ 6 s at 60 Hz substep cadence. Doubled from
+// 180 so contact moments that fall just outside a 3-second window still
+// get captured — the bug-of-interest (tangential v accumulation during a
+// brief contact) was being missed when the dump fired a beat late.
+const RING_SIZE = 360;
 const ring = new Array(RING_SIZE);
 let writeIdx = 0;
 let totalRecorded = 0;
 
 let _state = null;
 let _getTunables = null;    // () → object snapshot of all state tunables
+
+// Per-id metadata cache. recordSubstep populates this while the entity
+// is still alive in state.entities. dumpToServer reads from here when
+// state.entities.find() returns null (entity already destroyed by the
+// time the user pressed D), so dumps that span "place → contact →
+// clear → place again" still describe every id in the ring window.
+//
+// Cache is not trimmed: at ~5 fields per id and monotonically increasing
+// ids, growth is ≈ 50 B per entity ever placed — negligible.
+const _idMetaCache = new Map();
 
 export function installRecorder(state, getTunables) {
   _state = state;
@@ -31,8 +45,9 @@ export function installRecorder(state, getTunables) {
 // AFTER pull-back to entities. The trace argument carries the substep's
 // pre-state (before gravity), gravity vectors per entity, post-state
 // (after world.step), contact details (normal/depth from the engine),
-// and any wrap-rebuild events. We log raw inputs and outputs only —
-// derived quantities (kinetic energy, momentum, Δv_solver, tangential
+// in-step contact events drained from the engine's EventQueue, and any
+// wrap-rebuild events. We log raw inputs and outputs only — derived
+// quantities (kinetic energy, momentum, Δv_solver, tangential
 // decomposition, etc.) are computed offline from these by the analysis
 // pass, per "VSCode-debug-trace" diagnostic philosophy.
 //
@@ -43,9 +58,49 @@ export function installRecorder(state, getTunables) {
 //     dt:            integrator timestep this substep used (SIM_DT)
 //     solverIters:   { velocity, pgs }    — backend's current iter counts
 //     pre:           [ { id, x, y, vx, vy, sleeping } ]
-//     gravity:       [ { id, ax, ay } ]   — accel from computeGravity
+//     gravity:       [ { id, ax, ay, forceApplied } ]
+//                       forceApplied=true  → addForce was called this substep
+//                       forceApplied=false → skipped for one of these reasons:
+//                                            (absorbing | pinned | no-body |
+//                                             sleeping+tiny-impulse).
+//                                            Note that ax/ay are still the
+//                                            computed gravity vector — the
+//                                            value is just not delivered to
+//                                            the body.
 //     post:          [ { id, x, y, vx, vy, sleeping } ]
-//     contacts:      [ { aId, bId, nx, ny, depth } ]
+//     contacts:      [ { aId, bId, nx, ny, depth } ]  post-step query
+//     contactEventsTruncated: bool — true if more than 512 events fired
+//                       in this substep and the tail was dropped. The
+//                       cap exists to prevent unbounded GC pressure
+//                       from a pathological dense cluster. Offline
+//                       analysis should flag these substeps explicitly.
+//     contactEvents: [ { aId, bId, started, aVx, aVy, bVx, bVy,
+//                         nx, ny, depth } ]
+//                       drained from Rapier EventQueue — fires for each
+//                       contact start/end *inside* world.step, so brief
+//                       impacts that resolve mid-step are still captured
+//                       even when the post-step query sees nothing.
+//                       aVx/aVy/bVx/bVy are read at drain time, AFTER
+//                       world.step has fully returned — every event in
+//                       this slot's contactEvents shares the same final
+//                       post-step velocity for its body. They are NOT
+//                       per-event velocities at the moment the event
+//                       fired. Cross-reference with adjacent slots'
+//                       pre[]/post[] entries by id for finer timing.
+//                       nx/ny/depth are the contact normal (aId → bId
+//                       orientation, world frame because balls have
+//                       lockRotations) and Rapier's solver-target depth
+//                       at drain time. NULL on end events (manifold
+//                       has already dissolved by drain time) — use the
+//                       contacts[] entry from one substep earlier for
+//                       the normal that was active just before the end.
+//                       In wrap mode, IDs can be NEGATIVE: aId = -(N+1)
+//                       means the contact involved a ghost body that
+//                       mirrors real entity N (a copy placed at the
+//                       wrap-offset position so cross-edge contacts are
+//                       detected). To recover the real entity, take
+//                       (-aId - 1). Both positive and negative IDs
+//                       refer to the same underlying matter.
 //     wrappedEntityIds: ids destroyed+recreated by wrap-boundary
 //   }
 export function recordSubstep(trace) {
@@ -59,10 +114,30 @@ export function recordSubstep(trace) {
     gravity: trace.gravity || [],
     post: trace.post || [],
     contacts: trace.contacts || [],
+    contactEvents: trace.contactEvents || [],
+    contactEventsTruncated: !!trace.contactEventsTruncated,
     wrappedEntityIds: trace.wrappedEntityIds || [],
   };
   writeIdx = (writeIdx + 1) % RING_SIZE;
   totalRecorded++;
+
+  // Cache metadata for every id we saw this substep while the entity
+  // is still alive — dumpToServer can then describe destroyed ids too.
+  // We REFRESH the entry every substep (no early-exit) so mutable
+  // fields like `pinned` (toggleable from the UI) reflect the latest
+  // live state. The cost is one Map.set per entity per substep, which
+  // is negligible.
+  for (const e of (trace.pre || [])) {
+    const ent = _state.entities.find(x => x.id === e.id);
+    if (!ent) continue;
+    _idMetaCache.set(e.id, {
+      type:   ent.type,
+      mass:   ent.mass,
+      radius: +ent.radius.toFixed(3),
+      charge: ent.charge,
+      pinned: !!ent.pinned,
+    });
+  }
 }
 
 export async function dumpToServer(label = 'manual') {
@@ -78,26 +153,40 @@ export async function dumpToServer(label = 'manual') {
   }
   // Static identification of every entity that touched the ring window
   // (id → mass / radius / charge / type / pinned). Pulled OUT of the
-  // per-substep slots so they don't repeat 180 × N times.
+  // per-substep slots so they don't repeat RING_SIZE × N times. Sources
+  // in priority order:
+  //   1. live entity in _state.entities — always preferred when available.
+  //   2. _idMetaCache fallback for entities destroyed before dump time.
+  //      The cache is refreshed every substep while the entity is live
+  //      (see recordSubstep), so the cached value is the last-known
+  //      live state — accurate even for fields the UI can mutate
+  //      mid-life (currently just `pinned`).
   const idMeta = {};
   for (const slot of ringOrdered) {
     for (const e of (slot.pre || [])) {
-      if (!idMeta[e.id]) {
-        const ent = _state.entities.find(x => x.id === e.id);
-        if (ent) idMeta[e.id] = {
+      if (idMeta[e.id]) continue;
+      const ent = _state.entities.find(x => x.id === e.id);
+      if (ent) {
+        idMeta[e.id] = {
           type: ent.type,
           mass: ent.mass,
           radius: +ent.radius.toFixed(3),
           charge: ent.charge,
           pinned: !!ent.pinned,
         };
+      } else if (_idMetaCache.has(e.id)) {
+        idMeta[e.id] = _idMetaCache.get(e.id);
       }
     }
   }
   const payload = {
     label,
     timestamp: new Date().toISOString(),
-    schemaVersion: 2,
+    // v3 (2026-05-24): slot.gravity[i] grew a `forceApplied` flag, slot
+    // gained `contactEvents[]` from Rapier's EventQueue, ring length
+    // doubled to 360 substeps. Reader code should fall back to absent
+    // fields when reading older v2 dumps.
+    schemaVersion: 3,
     viewport: { ..._state.viewport },
     boundaryMode: _state.boundaryMode,
     backendName: _state.backendName,
