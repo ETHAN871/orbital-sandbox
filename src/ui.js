@@ -63,6 +63,8 @@ export function bindUI() {
 
   // V9.8: field-viz brightness contrast (场可视化 section).
   bindRangeSlider('field-contrast', val => { state.fieldContrast = val; }, 2);
+  // V9.9: Jobard-Lefer streamline spacing (CSS-px) for curvilinear grid.
+  bindRangeSlider('field-spacing', val => { state.fieldLineSpacing = val | 0; }, 0);
 
   // 7 sliders in the "高级调参" collapsible — each writes directly to its
   // state.* field. Handlers read state.* at use site, so changes take

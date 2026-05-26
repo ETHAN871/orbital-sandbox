@@ -69,6 +69,7 @@ import {
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, PARTICLE_FLOW,
 } from './shaders.js';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
+import { computeFieldLines } from './field-lines.js';
 
 // ─── Module state ─────────────────────────────────────────────────
 let _gl = null;
@@ -1046,6 +1047,59 @@ function _drawGridWarp() {
   gl.disableVertexAttribArray(_progGridWarp.aPos);
 }
 
+// V9.9 curvilinear mode: render gravitational geodesics as polylines.
+// computeFieldLines (CPU integrator) returns polylines that already
+// handle wrap-mode splits + body absorption. Each polyline becomes
+// N-1 line segments fed into the existing LINE_SEG instanced pipeline.
+//
+// Cost: ~N_bodies × raysPerBody × ~80 avg steps × N_entities per ∇φ
+// eval. At 10 bodies × 16 rays × 80 × 10 = ~130 K ops / frame ≈ 1 ms
+// CPU. GL upload + draw is O(total segments) ≈ ~5 K instances —
+// negligible vs the GRID_WARP fragment work it replaces.
+function _drawFieldLines() {
+  if (!_progLineSeg || !_vaoLineSeg || !_bufInstanceLineSeg) return;
+  if (state.entities.length === 0) return;
+  const wrap = state.boundaryMode === 'wrap';
+  const viewport = { width: _vpW, height: _vpH };
+  const polylines = computeFieldLines(
+    state.entities, viewport, state.fieldLineSpacing,
+    state.G, state.epsilon, wrap,
+  );
+  if (polylines.length === 0) return;
+
+  // Convert polylines into LINE_SEG instances. Reuse _lineSegData
+  // and reset _lineSegCount when done so drawUI starts from a
+  // clean buffer (drawUI runs after drawField).
+  _lineSegCount = 0;
+  // Same cyan family as the BH event-horizon ring, slightly cooler
+  // and with low alpha so multiple overlapping lines stack pleasantly.
+  const FL_R = 150 / 255, FL_G = 195 / 255, FL_B = 240 / 255, FL_A = 0.45;
+  for (let p = 0; p < polylines.length; p++) {
+    const line = polylines[p];
+    const len = line.length;
+    if (len < 4) continue;   // need at least 2 vertices for one segment
+    let arc = 0;
+    for (let i = 0; i < len - 2; i += 2) {
+      const x0 = line[i],     y0 = line[i + 1];
+      const x1 = line[i + 2], y1 = line[i + 3];
+      _pushLineSeg(x0, y0, x1, y1, FL_R, FL_G, FL_B, FL_A, arc, 1.5, 0.0, 0.0);
+      const dx = x1 - x0, dy = y1 - y0;
+      arc += Math.sqrt(dx * dx + dy * dy);
+    }
+  }
+  if (_lineSegCount === 0) return;
+
+  const gl = _gl;
+  gl.useProgram(_progLineSeg.prog);
+  gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
+  gl.bindVertexArray(_vaoLineSeg);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
+  gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
+  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, _lineSegCount);
+  // Reset so drawUI's subsequent rebuild starts from zero.
+  _lineSegCount = 0;
+}
+
 // V9.1: build a (cols × rows) grid of streamline seed positions covering
 // the viewport with margins. Target seed count is ~96 (per user choice);
 // we resolve to the integer (cols, rows) closest to that target that
@@ -1825,7 +1879,13 @@ export function drawField() {
   // Particle-flow overlay companions the 2D grid for "luminous dust"
   // feel; in 3D and legacy modes it's omitted (those carry their own
   // visual character).
-  if (state.fieldStyle === 'legacy') {
+  // V9.9: 'curvilinear' default — equipotential rings + radial
+  // geodesic field lines from each body. Fold-free by construction.
+  // 'legacy' = rings only (no field lines). '2d'/'3d' = old GRID_WARP.
+  if (state.fieldStyle === 'curvilinear') {
+    _drawEquipotential();
+    _drawFieldLines();
+  } else if (state.fieldStyle === 'legacy') {
     _drawEquipotential();
   } else {
     _drawGridWarp();

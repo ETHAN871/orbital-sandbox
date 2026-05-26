@@ -59,6 +59,12 @@ export const DEFAULTS_TUNING = Object.freeze({
   // contrast (deep wells nearly black).
   fieldContrast: 0.75,
 
+  // V9.9 curvilinear mode: Jobard-Lefer streamline separation in
+  // CSS-px. Smaller = denser grid (more lines, more CPU). 30 ≈ a
+  // medium-density curvilinear feel on typical viewports. Range
+  // roughly [10, 80].
+  fieldLineSpacing: 30,
+
   // Contact spring stiffness: angular natural frequency ω₀ for the
   // TGS-Soft contact constraint. Effective spring k = m·ω₀² (the F=kx
   // form the user asked for). Higher → snappier rebounds, faster
@@ -195,6 +201,7 @@ export const state = {
   overlapBulletThreshold:   DEFAULTS_TUNING.overlapBulletThreshold,
   contactStiffness:         DEFAULTS_TUNING.contactStiffness,
   fieldContrast:            DEFAULTS_TUNING.fieldContrast,
+  fieldLineSpacing:         DEFAULTS_TUNING.fieldLineSpacing,
 
   // Canvas background color — toggled by the 深/浅 button.
   // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.
@@ -210,16 +217,16 @@ export const state = {
   // OFF so the GPU work is fully gated (zero overhead when not displayed).
   showField: false,
 
-  // V9.2 (2026-05-26 rewrite, 2026-05-26 user picked 2D+particles):
-  // field visualization style.
-  //   '2d' (default) — flat top-down warp. Grid lines bend toward
-  //                    masses, stay in the XY plane. Companion
-  //                    particle-flow overlay drawn on top.
-  //   '3d'           — spacetime fabric / rubber-sheet style with
-  //                    oblique projection. Kept for A/B compare.
-  //   'legacy'       — old equipotential contour rings.
-  // Set via ?field=2d|3d|legacy URL param at boot (parsed in main.js).
-  fieldStyle: '2d',
+  // V9.9 (2026-05-26 rewrite): field visualization style.
+  //   'curvilinear' (default) — equipotential contour rings +
+  //                    radial geodesic field lines from each body.
+  //                    Orthogonal contour pair = natural curvilinear
+  //                    grid, fold-free by construction.
+  //   '2d'           — Cartesian grid warped by ∇φ (anti-fold capped).
+  //   '3d'           — spacetime-fabric / rubber-sheet oblique.
+  //   'legacy'       — equipotential contour rings only (no field lines).
+  // Set via ?field=curvilinear|2d|3d|legacy URL param at boot.
+  fieldStyle: 'curvilinear',
 
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
