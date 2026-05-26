@@ -44,6 +44,18 @@ try {
     console.info('[main] AQM disabled via ?aqm=off');
   }
 } catch {}
+
+// V9.2 (2026-05-26): field-viz style override via URL.
+// ?field=3d (default) — spacetime fabric, 3D oblique projection.
+// ?field=2d           — flat 2D in-plane warp.
+// ?field=legacy       — old equipotential contour rings (A/B compare).
+try {
+  const fs = new URLSearchParams(window.location.search).get('field');
+  if (fs === '2d' || fs === 'legacy' || fs === '3d') {
+    state.fieldStyle = fs;
+    console.info('[main] field viz style =', fs);
+  }
+} catch {}
 import {
   installRecorder,
   installKeyHandler as installDumpKeyHandler,

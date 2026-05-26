@@ -66,7 +66,7 @@ import { resolveDisplayColor } from './entities.js';
 import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
-  EQUIPOTENTIAL, STREAMLINE,
+  EQUIPOTENTIAL, STREAMLINE, GRID_WARP,
 } from './shaders.js';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 
@@ -93,6 +93,18 @@ let _progLineSeg = null;
 // V9.1 field-visualization shaders:
 let _progEquipotential = null;
 let _progStreamline = null;
+// V9.2 (2026-05-26): grid-warp field viz. Replaces _progEquipotential
+// as the default; _progEquipotential is kept compiled for ?field=legacy.
+let _progGridWarp = null;
+// Grid-warp vertex buffer (CSS-px positions of grid intersections) and
+// index buffer (line-segment endpoints connecting neighbors). Sized
+// based on viewport at first use and on resize.
+let _bufGridVerts = null;
+let _bufGridIndices = null;
+let _gridVertexCount = 0;
+let _gridIndexCount = 0;
+let _gridCols = 0;
+let _gridRows = 0;
 
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
@@ -363,6 +375,20 @@ function _initPrograms() {
   _progStreamline.uPulseHead    = gl.getUniformLocation(_progStreamline.prog, 'uPulseHead');
   _progStreamline.uPulseTailFrac = gl.getUniformLocation(_progStreamline.prog, 'uPulseTailFrac');
   _progStreamline.uColor        = gl.getUniformLocation(_progStreamline.prog, 'uColor');
+
+  // V9.2 grid-warp program (default field viz).
+  _progGridWarp = _makeProgram(GRID_WARP.VS, GRID_WARP.FS);
+  _progGridWarp.aPos           = gl.getAttribLocation(_progGridWarp.prog, 'aPos');
+  _progGridWarp.uViewport      = gl.getUniformLocation(_progGridWarp.prog, 'uViewport');
+  _progGridWarp.uEntities      = gl.getUniformLocation(_progGridWarp.prog, 'uEntities[0]');
+  _progGridWarp.uEntityCount   = gl.getUniformLocation(_progGridWarp.prog, 'uEntityCount');
+  _progGridWarp.uEpsilon       = gl.getUniformLocation(_progGridWarp.prog, 'uEpsilon');
+  _progGridWarp.uDispScale     = gl.getUniformLocation(_progGridWarp.prog, 'uDispScale');
+  _progGridWarp.uTiltY         = gl.getUniformLocation(_progGridWarp.prog, 'uTiltY');
+  _progGridWarp.uMode          = gl.getUniformLocation(_progGridWarp.prog, 'uMode');
+  _progGridWarp.uOrtho         = gl.getUniformLocation(_progGridWarp.prog, 'uOrtho');
+  _progGridWarp.uColor         = gl.getUniformLocation(_progGridWarp.prog, 'uColor');
+  _progGridWarp.uIntensityHalf = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityHalf');
 }
 
 function _initBuffers() {
@@ -607,6 +633,100 @@ export function resizeRenderer(w, h, dpr) {
   _updateOrthoMat();
   _initFbos(_vpW, _vpH);
   _rebuildStreamlineSeeds();
+  _rebuildGridWarpVerts();
+}
+
+// V9.2: build a regular grid of vertices covering the viewport, plus an
+// index buffer of line-segment endpoints connecting each vertex to its
+// right and down neighbors. Resolution targets ~5000 vertices = a good
+// trade between visual density and per-frame vertex cost.
+// Called on resize and on first init.
+function _rebuildGridWarpVerts() {
+  if (!_gl || _vpW <= 0 || _vpH <= 0) return;
+  const gl = _gl;
+  // Aim for ~80 columns at typical aspect; rows scale to viewport.
+  const TARGET_COLS = 80;
+  const cellPx = Math.max(8, _vpW / TARGET_COLS);
+  const cols = Math.max(8, Math.round(_vpW / cellPx) + 1);
+  const rows = Math.max(8, Math.round(_vpH / cellPx) + 1);
+  _gridCols = cols;
+  _gridRows = rows;
+  const vertCount = cols * rows;
+  _gridVertexCount = vertCount;
+  // Vertex positions in CSS-px.
+  const verts = new Float32Array(vertCount * 2);
+  let idx = 0;
+  for (let r = 0; r < rows; r++) {
+    const y = (r / (rows - 1)) * _vpH;
+    for (let c = 0; c < cols; c++) {
+      const x = (c / (cols - 1)) * _vpW;
+      verts[idx++] = x;
+      verts[idx++] = y;
+    }
+  }
+  // Index buffer: for each cell, add a horizontal segment (this vert →
+  // right neighbor) and a vertical segment (this vert → down neighbor).
+  // Last column gets no horizontal; last row gets no vertical.
+  const numHorizontal = (cols - 1) * rows;
+  const numVertical = cols * (rows - 1);
+  const idxCount = (numHorizontal + numVertical) * 2;
+  _gridIndexCount = idxCount;
+  // Use Uint32 — index counts can exceed 65535 (e.g. 80×60 = 4800 verts,
+  // ~9500 line endpoints).
+  const indices = new Uint32Array(idxCount);
+  let ii = 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = r * cols + c;
+      if (c < cols - 1) { indices[ii++] = v; indices[ii++] = v + 1; }       // horizontal
+      if (r < rows - 1) { indices[ii++] = v; indices[ii++] = v + cols; }    // vertical
+    }
+  }
+  if (!_bufGridVerts) _bufGridVerts = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  if (!_bufGridIndices) _bufGridIndices = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+}
+
+// V9.2: grid-warp draw. Selects between 3D oblique and 2D in-plane via
+// state.fieldStyle ('3d' default | '2d'). Uses the entity array packed
+// into _fieldEntityData by drawField().
+const GRID_WARP_COLOR_3D = [120 / 255, 170 / 255, 230 / 255, 0.55];
+const GRID_WARP_COLOR_2D = [150 / 255, 200 / 255, 250 / 255, 0.55];
+function _drawGridWarp() {
+  const gl = _gl;
+  if (!_progGridWarp || !_bufGridVerts || !_bufGridIndices) return;
+  if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
+  const mode = (state.fieldStyle === '2d') ? 1 : 0;
+  // Displacement scale: tuned so a single mass-100 body at the screen
+  // center makes its well visible on a 700-px viewport without warping
+  // the entire grid into a vertical line. Empirical; can be exposed as
+  // a slider later.
+  const dispScale = (mode === 0) ? 5.0 : 8.0;
+  const tiltY = 1.0;     // 3D-only: how much depth maps into screen Y
+  const intensityHalf = 40.0;
+  const color = (mode === 0) ? GRID_WARP_COLOR_3D : GRID_WARP_COLOR_2D;
+
+  gl.useProgram(_progGridWarp.prog);
+  gl.uniform2f(_progGridWarp.uViewport, _vpW, _vpH);
+  gl.uniform4fv(_progGridWarp.uEntities, _fieldEntityData, 0, _fieldEntityCount * 4);
+  gl.uniform1i(_progGridWarp.uEntityCount, _fieldEntityCount);
+  gl.uniform1f(_progGridWarp.uEpsilon, state.epsilon);
+  gl.uniform1f(_progGridWarp.uDispScale, dispScale);
+  gl.uniform1f(_progGridWarp.uTiltY, tiltY);
+  gl.uniform1i(_progGridWarp.uMode, mode);
+  gl.uniformMatrix4fv(_progGridWarp.uOrtho, false, _orthoMat);
+  gl.uniform4f(_progGridWarp.uColor, color[0], color[1], color[2], color[3]);
+  gl.uniform1f(_progGridWarp.uIntensityHalf, intensityHalf);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
+  gl.enableVertexAttribArray(_progGridWarp.aPos);
+  gl.vertexAttribPointer(_progGridWarp.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
+  gl.drawElements(gl.LINES, _gridIndexCount, gl.UNSIGNED_INT, 0);
+  gl.disableVertexAttribArray(_progGridWarp.aPos);
 }
 
 // V9.1: build a (cols × rows) grid of streamline seed positions covering
@@ -614,7 +734,10 @@ export function resizeRenderer(w, h, dpr) {
 // we resolve to the integer (cols, rows) closest to that target that
 // matches the viewport aspect ratio. Recomputed only on viewport change.
 function _rebuildStreamlineSeeds() {
-  const targetCount = 96;
+  // V9.2: density quartered (96 → 24). The grid-warp now carries the
+  // primary "where does the field push" signal; streamlines are kept
+  // as sparse decorative pulses to maintain motion.
+  const targetCount = 24;
   const aspect = _vpW / Math.max(1, _vpH);
   // cols * rows ≈ targetCount; cols / rows ≈ aspect → cols = sqrt(target*aspect).
   let cols = Math.max(2, Math.round(Math.sqrt(targetCount * aspect)));
@@ -1373,7 +1496,14 @@ export function drawField() {
   gl.blendEquation(gl.FUNC_ADD);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-  _drawEquipotential();
+  // V9.2 rewrite (2026-05-26): default field viz is now grid warp.
+  // Legacy equipotential rings are kept gated behind state.fieldStyle
+  // === 'legacy' for regression debugging; default is '3d'.
+  if (state.fieldStyle === 'legacy') {
+    _drawEquipotential();
+  } else {
+    _drawGridWarp();
+  }
   _drawStreamlines();
 
   gl.disable(gl.BLEND);

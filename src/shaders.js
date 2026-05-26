@@ -526,3 +526,94 @@ void main() {
   outColor = vec4(uColor.rgb, uColor.a * aaPerp * aTrail * vAlpha);
 }`,
 };
+
+// --- Grid warp (spacetime fabric) --------------------------------------
+// New field viz (2026-05-26 rewrite). Each frame draws a regular grid of
+// vertices. Per-vertex the GPU computes the gravitational potential
+// contribution from up to MAX_ENTITIES masses and either:
+//
+//   - 3D mode (uMode == 0): vertex Z = scale × Σ -G·q·m / sqrt(r² + ε²),
+//     projected to 2D via oblique projection (x, y + Z·tiltY). Looks
+//     like the classic rubber-sheet / Interstellar gravity-well drawing.
+//
+//   - 2D mode (uMode == 1): vertex displaced in the XY plane along
+//     the local force direction ∇φ by an amount proportional to |∇φ|.
+//     Grid lines bend toward masses without leaving the plane — flat
+//     and clean, matches the 2D top-down camera.
+//
+// Cost: vertex-shader work only, no fragment-shader N-body sum. With a
+// 80×60 grid that's 4800 vertices × (≤ 128 masses × 5 ops) ≈ 3 M vertex
+// ops, but vertex throughput is 30-50× higher than fragment throughput
+// on most GPUs, and we replaced 630 k fragments × 128 masses (~80 M ops)
+// from the old EQUIPOTENTIAL fullscreen pass. Net ~20-30× speedup.
+//
+// uColor.a is modulated per-fragment by a "intensity" estimate: edges
+// in high-warp regions are slightly more opaque, far-field edges fade.
+// This is what gives the visual rhythm of "deeper wells = denser ink".
+export const GRID_WARP = {
+  VS: `#version 300 es
+#define MAX_ENTITIES 128
+in vec2 aPos;          // grid vertex in CSS px (untransformed)
+uniform vec2 uViewport;
+uniform vec4 uEntities[MAX_ENTITIES];   // (x, y, G·q·m, 0)
+uniform int uEntityCount;
+uniform float uEpsilon;
+uniform float uDispScale;     // amplitude of warp (px)
+uniform float uTiltY;         // 3D: how much Z projects into screen-Y (0..1)
+uniform int uMode;            // 0 = 3D oblique, 1 = 2D in-plane
+uniform mat4 uOrtho;          // CSS-px → NDC
+out float vIntensity;         // displacement magnitude — drives alpha in FS
+void main() {
+  float eps2 = uEpsilon * uEpsilon;
+  vec2 p = aPos;
+  float phi = 0.0;             // Σ φ for 3D mode
+  vec2 gradPhi = vec2(0.0);    // Σ ∇φ for 2D mode
+  for (int i = 0; i < MAX_ENTITIES; i++) {
+    if (i >= uEntityCount) break;
+    vec4 e = uEntities[i];
+    vec2 d = p - vec2(e.x, e.y);
+    float r2 = d.x * d.x + d.y * d.y + eps2;
+    float invR = inversesqrt(r2);
+    float invR3 = invR * invR * invR;
+    if (uMode == 0) {
+      phi += -e.z * invR;
+    } else {
+      // ∇φ = G·q·m · d / (r²+ε²)^(3/2). Negate so vertices move
+      // TOWARD attractor (visually intuitive).
+      gradPhi += -e.z * d * invR3;
+    }
+  }
+  vec2 worldPx;
+  float intensity;
+  if (uMode == 0) {
+    // 3D oblique: phi is negative for attractors → -phi is positive
+    // depth. Project Z into Y as a "tilt down" — depressions appear
+    // below the body, matching the rubber-sheet mental model.
+    float depth = clamp(-phi * uDispScale, 0.0, 250.0);
+    worldPx = vec2(p.x, p.y + depth * uTiltY);
+    intensity = depth;
+  } else {
+    // 2D in-plane: displacement capped so a body at distance ≈ ε
+    // doesn't pull a vertex onto itself (visual nonsense).
+    vec2 disp = gradPhi * uDispScale;
+    float magSq = dot(disp, disp);
+    float cap = 60.0;
+    if (magSq > cap * cap) disp = disp * (cap / sqrt(magSq));
+    worldPx = p + disp;
+    intensity = length(disp);
+  }
+  vIntensity = intensity;
+  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+in float vIntensity;
+uniform vec4 uColor;
+uniform float uIntensityHalf;
+out vec4 outColor;
+void main() {
+  float t = smoothstep(0.0, uIntensityHalf, vIntensity);
+  float a = mix(0.25, 1.0, t);
+  outColor = vec4(uColor.rgb, uColor.a * a);
+}`,
+};

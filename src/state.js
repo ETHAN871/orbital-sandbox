@@ -201,6 +201,17 @@ export const state = {
   // OFF so the GPU work is fully gated (zero overhead when not displayed).
   showField: false,
 
+  // V9.2 (2026-05-26 rewrite): field visualization style.
+  //   '3d' (default) — spacetime fabric / rubber-sheet style with
+  //                    oblique projection. Vertices sink toward masses.
+  //   '2d'           — flat top-down warp. Grid lines bend toward
+  //                    masses but stay in the XY plane.
+  //   'legacy'       — old equipotential contour rings (kept for
+  //                    A/B comparison, will be removed after user
+  //                    picks a default).
+  // Set via ?field=3d|2d|legacy URL param at boot (parsed in main.js).
+  fieldStyle: '3d',
+
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
   // Read-only outside physics-backend.js; useful for HUD/debug displays.
