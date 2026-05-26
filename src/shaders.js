@@ -608,13 +608,25 @@ void main() {
     worldPx = vec2(p.x, p.y + depth * uTiltY);
     intensity = depth;
   } else {
-    // 2D in-plane: global smooth saturation as a backstop for the
+    // 2D in-plane: atan-style soft saturation as backstop for the
     // already-bounded per-body sum (multi-body pile-ups).
+    //
+    // sat(m) = L * atan(m / L)
+    //   • slope at m=0 is 1 → small sums pass through 1:1 (single
+    //     body still warps exactly as bounded above, no premature
+    //     compression).
+    //   • as m→∞, sat → L·π/2 ≈ 78.5 px with L=50 → big clusters
+    //     produce a visibly DEEPER well than one body. The old
+    //     cap/(cap+m) with cap=35 saturated at 35 px regardless of
+    //     how many masses were piled in — clusters looked flat.
+    //   • approach to the limit is smooth (like atan→π/2) instead
+    //     of the 1/x falloff of the rational form.
     float mag = length(disp2D);
-    float cap = 35.0;
-    float factor = cap / (cap + mag);
+    float L = 50.0;
+    float satMag = L * atan(mag / L);
+    float factor = (mag > 0.0001) ? satMag / mag : 1.0;
     worldPx = p + disp2D * factor;
-    intensity = mag * factor;
+    intensity = satMag;
   }
   vIntensity = intensity;
   gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);

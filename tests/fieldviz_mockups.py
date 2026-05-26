@@ -501,7 +501,12 @@ def mockup_hard_vs_smooth():
         return (-ez * dx * invR3, -ez * dy * invR3)
 
     def _draw_band(y_top, y_bot, mode_label, label):
-        """mode_label ∈ {'hard', 'smooth', 'antiovershoot'}."""
+        """mode_label ∈ {'hard', 'smooth', 'antiovershoot', 'atan'}.
+
+        Single-body bands show the saturation function shape.
+        See mockup_cluster_depth for the multi-body cluster comparison
+        that motivated the atan switch.
+        """
         cols, rows = 56, 28
         X_LEFT, X_RIGHT = 30, 600
         cw = (X_RIGHT - X_LEFT) / (cols - 1)
@@ -511,6 +516,7 @@ def mockup_hard_vs_smooth():
         DISP_SCALE = 175.0
         CAP = 35.0
         OVERSHOOT_FRAC = 0.4
+        L_ATAN = 50.0
         for r in range(rows):
             for c in range(cols):
                 x = X_LEFT + c * cw
@@ -536,7 +542,7 @@ def mockup_hard_vs_smooth():
                     mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
                     factor = CAP / (CAP + mag)
                     pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
-                else:  # antiovershoot — per-body bound + global smooth
+                elif mode_label == 'antiovershoot':
                     raw_mag = ez * DISP_SCALE / r2
                     max_allowed = r_dist * OVERSHOOT_FRAC
                     bounded = min(raw_mag, max_allowed)
@@ -545,6 +551,17 @@ def mockup_hard_vs_smooth():
                     disp_y = uy * bounded
                     mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
                     factor = CAP / (CAP + mag)
+                    pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+                else:  # 'atan' — anti-overshoot + atan saturation
+                    raw_mag = ez * DISP_SCALE / r2
+                    max_allowed = r_dist * OVERSHOOT_FRAC
+                    bounded = min(raw_mag, max_allowed)
+                    ux, uy = -dx / r_dist, -dy / r_dist
+                    disp_x = ux * bounded
+                    disp_y = uy * bounded
+                    mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
+                    sat = L_ATAN * math.atan(mag / L_ATAN) if mag > 1e-6 else 0.0
+                    factor = sat / mag if mag > 1e-4 else 1.0
                     pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
         for r in range(rows):
             for c in range(cols - 1):
@@ -594,6 +611,109 @@ def mockup_hard_vs_smooth():
     return path
 
 
+# ───────────────────────────────────────────────────────────────────
+# MOCKUP 7 — Cluster depth: rational vs atan saturation
+# ───────────────────────────────────────────────────────────────────
+def mockup_cluster_depth():
+    """Side-by-side comparison of cap/(cap+m) vs L·atan(m/L) when
+    many bodies are clustered (the user-reported scenario).
+
+    Top band: rational sat cap/(cap+mag), cap=35 → cluster warps no
+              deeper than a single body. Flat-looking despite mass.
+    Bottom band: atan sat L·atan(mag/L), L=50 (asymptote ≈ 78 px) →
+              cluster produces a visibly deeper well.
+
+    Same 90-body diagonal-chain cluster mirroring user's screenshot.
+    """
+    im = Image.new("RGBA", (W, H), BG + (255,))
+    draw = ImageDraw.Draw(im, "RGBA")
+
+    # Build a ~90-body diagonal-chain cluster (mimics user screenshot).
+    cluster = []
+    rng = random.Random(7)
+    for row in range(15):
+        for col in range(6):
+            # Diagonal offset so it forms a chain.
+            cx = 220 + row * 14 + col * 14 + rng.uniform(-2, 2)
+            cy = 90 + row * 22 + col * 4 + rng.uniform(-2, 2)
+            cluster.append({"x": cx, "y": cy, "r": 10, "m": 50})
+
+    def _cluster_grad(x, y, body_y_offset):
+        ez_per = 80.0 * 50.0
+        gx, gy = 0.0, 0.0
+        for b in cluster:
+            dx = x - b["x"]
+            dy = y - (b["y"] + body_y_offset)
+            r2 = dx * dx + dy * dy + 16.0
+            r_dist = math.sqrt(r2)
+            raw_mag = ez_per * 175.0 / r2
+            max_allowed = r_dist * 0.4
+            bounded = min(raw_mag, max_allowed)
+            gx += -dx / r_dist * bounded
+            gy += -dy / r_dist * bounded
+        return gx, gy
+
+    def _draw_band(y_top, y_bot, sat_label, label):
+        cols, rows = 70, 36
+        X_LEFT, X_RIGHT = 30, W - 30
+        cw = (X_RIGHT - X_LEFT) / (cols - 1)
+        rh = (y_bot - y_top) / (rows - 1)
+        # Offset cluster so it sits inside the band.
+        body_y_offset = y_top - 90
+        pts = [[(0.0, 0.0)] * cols for _ in range(rows)]
+        CAP = 35.0
+        L = 50.0
+        for r in range(rows):
+            for c in range(cols):
+                x = X_LEFT + c * cw
+                y = y_top + r * rh
+                disp_x, disp_y = _cluster_grad(x, y, body_y_offset)
+                mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
+                if sat_label == 'rational':
+                    factor = CAP / (CAP + mag)
+                else:  # atan
+                    sat = L * math.atan(mag / L) if mag > 1e-6 else 0.0
+                    factor = sat / mag if mag > 1e-4 else 1.0
+                pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+        for r in range(rows):
+            for c in range(cols - 1):
+                (x1, y1), (x2, y2) = pts[r][c], pts[r][c + 1]
+                draw.line([(x1, y1), (x2, y2)], fill=(150, 195, 240, 150), width=1)
+        for c in range(cols):
+            for r in range(rows - 1):
+                (x1, y1), (x2, y2) = pts[r][c], pts[r + 1][c]
+                draw.line([(x1, y1), (x2, y2)], fill=(150, 195, 240, 150), width=1)
+        # Draw the cluster bodies.
+        body_colors = [
+            (255, 100, 150), (100, 200, 255), (200, 100, 255),
+            (100, 255, 150), (255, 180, 80), (150, 100, 255),
+            (255, 220, 80), (80, 255, 200),
+        ]
+        for i, b in enumerate(cluster):
+            col = body_colors[i % len(body_colors)]
+            cx, cy = b["x"], b["y"] + body_y_offset
+            draw.ellipse(
+                [cx - b["r"], cy - b["r"], cx + b["r"], cy + b["r"]],
+                fill=(*col, 255),
+                outline=(255, 255, 255, 90), width=1,
+            )
+        draw.text((30, y_top - 24), label, font=FONT_CAPTION, fill=(220, 230, 240, 240))
+
+    HALF_H = (H - 130 - 40) // 2
+    _draw_band(140, 140 + HALF_H, sat_label='rational',
+               label="RATIONAL cap/(cap+m), cap=35 — cluster cap-bound, well stays shallow (current bug)")
+    _draw_band(140 + HALF_H + 40, 140 + 2 * HALF_H + 40, sat_label='atan',
+               label="ATAN L·atan(m/L), L=50 (asymp ≈ 78 px) — cluster carves visibly deeper well (fix)")
+    _header(
+        im,
+        "Cluster depth — rational vs atan saturation (90-body chain)",
+        "user-reported: many bodies stacked → mild warp. atan asymptote ≈ 2× rational cap.",
+    )
+    path = os.path.join(OUT_DIR, "mockup_cluster_depth.png")
+    im.save(path)
+    return path
+
+
 if __name__ == "__main__":
     p1 = mockup_3d()
     p2 = mockup_2d()
@@ -601,6 +721,7 @@ if __name__ == "__main__":
     p4 = mockup_mix()
     p5 = mockup_wrap()
     p6 = mockup_hard_vs_smooth()
+    p7 = mockup_cluster_depth()
     print("Wrote:")
-    for p in (p1, p2, p3, p4, p5, p6):
+    for p in (p1, p2, p3, p4, p5, p6, p7):
         print(" ", p)
