@@ -657,25 +657,42 @@ export function resizeRenderer(w, h, dpr) {
 // right and down neighbors. Resolution targets ~5000 vertices = a good
 // trade between visual density and per-frame vertex cost.
 // Called on resize and on first init.
+//
+// V9.3 borderless: grid extends GRID_EXPAND_FRAC past the viewport on
+// every side so the unwarped grid edge sits off-screen. The shader's
+// vEdgeFade smoothstep on the ORIGINAL aPos fades alpha to 0 between
+// the visible viewport edge and the rebuilt grid edge, so the user
+// never sees a rectangular boundary — the field reads as an infinite
+// warped plane fading into the background.
 function _rebuildGridWarpVerts() {
   if (!_gl || _vpW <= 0 || _vpH <= 0) return;
   const gl = _gl;
   // Aim for ~80 columns at typical aspect; rows scale to viewport.
   const TARGET_COLS = 80;
   const cellPx = Math.max(8, _vpW / TARGET_COLS);
-  const cols = Math.max(8, Math.round(_vpW / cellPx) + 1);
-  const rows = Math.max(8, Math.round(_vpH / cellPx) + 1);
+  // Extend grid past viewport on all sides — fade handled in shader.
+  // 0.15 → grid is 30% wider+taller; ~1.69× total vertex count.
+  // Vertex shader's vEdgeFade smoothstep(0.85, 1.15) matches this.
+  const GRID_EXPAND_FRAC = 0.15;
+  const extW = _vpW * (1 + 2 * GRID_EXPAND_FRAC);
+  const extH = _vpH * (1 + 2 * GRID_EXPAND_FRAC);
+  const offX = -_vpW * GRID_EXPAND_FRAC;
+  const offY = -_vpH * GRID_EXPAND_FRAC;
+  const cols = Math.max(8, Math.round(extW / cellPx) + 1);
+  const rows = Math.max(8, Math.round(extH / cellPx) + 1);
   _gridCols = cols;
   _gridRows = rows;
   const vertCount = cols * rows;
   _gridVertexCount = vertCount;
-  // Vertex positions in CSS-px.
+  // Vertex positions in CSS-px. Span [offX, offX+extW] × [offY, offY+extH].
+  // Visible viewport is [0, _vpW] × [0, _vpH] — vertices outside that
+  // window fade to alpha 0 in the shader (vEdgeFade).
   const verts = new Float32Array(vertCount * 2);
   let idx = 0;
   for (let r = 0; r < rows; r++) {
-    const y = (r / (rows - 1)) * _vpH;
+    const y = offY + (r / (rows - 1)) * extH;
     for (let c = 0; c < cols; c++) {
-      const x = (c / (cols - 1)) * _vpW;
+      const x = offX + (c / (cols - 1)) * extW;
       verts[idx++] = x;
       verts[idx++] = y;
     }
