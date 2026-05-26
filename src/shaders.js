@@ -562,23 +562,18 @@ uniform float uDispScale;     // amplitude of warp (px)
 uniform float uTiltY;         // 3D: how much Z projects into screen-Y (0..1)
 uniform int uMode;            // 0 = 3D oblique, 1 = 2D in-plane
 uniform mat4 uOrtho;          // CSS-px → NDC
-out float vIntensity;         // displacement magnitude — drives alpha in FS
-out float vEdgeFade;          // 1 = full alpha, 0 = invisible at grid edge
+out float vIntensity;         // displacement magnitude — drives brightness in FS
 void main() {
   float eps2 = uEpsilon * uEpsilon;
   vec2 p = aPos;
-  // Edge fade computed on ORIGINAL (unwarped) grid coords.
-  // The rebuilt grid extends past the viewport on every side (see
-  // _rebuildGridWarpVerts), so the visible viewport occupies the
-  // central |d|<=1 of the rebuilt grid. We smoothstep alpha to 0 at
-  // the outer grid edge so the user never sees a hard rectangle —
-  // the field looks like an infinite warped plane fading into black.
-  // Per-axis max gives a soft rectangular vignette that preserves
-  // the field's rectilinear shape (circular vignette would crop the
-  // corners of strong warps).
-  vec2 dNorm = (aPos / uViewport - 0.5) * 2.0;
-  float dMax = max(abs(dNorm.x), abs(dNorm.y));
-  vEdgeFade = 1.0 - smoothstep(0.85, 1.15, dMax);
+  // (V9.4) No alpha edge-fade — the prior viewport-distance smoothstep
+  // read as "edge darkening" instead of an infinite-plane illusion.
+  // The grid still extends past the viewport (see
+  // _rebuildGridWarpVerts) so the unwarped grid corners stay off
+  // screen; brightness is driven purely by displacement magnitude
+  // (vIntensity) in the fragment shader — flat regions full bright,
+  // deep wells dim (mimics ambient overhead lighting on a rubber
+  // sheet sagging into a gravity well).
   float phi = 0.0;             // Σ φ for 3D mode
   // 2D mode: build displacement with PER-BODY anti-overshoot bound.
   // Each entity's pull on a vertex is capped at OVERSHOOT_FRAC × r_i
@@ -647,14 +642,19 @@ void main() {
   FS: `#version 300 es
 precision highp float;
 in float vIntensity;
-in float vEdgeFade;
 uniform vec4 uColor;
 uniform float uIntensityHalf;
 out vec4 outColor;
 void main() {
+  // Height-based shading: vIntensity is the sag depth (3D) or warp
+  // magnitude (2D). High intensity = vertex is deep in a gravity
+  // well → render dim (in shadow). Low intensity = flat plane,
+  // perpendicular to imaginary overhead light → full brightness.
+  // Range 1.0→0.25: deep wells stay visible at 25% so the user can
+  // still read the well's structure, against the dark background.
   float t = smoothstep(0.0, uIntensityHalf, vIntensity);
-  float a = mix(0.25, 1.0, t);
-  outColor = vec4(uColor.rgb, uColor.a * a * vEdgeFade);
+  float brightness = mix(1.0, 0.25, t);
+  outColor = vec4(uColor.rgb * brightness, uColor.a);
 }`,
 };
 
