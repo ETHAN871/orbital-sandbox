@@ -562,6 +562,7 @@ uniform float uDispScale;     // amplitude of warp (px)
 uniform float uTiltY;         // 3D: how much Z projects into screen-Y (0..1)
 uniform int uMode;            // 0 = 3D oblique, 1 = 2D in-plane
 uniform mat4 uOrtho;          // CSS-px → NDC
+uniform float uCellPx;        // grid cell spacing — caps displacement so adjacent vertices can't swap
 out float vIntensity;         // displacement magnitude — drives brightness in FS
 void main() {
   float eps2 = uEpsilon * uEpsilon;
@@ -608,11 +609,21 @@ void main() {
   }
   vec2 worldPx;
   float intensity;
+  // Anti-fold cap: max displacement magnitude per vertex.
+  // For two adjacent vertices spacing = cellPx, if both can be
+  // displaced by up to D, worst case (opposite directions) → final
+  // separation = cellPx - 2D. For no swap (no fold), need 2D <
+  // cellPx → D < cellPx/2. Use 0.45 for safety margin (diagonal
+  // adjacency, atan smoothing variance). Without this cap, dense
+  // clusters produce visible grid folding / "wireframe sphere"
+  // illusion as adjacent vertices cross each other.
+  float maxDisp = uCellPx * 0.45;
   if (uMode == 0) {
     // 3D oblique: phi is negative for attractors → -phi is positive
     // depth. Project Z into Y as a "tilt down" — depressions appear
     // below the body, matching the rubber-sheet mental model.
     float depth = clamp(-phi * uDispScale, 0.0, 250.0);
+    depth = min(depth, maxDisp);
     worldPx = vec2(p.x, p.y + depth * uTiltY);
     intensity = depth;
   } else {
@@ -623,15 +634,17 @@ void main() {
     //   • slope at m=0 is 1 → small sums pass through 1:1 (single
     //     body still warps exactly as bounded above, no premature
     //     compression).
-    //   • as m→∞, sat → L·π/2 ≈ 78.5 px with L=50 → big clusters
-    //     produce a visibly DEEPER well than one body. The old
-    //     cap/(cap+m) with cap=35 saturated at 35 px regardless of
-    //     how many masses were piled in — clusters looked flat.
+    //   • as m→∞, sat → L·π/2 ≈ 78.5 px with L=50 — but then the
+    //     anti-fold cap below clamps to ≤ 0.45·cellPx, so the
+    //     effective max scales with grid density. Big clusters
+    //     produce the deepest visible warp the grid topology can
+    //     hold without lines crossing.
     //   • approach to the limit is smooth (like atan→π/2) instead
     //     of the 1/x falloff of the rational form.
     float mag = length(disp2D);
     float L = 50.0;
     float satMag = L * atan(mag / L);
+    satMag = min(satMag, maxDisp);
     float factor = (mag > 0.0001) ? satMag / mag : 1.0;
     worldPx = p + disp2D * factor;
     intensity = satMag;

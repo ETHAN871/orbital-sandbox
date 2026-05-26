@@ -102,6 +102,7 @@ let _gridVertexCount = 0;
 let _gridIndexCount = 0;
 let _gridCols = 0;
 let _gridRows = 0;
+let _gridCellPx = 8;   // grid spacing — uploaded as uCellPx for the anti-fold cap
 
 // V9.2 sparse particle-flow overlay (companion to grid warp). CPU
 // advection of ~200 particles per frame; rendered as additive-blended
@@ -399,6 +400,7 @@ function _initPrograms() {
   _progGridWarp.uIntensityMin  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMin');
   _progGridWarp.uIntensityMax  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMax');
   _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
+  _progGridWarp.uCellPx        = gl.getUniformLocation(_progGridWarp.prog, 'uCellPx');
 
   // V9.2 particle-flow program (companion overlay).
   _progParticleFlow = _makeProgram(PARTICLE_FLOW.VS, PARTICLE_FLOW.FS);
@@ -684,6 +686,7 @@ function _rebuildGridWarpVerts() {
   const rows = Math.max(8, Math.round(extH / cellPx) + 1);
   _gridCols = cols;
   _gridRows = rows;
+  _gridCellPx = cellPx;   // shader uses this for the anti-fold cap (uCellPx)
   const vertCount = cols * rows;
   _gridVertexCount = vertCount;
   // Vertex positions in CSS-px. Span [offX, offX+extW] × [offY, offY+extH].
@@ -896,6 +899,7 @@ const _GRIDWARP_DEPTH_CAP = 250.0;      // mirrors VS clamp in 3D mode
 // (no EMA warm-up dimness for the first ~30 frames).
 let _intensityMinEMA = -1;
 let _intensityMaxEMA = -1;
+let _intensityModePrev = -1;   // detect 2D↔3D switch → reset EMA seed
 // Scratch returned by _computeFieldIntensityRange — reused each
 // frame to avoid GC churn from allocating a fresh {min, max}.
 const _intensityRange = { min: 0, max: 0 };
@@ -913,6 +917,11 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
   // ~2300·N ops/frame. At N=200 that's ~460K ops ≈ 2 ms; cheaper
   // than the GL draw itself.
   const SC = 16, SR = 12;
+  // Same anti-fold cap as the shader. Without mirroring it here the
+  // CPU min/max range overstates max → smoothstep underestimates t →
+  // brightness looks too bright at the deepest wells (the GL has
+  // already capped to maxDisp, but the renderer thinks max is higher).
+  const maxDisp = _gridCellPx * 0.45;
   let minI = Infinity, maxI = 0;
   for (let r = 0; r < SR; r++) {
     const y = (r / (SR - 1)) * _vpH;
@@ -929,6 +938,7 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
           phi += -ents[o + 2] / Math.sqrt(r2);
         }
         intensity = Math.min(_GRIDWARP_DEPTH_CAP, Math.max(0, -phi * dispScale));
+        if (intensity > maxDisp) intensity = maxDisp;
       } else {
         // 2D — mirrors GRID_WARP.VS 2D branch verbatim. Variable
         // names track the VS: r = softened distance to body, raw =
@@ -952,6 +962,7 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
         }
         const mag = Math.sqrt(disp2Dx * disp2Dx + disp2Dy * disp2Dy);
         intensity = _GRIDWARP_L_ATAN * Math.atan(mag / _GRIDWARP_L_ATAN);
+        if (intensity > maxDisp) intensity = maxDisp;
       }
       if (intensity < minI) minI = intensity;
       if (intensity > maxI) maxI = intensity;
@@ -987,6 +998,14 @@ function _drawGridWarp() {
   // 15% grid extension inherit the same scale (acceptable since
   // they're clipped).
   const range = _computeFieldIntensityRange(mode, dispScale, state.epsilon);
+  // Reset EMA when fieldStyle changes — 2D and 3D produce intensities
+  // in different physical units (warp magnitude vs sag depth), so the
+  // previous EMA would mismap brightness for ~7 frames post-switch.
+  if (mode !== _intensityModePrev) {
+    _intensityMinEMA = -1;
+    _intensityMaxEMA = -1;
+    _intensityModePrev = mode;
+  }
   if (_intensityMinEMA < 0) {
     _intensityMinEMA = range.min;   // first-frame seed avoids cold-start dimness
     _intensityMaxEMA = range.max;
@@ -1015,6 +1034,9 @@ function _drawGridWarp() {
   // contrast slider: state.fieldContrast 0..1, floor = 1 - contrast
   // (0 contrast → floor = 1 → no dimming; 1 contrast → floor = 0 → max).
   gl.uniform1f(_progGridWarp.uContrastFloor, 1 - state.fieldContrast);
+  // anti-fold cap: max displacement < 0.5·cellPx → adjacent vertices
+  // can never swap order → grid never self-intersects.
+  gl.uniform1f(_progGridWarp.uCellPx, _gridCellPx);
 
   gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
   gl.enableVertexAttribArray(_progGridWarp.aPos);
