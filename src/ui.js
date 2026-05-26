@@ -61,6 +61,9 @@ export function bindUI() {
   // Trail-width slider (collapsible "线宽设置" section).
   bindRangeSlider('trail-width', val => { state.trailWidth = val; }, 1);
 
+  // V9.8: field-viz brightness contrast (场可视化 section).
+  bindRangeSlider('field-contrast', val => { state.fieldContrast = val; }, 2);
+
   // 7 sliders in the "高级调参" collapsible — each writes directly to its
   // state.* field. Handlers read state.* at use site, so changes take
   // effect on the next frame without any extra wiring.

@@ -398,6 +398,7 @@ function _initPrograms() {
   _progGridWarp.uColor         = gl.getUniformLocation(_progGridWarp.prog, 'uColor');
   _progGridWarp.uIntensityMin  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMin');
   _progGridWarp.uIntensityMax  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMax');
+  _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
 
   // V9.2 particle-flow program (companion overlay).
   _progParticleFlow = _makeProgram(PARTICLE_FLOW.VS, PARTICLE_FLOW.FS);
@@ -1011,6 +1012,9 @@ function _drawGridWarp() {
   gl.uniform4f(_progGridWarp.uColor, color[0], color[1], color[2], color[3]);
   gl.uniform1f(_progGridWarp.uIntensityMin, intensityMin);
   gl.uniform1f(_progGridWarp.uIntensityMax, intensityMax);
+  // contrast slider: state.fieldContrast 0..1, floor = 1 - contrast
+  // (0 contrast → floor = 1 → no dimming; 1 contrast → floor = 0 → max).
+  gl.uniform1f(_progGridWarp.uContrastFloor, 1 - state.fieldContrast);
 
   gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
   gl.enableVertexAttribArray(_progGridWarp.aPos);
@@ -1685,14 +1689,20 @@ function _buildAbsorbing() {
     _pushCircleFill(e.x, e.y, r, col[0], col[1], col[2], fade);
 
     if (e.type === 'black_hole') {
-      // V8.1c: charge -1 (white BH) → rgba(0,0,0,0.55); else rgba(120,180,255,0.75).
-      let er, eg, eb, ea;
+      // V9.8: thicker, brighter event-horizon ring + halo so the
+      // body stays visible against any background (matches the
+      // sprite-cache BH style; the absorbing fallback bypasses
+      // the cache because alpha is per-frame).
+      let er, eg, eb, eaCore, eaHalo;
       if (e.charge === -1) {
-        er = 0; eg = 0; eb = 0; ea = 0.55;
+        er = 20 / 255; eg = 30 / 255; eb = 45 / 255;
+        eaCore = 0.95; eaHalo = 0.30;
       } else {
-        er = 120 / 255; eg = 180 / 255; eb = 255 / 255; ea = 0.75;
+        er = 160 / 255; eg = 210 / 255; eb = 255 / 255;
+        eaCore = 1.00; eaHalo = 0.30;
       }
-      _pushCircleRing(e.x, e.y, r, er, eg, eb, ea * fade, 1.5, 0.0, 0.0);
+      _pushCircleRing(e.x, e.y, r + 2, er, eg, eb, eaHalo * fade, 5.0, 0.0, 0.0);
+      _pushCircleRing(e.x, e.y, r,     er, eg, eb, eaCore * fade, 2.5, 0.0, 0.0);
     }
   }
 }

@@ -80,6 +80,10 @@
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
         <p class="hint">等势线 + 同步脉冲流线（地形图风格）</p>
+        <label>
+          <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
+          <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
+        </label>
       </section>
 
       <details class="group collapsible">
@@ -181,6 +185,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260526-raf-fallback"></script>
+  <script type="module" src="src/main.js?v=20260526-contrast-slider"></script>
 </body>
 </html>

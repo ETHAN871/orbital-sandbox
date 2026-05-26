@@ -96,14 +96,39 @@ function renderSprite(type, color, radius, charge, pinned) {
   ctx.arc(cx, cy, r, 0, Math.PI * 2);
   ctx.fill();
 
-  // Black-hole edge for visibility on dark background.
+  // Black-hole edge: ALWAYS a visible event-horizon ring + outer halo.
+  //
+  // The body fill is #000000 (charge ∈ {0,+1}) or #ffffff (charge=-1).
+  // The default dark background (10,10,15) makes #000000 bodies
+  // essentially invisible — the grid warps but no body is seen,
+  // producing the "ghost convergence" singularity bug. Fix: a
+  // permanent 2.5 px event-horizon ring + soft 5 px outer halo so
+  // the silhouette stays readable regardless of background or zoom.
   if (type === 'black_hole') {
+    let coreCol, haloCol;
     if (charge === -1) {
-      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      // White BH: charcoal ring + dark halo so it reads on both
+      // dark and light backgrounds.
+      coreCol = 'rgba(20,30,45,0.95)';
+      haloCol = 'rgba(20,30,45,0.30)';
     } else {
-      ctx.strokeStyle = 'rgba(120,180,255,0.75)';
+      // Black BH (charge 0 or +1): bright cyan event-horizon ring +
+      // cyan halo. Bright enough to read against both dark and
+      // light backgrounds.
+      coreCol = 'rgba(160,210,255,1.00)';
+      haloCol = 'rgba(120,180,255,0.30)';
     }
-    ctx.lineWidth = 1.5;
+    // Outer halo first (drawn under the core ring).
+    ctx.strokeStyle = haloCol;
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 2, 0, Math.PI * 2);
+    ctx.stroke();
+    // Crisp inner ring at the body edge.
+    ctx.strokeStyle = coreCol;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.stroke();
   }
 

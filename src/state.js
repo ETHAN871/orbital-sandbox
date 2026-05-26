@@ -51,6 +51,14 @@ export const DEFAULTS_TUNING = Object.freeze({
   overlapCooldownFrames:    6,
   overlapBulletThreshold:   400,
 
+  // Field-viz brightness contrast (0..1). Renderer feeds this as
+  // uContrastFloor — the dimmest brightness in the height shading,
+  // mixed in via `brightness = mix(1.0, 1.0 - contrast, t)`. 0 = no
+  // contrast (uniform full brightness, no wells visible); 0.75 ≈
+  // legacy look (deep wells at brightness 0.25); 1.0 = maximum
+  // contrast (deep wells nearly black).
+  fieldContrast: 0.75,
+
   // Contact spring stiffness: angular natural frequency ω₀ for the
   // TGS-Soft contact constraint. Effective spring k = m·ω₀² (the F=kx
   // form the user asked for). Higher → snappier rebounds, faster
@@ -186,6 +194,7 @@ export const state = {
   overlapCooldownFrames:    DEFAULTS_TUNING.overlapCooldownFrames,
   overlapBulletThreshold:   DEFAULTS_TUNING.overlapBulletThreshold,
   contactStiffness:         DEFAULTS_TUNING.contactStiffness,
+  fieldContrast:            DEFAULTS_TUNING.fieldContrast,
 
   // Canvas background color — toggled by the 深/浅 button.
   // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.

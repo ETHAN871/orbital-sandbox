@@ -645,6 +645,7 @@ in float vIntensity;
 uniform vec4 uColor;
 uniform float uIntensityMin;
 uniform float uIntensityMax;
+uniform float uContrastFloor;  // dimmest brightness for the height ramp
 out vec4 outColor;
 void main() {
   // Relative height-based shading (V9.6): smoothstep maps each
@@ -659,8 +660,12 @@ void main() {
   // contrast between bodies remains visible even in crowded scenes.
   // Renderer guarantees max - min >= 0.5 so smoothstep degenerate
   // case is avoided.
+  // brightness: 1.0 at flat regions (t=0), uContrastFloor at deep
+  // wells (t=1). Renderer maps the slider value: dim = 1 - contrast,
+  // so contrast=0 → dim=1.0 (flat shading, no contrast), contrast=1
+  // → dim=0.0 (deep wells go fully dark).
   float t = smoothstep(uIntensityMin, uIntensityMax, vIntensity);
-  float brightness = mix(1.0, 0.25, t);
+  float brightness = mix(1.0, uContrastFloor, t);
   outColor = vec4(uColor.rgb * brightness, uColor.a);
 }`,
 };
