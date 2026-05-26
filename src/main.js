@@ -124,12 +124,12 @@ installDumpHint();
 let lastTime = performance.now();
 let accumulator = 0;
 const fpsMeter = createFpsMeter();   // bottom-right widget + RAF-delta EWMA cross-check
-requestAnimationFrame(frame);
+scheduleFrame(frame);
 
 // ─── Loop ──────────────────────────────────────────────────────────
 // RAF callbacks themselves are synchronous; the substep loop awaits the
 // backend (CPU resolves immediately; GPU awaits the pipelined mapAsync).
-// finally → requestAnimationFrame so a thrown error in runFrame still keeps
+// finally → scheduleFrame so a thrown error in runFrame still keeps
 // the loop alive (sliders remain reactive; the user sees the console error
 // rather than a silently frozen canvas).
 function frame(now) {
@@ -138,8 +138,32 @@ function frame(now) {
     .catch(err => console.error('[main] frame failed:', err))
     .finally(() => {
       fpsMeter.end();
-      requestAnimationFrame(frame);
+      scheduleFrame(frame);
     });
+}
+
+// V9.7: dual-driver to keep the renderer alive when the tab is hidden.
+//
+// Chrome throttles requestAnimationFrame to ~1Hz (sometimes pauses
+// entirely) on tabs with document.hidden=true. This kills the
+// preview MCP inspector tab — it loads the page successfully but
+// then RAF stops firing, so the canvas stays black and
+// preview_screenshot returns black. The previous workaround
+// (open URL in real browser via PowerShell Start-Process) bypassed
+// the inspector but lost the eval/screenshot pipeline.
+//
+// Root fix: when document.hidden=true, fall back to setTimeout(33ms,
+// ~30Hz) so the loop keeps ticking. Visible tab still gets RAF for
+// vsync-aligned 60Hz. The 33ms fallback is a deliberate trade — full
+// 60Hz when hidden would burn battery on real-user backgrounded
+// tabs; 30Hz is smooth enough for headless debugging without
+// doubling CPU when the user actually wants the tab idle.
+function scheduleFrame(fn) {
+  if (document.hidden) {
+    setTimeout(() => fn(performance.now()), 33);
+  } else {
+    requestAnimationFrame(fn);
+  }
 }
 
 async function runFrame(now) {

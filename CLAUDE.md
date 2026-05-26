@@ -102,6 +102,16 @@ Single mutable `state` object — every other module imports and mutates through
 
 This trap has been hit **at least 5 times** across sessions. The lesson decays between sessions. Follow this checklist verbatim.
 
+### Root-cause fix shipped 2026-05-26 (commit v9.7)
+
+`src/main.js` now uses `scheduleFrame(fn)` instead of bare `requestAnimationFrame`. When `document.hidden === true` (true for the preview MCP inspector tab whenever the user isn't actively focused on it), it falls back to `setTimeout(33)` so the render loop keeps ticking at ~30 Hz. `preview_screenshot` should now return live content — no more guaranteed black screen.
+
+**Do NOT remove this fallback** without restoring an alternative — the preview MCP inspector tab is HIDDEN by definition (it's an inspected target, not a focused tab). RAF throttling there is the failure mode, not the user's bug.
+
+If the screen is still black after the fix, suspect: (1) backend init failed (check console for Rapier WASM errors), (2) gl context lost, (3) cache-buster wasn't bumped after a shader change. NOT RAF throttling.
+
+### Legacy failure (chrome-error://chromewebdata/)
+
 ### Symptom
 
 `preview_eval` reports `url: "chrome-error://chromewebdata/"`, dynamic imports fail with `Failed to fetch dynamically imported module: chrome-error://chromewebdata/src/state.js`, HUD/DOM probes return null/false.
