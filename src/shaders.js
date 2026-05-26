@@ -101,11 +101,12 @@ uniform mat4 uOrtho;
 uniform float uRouter;               // outer radius in px (R + 0.5)
 out vec2 vLocal;                     // offset from center, px
 out vec3 vColor;
+${SAG_VS_HELPER}
 void main() {
   vec2 worldPx = iCenter + aCorner * uRouter;
   vLocal = aCorner * uRouter;
   vColor = iColor;
-  gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
+  gl_Position = uOrtho * vec4(sagProject(worldPx), 0.0, 1.0);
 }`,
   FS: `#version 300 es
 precision highp float;
@@ -138,9 +139,12 @@ in float iAlpha;
 uniform mat4 uOrtho;
 out vec2 vUv;
 out float vAlpha;
+${SAG_VS_HELPER}
 void main() {
   vec2 spritePx = vec2(aCorner.x * iSize.x, aCorner.y * iSize.y);
-  vec2 worldPx = iCenter - iOffset + spritePx;
+  // Project the entity CENTER through sag, then add sprite offset so
+  // the sprite shape stays unwarped (just shifted to the well bottom).
+  vec2 worldPx = sagProject(iCenter) - iOffset + spritePx;
   vUv = aCorner;
   vAlpha = iAlpha;
   gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
@@ -177,9 +181,12 @@ uniform mat4 uOrtho;
 out vec2 vLocal;
 out vec4 vColor;
 out float vRadius;
+${SAG_VS_HELPER}
 void main() {
   float pad = iRadius + 1.0;          // +1 px for AA ramp
-  vec2 worldPx = iCenter + aCorner * pad;
+  // Project center through sag; corner offset stays unwarped so the
+  // circle remains a circle on screen, just shifted to the well bottom.
+  vec2 worldPx = sagProject(iCenter) + aCorner * pad;
   vLocal = aCorner * pad;
   vColor = iColor;
   vRadius = iRadius;
@@ -225,9 +232,11 @@ out float vRadius;
 out float vLineW;
 out float vDashOn;
 out float vDashPeriod;
+${SAG_VS_HELPER}
 void main() {
   float pad = iRadius + iLineW * 0.5 + 1.0;   // +1 px AA ramp
-  vec2 worldPx = iCenter + aCorner * pad;
+  // Project center; corner offset stays unwarped (circular ring on screen).
+  vec2 worldPx = sagProject(iCenter) + aCorner * pad;
   vLocal = aCorner * pad;
   vColor = iColor;
   vRadius = iRadius;
@@ -296,19 +305,21 @@ out float vArc;           // arc-length at this fragment, px
 out float vLineW;
 out float vDashOn;
 out float vDashPeriod;
+${SAG_VS_HELPER}
 void main() {
-  vec2 dir = iP1 - iP0;
+  // Project both endpoints so polyline endpoints sit at projected positions
+  // (e.g. prediction line follows the body into its well). Segment geometry
+  // is then built from projected endpoints — line is straight on screen
+  // between A_projected and B_projected.
+  vec2 p0 = sagProject(iP0);
+  vec2 p1 = sagProject(iP1);
+  vec2 dir = p1 - p0;
   float segLen = length(dir);
   vec2 along = (segLen > 0.0) ? dir / segLen : vec2(1.0, 0.0);
   vec2 perp = vec2(-along.y, along.x);
-  // Pad +0.5 px in the perpendicular direction so the FS AA ramp at the
-  // long edges of the quad isn't clipped. The along-axis extent stays
-  // exactly [iP0, iP1] — for a polyline that's correct because consecutive
-  // segments share endpoints; standalone segments (rubber band) have no
-  // visible end-caps but the dash mask hides truncation.
   float s = aCorner.x;
   float halfW = iLineW * 0.5 + 0.5;
-  vec2 worldPx = iP0
+  vec2 worldPx = p0
                + along * (s * segLen)
                + perp  * ((aCorner.y - 0.5) * 2.0 * halfW);
   vT = (aCorner.y - 0.5) * 2.0 * halfW;
@@ -725,13 +736,16 @@ in float aAge;        // 0 = just-spawned, 1 = about to recycle
 uniform mat4 uOrtho;
 uniform float uPointSize;
 out float vAge;
+${SAG_VS_HELPER}
 void main() {
   vAge = aAge;
   // Younger particles are slightly bigger so the recycle flicker is
   // less visible — they fade in/out instead of pop.
   float ageMul = mix(1.2, 0.6, aAge);
   gl_PointSize = uPointSize * ageMul;
-  gl_Position = uOrtho * vec4(aPos, 0.0, 1.0);
+  // Project each particle's CSS-px position through sag so particles
+  // flow visually along the projected gravity wells.
+  gl_Position = uOrtho * vec4(sagProject(aPos), 0.0, 1.0);
 }`,
   FS: `#version 300 es
 precision highp float;

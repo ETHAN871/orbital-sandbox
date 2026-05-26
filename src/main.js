@@ -22,6 +22,7 @@ import {
   drawUI,
   updateTrailCanvas,
   resizeRenderer,
+  prepareFrameRenderer,
 } from './renderer-webgl.js';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
@@ -210,6 +211,10 @@ async function runFrame(now) {
   }
 
   perfMarkPhase('render');
+  // V10: rubber-sheet sag-texture prep must run BEFORE drawSceneGL so
+  // entity / trail / UI shaders sample valid sag data. No-op for non-
+  // rubber-sheet field styles.
+  prepareFrameRenderer();
   drawSceneGL();
   drawField();
   drawUI();

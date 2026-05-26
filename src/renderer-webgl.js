@@ -424,6 +424,33 @@ function _initPrograms() {
   _progParticleFlow.uOrtho     = gl.getUniformLocation(_progParticleFlow.prog, 'uOrtho');
   _progParticleFlow.uColor     = gl.getUniformLocation(_progParticleFlow.prog, 'uColor');
   _progParticleFlow.uPointSize = gl.getUniformLocation(_progParticleFlow.prog, 'uPointSize');
+
+  // V10 rubber-sheet: bind sag uniforms on every shader whose vertices
+  // need to sink into gravity wells. GRID_WARP is skipped (it has its
+  // own 3D oblique path); EQUIPOTENTIAL/STREAMLINE/TRAIL_DECAY/TRAIL_BLIT
+  // are field-only / fullscreen passes that stay flat.
+  for (const p of [_progTrailDot, _progEntity, _progCircleFill, _progCircleRing, _progLineSeg, _progParticleFlow]) {
+    p.uSagTex      = gl.getUniformLocation(p.prog, 'uSagTex');
+    p.uSagMode     = gl.getUniformLocation(p.prog, 'uSagMode');
+    p.uSagViewport = gl.getUniformLocation(p.prog, 'uSagViewport');
+  }
+}
+
+// V10: bind sag texture to a texture unit and upload sag uniforms for
+// the currently-bound program. Called by every draw path that uses the
+// sag-aware shaders. Texture unit 1 reserved for sag (unit 0 used by
+// the entity sprite texture binding in _drawEntities; safe to keep
+// sag in 1 for the whole frame).
+const _SAG_TEX_UNIT = 1;
+function _bindSagUniforms(prog) {
+  if (!_gl) return;
+  const gl = _gl;
+  gl.activeTexture(gl.TEXTURE0 + _SAG_TEX_UNIT);
+  gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
+  gl.uniform1i(prog.uSagTex, _SAG_TEX_UNIT);
+  gl.uniform1f(prog.uSagMode, _sagActive ? 1.0 : 0.0);
+  gl.uniform2f(prog.uSagViewport, _vpW, _vpH);
+  gl.activeTexture(gl.TEXTURE0);   // restore default
 }
 
 function _initBuffers() {
@@ -667,13 +694,18 @@ function _initSagTexture() {
   if (!_gl) return;
   if (_sagTexture) return;   // already created
   const gl = _gl;
+  // OES_texture_float_linear is REQUIRED for LINEAR filter on R32F.
+  // Without it the sampler silently clamps to NEAREST — visible as
+  // blocky body positions when sag wells are narrow. Universal on
+  // desktop WebGL 2 but worth the explicit getExtension call.
+  gl.getExtension('OES_texture_float_linear');
   _sagTexture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
   // R32F: single-channel float. WebGL 2 core supports R32F as a sampled
   // texture format (the EXT_color_buffer_float extension is only required
   // if we wanted to RENDER to it). We only sample, so no extension guard.
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, _SAG_TEX_W, _SAG_TEX_H, 0, gl.RED, gl.FLOAT, null);
-  // Linear filtering — gives smooth sag values between texels for sub-px body placement.
+  // Linear filtering — gives smooth sag values between texels.
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -937,6 +969,7 @@ function _drawParticleFlow() {
   gl.uniform4f(_progParticleFlow.uColor,
     PARTICLE_COLOR[0], PARTICLE_COLOR[1], PARTICLE_COLOR[2], PARTICLE_COLOR[3]);
   gl.uniform1f(_progParticleFlow.uPointSize, PARTICLE_POINT_SIZE * _dpr);
+  _bindSagUniforms(_progParticleFlow);
 
   // Additive blending for the luminous dust look.
   const prevBlendFunc = [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA];
@@ -1068,7 +1101,13 @@ function _drawGridWarp() {
   // global-bowl effect — but acknowledged as a known v1 limitation
   // since user picked 2D+particles direction.
   const dispScale = (mode === 0) ? 5.0 : 175.0;
-  const tiltY = 1.0;
+  // V10 rubber-sheet: align mesh tilt with sag-texture projection so the
+  // wireframe mesh sinks by the same screen-y amount as bodies/UI.
+  // sag-texture uses screen_y += sag·sin(45°) ≈ sag·0.7071, so use the
+  // same factor for GRID_WARP's mesh in rubber-sheet mode. Other 3D
+  // mode users (fieldStyle === '3d' legacy) keep the original 1.0 for
+  // backward visual compat.
+  const tiltY = (mode === 0 && state.fieldStyle === 'rubber-sheet') ? 0.70710678 : 1.0;
   // V9.6: dynamic per-frame min+max → true scene-relative shading.
   // Anchors smoothstep to [scene min, scene max] so the flattest
   // visible vertex always renders fully bright relative to the
@@ -1174,6 +1213,7 @@ function _drawFieldLines() {
   const gl = _gl;
   gl.useProgram(_progLineSeg.prog);
   gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
+  _bindSagUniforms(_progLineSeg);
   gl.bindVertexArray(_vaoLineSeg);
   gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
   gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
@@ -1444,6 +1484,7 @@ export function updateTrailCanvas(simDeltaTime) {
     gl.uniformMatrix4fv(_progTrailDot.uOrtho, false, _orthoMat);
     gl.uniform1f(_progTrailDot.uRinner, Ri);
     gl.uniform1f(_progTrailDot.uRouter, Ro);
+    _bindSagUniforms(_progTrailDot);
 
     // MAX blend: dest = max(src, dest) per channel.
     gl.enable(gl.BLEND);
@@ -1552,6 +1593,7 @@ function _drawEntities() {
 
   gl.useProgram(_progEntity.prog);
   gl.uniformMatrix4fv(_progEntity.uOrtho, false, _orthoMat);
+  _bindSagUniforms(_progEntity);
   gl.bindVertexArray(_vaoEntity);
 
   for (const [sprite, posArr] of buckets) {
@@ -1703,6 +1745,7 @@ export function drawUI() {
   if (_circleFillCount > 0) {
     gl.useProgram(_progCircleFill.prog);
     gl.uniformMatrix4fv(_progCircleFill.uOrtho, false, _orthoMat);
+    _bindSagUniforms(_progCircleFill);
     gl.bindVertexArray(_vaoCircleFill);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleFill);
     gl.bufferData(gl.ARRAY_BUFFER, _circleFillData.subarray(0, _circleFillCount * 7), gl.DYNAMIC_DRAW);
@@ -1713,6 +1756,7 @@ export function drawUI() {
   if (_lineSegCount > 0) {
     gl.useProgram(_progLineSeg.prog);
     gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
+    _bindSagUniforms(_progLineSeg);
     gl.bindVertexArray(_vaoLineSeg);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
     gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
@@ -1723,6 +1767,7 @@ export function drawUI() {
   if (_circleRingCount > 0) {
     gl.useProgram(_progCircleRing.prog);
     gl.uniformMatrix4fv(_progCircleRing.uOrtho, false, _orthoMat);
+    _bindSagUniforms(_progCircleRing);
     gl.bindVertexArray(_vaoCircleRing);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleRing);
     gl.bufferData(gl.ARRAY_BUFFER, _circleRingData.subarray(0, _circleRingCount * 10), gl.DYNAMIC_DRAW);
@@ -1903,26 +1948,11 @@ const UI_CONTOUR_LINE_W_PX = 1.0;
 // scene at peak.
 const UI_STREAMLINE_COLOR = [180 / 255, 210 / 255, 255 / 255, 0.65];
 
-export function drawField() {
-  if (_disabled || !_gl) return;
-  if (!state.showField) return;
-  if (_vpW <= 0 || _vpH <= 0) return;
-  const gl = _gl;
-
-  // Pack entity data into the GPU uniform array. In normal (destroy)
-  // boundary mode each non-absorbing, non-neutral entity contributes a
-  // single entry. In wrap mode each such entity contributes its 9-ghost
-  // PBC neighbourhood (itself + 8 mirror copies offset by ±W and ±H), so
-  // the field continuously hands off across the wrap boundary instead of
-  // discontinuously snapping when a body teleports. Matches the 9-ghost
-  // PBC physics in physics.js — without this the streamlines would
-  // disagree with where the bodies actually feel force.
-  //
-  // MAX_FIELD_ENTITIES caps total entries (entity × ghost). At 9× cost
-  // per entity in wrap mode the budget is ~14 visible entities before
-  // truncation; truncated ghosts just visually approximate but do not
-  // crash. Acceptable for the typical scene; user can disable field viz
-  // if they spawn 20+ bodies in wrap mode.
+// Pack non-absorbing, non-neutral entities into _fieldEntityData with
+// 9-ghost PBC copies in wrap mode. Extracted so it can run BEFORE
+// drawSceneGL (needed by V10 sag-texture prep) without coupling to
+// drawField's heavier setup.
+function _packFieldEntities() {
   _fieldEntityCount = 0;
   const wrap = state.boundaryMode === 'wrap';
   const W = _vpW, H = _vpH;
@@ -1946,6 +1976,34 @@ export function drawField() {
       }
     }
   }
+}
+
+// V10 rubber-sheet: per-frame renderer prep. Must run BEFORE drawSceneGL
+// so the sag texture is ready when entities + trails + UI sample it.
+// Called from main.js's runFrame.
+export function prepareFrameRenderer() {
+  if (_disabled || !_gl) return;
+  if (_vpW <= 0 || _vpH <= 0) return;
+  const rubberSheet = (state.showField && state.fieldStyle === 'rubber-sheet');
+  if (rubberSheet) {
+    _packFieldEntities();
+    _updateSagTexture();
+    _sagActive = true;
+  } else {
+    _sagActive = false;
+  }
+}
+
+export function drawField() {
+  if (_disabled || !_gl) return;
+  if (!state.showField) return;
+  if (_vpW <= 0 || _vpH <= 0) return;
+  const gl = _gl;
+
+  // Pack entity data into the GPU uniform array (same data used by
+  // prepareFrameRenderer for the sag texture; safe to repack here as
+  // it's idempotent given the same state).
+  _packFieldEntities();
   if (_fieldEntityCount === 0) return;       // empty scene → nothing to draw
 
   // Common GL state for both passes.
@@ -1969,6 +2027,11 @@ export function drawField() {
     _drawFieldLines();
   } else if (state.fieldStyle === 'legacy') {
     _drawEquipotential();
+  } else if (state.fieldStyle === 'rubber-sheet') {
+    // V10: 3D oblique mesh (mode=0 in GRID_WARP) — vertex shader does
+    // its own per-vertex sag projection. Bodies + trails + UI sink via
+    // the sag texture path set up by prepareFrameRenderer.
+    _drawGridWarp();
   } else {
     _drawGridWarp();
     if (state.fieldStyle === '2d') _drawParticleFlow();
