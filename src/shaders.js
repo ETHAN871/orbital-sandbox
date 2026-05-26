@@ -567,20 +567,35 @@ void main() {
   float eps2 = uEpsilon * uEpsilon;
   vec2 p = aPos;
   float phi = 0.0;             // Σ φ for 3D mode
-  vec2 gradPhi = vec2(0.0);    // Σ ∇φ for 2D mode
+  // 2D mode: build displacement with PER-BODY anti-overshoot bound.
+  // Each entity's pull on a vertex is capped at OVERSHOOT_FRAC × r_i
+  // where r_i is THIS vertex's distance to THIS body. A single body
+  // can therefore never move a vertex more than OVERSHOOT_FRAC × r_i
+  // toward itself → no crossing through body centres → no triangular
+  // rays at body positions and no adjacent-vertex order swaps (folds).
+  // OVERSHOOT_FRAC = 0.4: 40% of the way per body. With multi-body
+  // sums this can briefly exceed any single r_i, hence the final
+  // global cap below.
+  vec2 disp2D = vec2(0.0);
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
-    vec2 d = p - vec2(e.x, e.y);
+    vec2 d = p - vec2(e.x, e.y);   // points AWAY from body
     float r2 = d.x * d.x + d.y * d.y + eps2;
     float invR = inversesqrt(r2);
-    float invR3 = invR * invR * invR;
     if (uMode == 0) {
       phi += -e.z * invR;
     } else {
-      // ∇φ = G·q·m · d / (r²+ε²)^(3/2). Negate so vertices move
-      // TOWARD attractor (visually intuitive).
-      gradPhi += -e.z * d * invR3;
+      // raw signed magnitude (m/r² scaled by uDispScale).
+      float r = 1.0 / invR;
+      float raw = e.z * uDispScale * invR * invR;
+      // Anti-overshoot on magnitude only (preserves direction +
+      // attractor/repulsor sign).
+      float OVERSHOOT_FRAC = 0.4;
+      float maxAllowed = r * OVERSHOOT_FRAC;
+      float bounded = sign(raw) * min(abs(raw), maxAllowed);
+      // Apply along the unit vector TOWARD the body (= -d / r).
+      disp2D += -d * invR * bounded;
     }
   }
   vec2 worldPx;
@@ -593,24 +608,12 @@ void main() {
     worldPx = vec2(p.x, p.y + depth * uTiltY);
     intensity = depth;
   } else {
-    // 2D in-plane: displacement TOWARD attractor with SMOOTH (rational)
-    // saturation instead of a hard cap. Hard-clamping caused two bugs
-    // at high mass (m=1000):
-    //   1. Grid folds — every vertex within r<600px of the body all
-    //      saturated to exactly cap=28 px, piling neighbours onto each
-    //      other around the body center → crossed/overlapping lines.
-    //   2. No visible distortion — uniform-saturation regions have ZERO
-    //      differential, so neighbouring vertices all shift by the same
-    //      amount and the grid looks merely translated rather than warped.
-    //
-    // The rational form disp * cap/(cap+|disp|) asymptotes to cap but
-    // preserves d(disp)/d(grad) > 0 at every magnitude, so the grid
-    // visibly compresses even when each vertex has saturated.
-    vec2 disp = gradPhi * uDispScale;
-    float mag = length(disp);
+    // 2D in-plane: global smooth saturation as a backstop for the
+    // already-bounded per-body sum (multi-body pile-ups).
+    float mag = length(disp2D);
     float cap = 35.0;
     float factor = cap / (cap + mag);
-    worldPx = p + disp * factor;
+    worldPx = p + disp2D * factor;
     intensity = mag * factor;
   }
   vIntensity = intensity;

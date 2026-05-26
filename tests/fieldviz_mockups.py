@@ -500,7 +500,8 @@ def mockup_hard_vs_smooth():
         invR3 = 1.0 / (r2 * math.sqrt(r2))
         return (-ez * dx * invR3, -ez * dy * invR3)
 
-    def _draw_band(y_top, y_bot, mode_smooth, label):
+    def _draw_band(y_top, y_bot, mode_label, label):
+        """mode_label ∈ {'hard', 'smooth', 'antiovershoot'}."""
         cols, rows = 56, 28
         X_LEFT, X_RIGHT = 30, 600
         cw = (X_RIGHT - X_LEFT) / (cols - 1)
@@ -508,20 +509,43 @@ def mockup_hard_vs_smooth():
         body_y = (y_top + y_bot) / 2
         pts = [[(0.0, 0.0)] * cols for _ in range(rows)]
         DISP_SCALE = 175.0
-        CAP = 35.0 if mode_smooth else 28.0
+        CAP = 35.0
+        OVERSHOOT_FRAC = 0.4
         for r in range(rows):
             for c in range(cols):
                 x = X_LEFT + c * cw
                 y = y_top + r * rh
-                gx, gy = _heavy_grad(x, y, body_y)
-                disp_x = gx * DISP_SCALE
-                disp_y = gy * DISP_SCALE
-                mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
-                if mode_smooth:
+                dx = x - HEAVY_BODY["x"]
+                dy = y - body_y
+                r2 = dx * dx + dy * dy + 16.0
+                r_dist = math.sqrt(r2)
+                ez = 80.0 * 1000.0
+                if mode_label == 'hard':
+                    grad_x = -ez * dx / (r2 * r_dist)
+                    grad_y = -ez * dy / (r2 * r_dist)
+                    disp_x = grad_x * DISP_SCALE
+                    disp_y = grad_y * DISP_SCALE
+                    mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
+                    factor = (28.0 / mag) if mag > 28.0 else 1.0
+                    pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+                elif mode_label == 'smooth':
+                    grad_x = -ez * dx / (r2 * r_dist)
+                    grad_y = -ez * dy / (r2 * r_dist)
+                    disp_x = grad_x * DISP_SCALE
+                    disp_y = grad_y * DISP_SCALE
+                    mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
                     factor = CAP / (CAP + mag)
-                else:
-                    factor = (CAP / mag) if mag > CAP else 1.0
-                pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+                    pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+                else:  # antiovershoot — per-body bound + global smooth
+                    raw_mag = ez * DISP_SCALE / r2
+                    max_allowed = r_dist * OVERSHOOT_FRAC
+                    bounded = min(raw_mag, max_allowed)
+                    ux, uy = -dx / r_dist, -dy / r_dist
+                    disp_x = ux * bounded
+                    disp_y = uy * bounded
+                    mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
+                    factor = CAP / (CAP + mag)
+                    pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
         for r in range(rows):
             for c in range(cols - 1):
                 (x1, y1), (x2, y2) = pts[r][c], pts[r][c + 1]
@@ -544,15 +568,26 @@ def mockup_hard_vs_smooth():
         )
         draw.text((X_LEFT, y_top - 22), label, font=FONT_CAPTION, fill=(220, 230, 240, 240))
 
-    HALF_H = (H - 130 - 40) // 2
-    _draw_band(140, 140 + HALF_H, mode_smooth=False,
-               label="HARD CAP (bug): vertices saturate → grid folds + no differential")
-    _draw_band(140 + HALF_H + 40, 140 + 2 * HALF_H + 40, mode_smooth=True,
-               label="SMOOTH SATURATION (fix): displacement preserves gradient → grid compresses cleanly")
+    GAP = 30
+    y0 = 140
+    THIRD_H = (H - y0 - 30 - 2 * GAP) // 3
+    _draw_band(
+        y0, y0 + THIRD_H, mode_label='hard',
+        label="HARD CAP (old): vertices clamp at 28 px → grid folds + no differential near body",
+    )
+    _draw_band(
+        y0 + THIRD_H + GAP, y0 + 2 * THIRD_H + GAP, mode_label='smooth',
+        label="SMOOTH SATURATION (prior fix): no fold far out, but vertices still cross body → triangles",
+    )
+    _draw_band(
+        y0 + 2 * (THIRD_H + GAP), y0 + 3 * THIRD_H + 2 * GAP,
+        mode_label='antiovershoot',
+        label="ANTI-OVERSHOOT (new): per-body bound = 0.4·r → no body crossing, no triangles, no folds",
+    )
     _header(
         im,
-        "Bug Fix — m=1000 body",
-        "hard-cap vs rational saturation · same gravity field, same scale",
+        "Bug Fix — m=1000 body (3-way: hard → smooth → anti-overshoot)",
+        "shows triangles + folding root cause is per-body overshoot, not global cap shape",
     )
     path = os.path.join(OUT_DIR, "mockup_bugfix.png")
     im.save(path)
