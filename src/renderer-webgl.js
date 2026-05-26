@@ -396,7 +396,8 @@ function _initPrograms() {
   _progGridWarp.uMode          = gl.getUniformLocation(_progGridWarp.prog, 'uMode');
   _progGridWarp.uOrtho         = gl.getUniformLocation(_progGridWarp.prog, 'uOrtho');
   _progGridWarp.uColor         = gl.getUniformLocation(_progGridWarp.prog, 'uColor');
-  _progGridWarp.uIntensityHalf = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityHalf');
+  _progGridWarp.uIntensityMin  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMin');
+  _progGridWarp.uIntensityMax  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMax');
 
   // V9.2 particle-flow program (companion overlay).
   _progParticleFlow = _makeProgram(PARTICLE_FLOW.VS, PARTICLE_FLOW.FS);
@@ -873,12 +874,13 @@ function _drawParticleFlow() {
 const GRID_WARP_COLOR_3D = [120 / 255, 170 / 255, 230 / 255, 0.55];
 const GRID_WARP_COLOR_2D = [150 / 255, 200 / 255, 250 / 255, 0.55];
 
-// V9.5 relative-shading: CPU mirror of GRID_WARP.VS intensity math,
-// sampled across the viewport so we can pass the per-frame MAX of
-// vIntensity as uIntensityHalf. The fragment shader normalizes
-// brightness against that value, so the deepest well in the scene
-// always maps to the dimmest brightness regardless of absolute warp
-// strength — i.e. relative-to-scene shading rather than absolute.
+// V9.6 relative-shading: CPU mirror of GRID_WARP.VS intensity math,
+// sampled across the viewport to derive the per-frame MIN and MAX
+// of vIntensity. Both are passed as uniforms (uIntensityMin /
+// uIntensityMax); the fragment shader smoothsteps between them so
+// the flattest visible vertex always renders fully bright and the
+// deepest well fully dim — regardless of absolute warp strength or
+// nonzero baseline warp in crowded scenes.
 //
 // CONTRACT (analogous to the Plummer-softening oracle in CLAUDE.md):
 // if you change the per-vertex intensity formula in GRID_WARP.VS,
@@ -886,14 +888,22 @@ const GRID_WARP_COLOR_2D = [150 / 255, 200 / 255, 250 / 255, 0.55];
 const _GRIDWARP_OVERSHOOT_FRAC = 0.4;   // mirrors VS
 const _GRIDWARP_L_ATAN = 50.0;          // mirrors VS
 const _GRIDWARP_DEPTH_CAP = 250.0;      // mirrors VS clamp in 3D mode
-// EMA state for the smoothstep upper bound (uIntensityHalf). Slow
-// rise/fall prevents brightness flash when a body is deleted or
-// moves off-screen and the raw max drops sharply in one frame.
-// Sentinel -1 = uninitialized → first frame seeds with raw max
+// EMA state for the smoothstep bounds (uIntensityMin/uIntensityMax).
+// Slow rise/fall prevents brightness flash when a body is deleted or
+// moves off-screen and the raw range collapses in one frame.
+// Sentinel -1 = uninitialized → first frame seeds with raw values
 // (no EMA warm-up dimness for the first ~30 frames).
-let _intensityHalfEMA = -1;
-function _computeFieldMaxIntensity(mode, dispScale, epsilon) {
-  if (_fieldEntityCount === 0) return 0;
+let _intensityMinEMA = -1;
+let _intensityMaxEMA = -1;
+// Scratch returned by _computeFieldIntensityRange — reused each
+// frame to avoid GC churn from allocating a fresh {min, max}.
+const _intensityRange = { min: 0, max: 0 };
+function _computeFieldIntensityRange(mode, dispScale, epsilon) {
+  if (_fieldEntityCount === 0) {
+    _intensityRange.min = 0;
+    _intensityRange.max = 0;
+    return _intensityRange;
+  }
   const ents = _fieldEntityData;
   const cnt = _fieldEntityCount;
   const eps2 = epsilon * epsilon;
@@ -902,7 +912,7 @@ function _computeFieldMaxIntensity(mode, dispScale, epsilon) {
   // ~2300·N ops/frame. At N=200 that's ~460K ops ≈ 2 ms; cheaper
   // than the GL draw itself.
   const SC = 16, SR = 12;
-  let maxI = 0;
+  let minI = Infinity, maxI = 0;
   for (let r = 0; r < SR; r++) {
     const y = (r / (SR - 1)) * _vpH;
     for (let c = 0; c < SC; c++) {
@@ -942,10 +952,13 @@ function _computeFieldMaxIntensity(mode, dispScale, epsilon) {
         const mag = Math.sqrt(disp2Dx * disp2Dx + disp2Dy * disp2Dy);
         intensity = _GRIDWARP_L_ATAN * Math.atan(mag / _GRIDWARP_L_ATAN);
       }
+      if (intensity < minI) minI = intensity;
       if (intensity > maxI) maxI = intensity;
     }
   }
-  return maxI;
+  _intensityRange.min = minI === Infinity ? 0 : minI;
+  _intensityRange.max = maxI;
+  return _intensityRange;
 }
 
 function _drawGridWarp() {
@@ -961,25 +974,29 @@ function _drawGridWarp() {
   // since user picked 2D+particles direction.
   const dispScale = (mode === 0) ? 5.0 : 175.0;
   const tiltY = 1.0;
-  // V9.5: dynamic per-frame max instead of fixed 22 — gives true
-  // scene-relative shading. EMA-smoothed (α=0.15) so brightness
-  // doesn't flash when a body is deleted / moves off-screen and
-  // the raw max drops sharply in one frame. Floor 0.5 keeps the
-  // smoothstep upper bound positive in empty scenes (smoothstep
-  // collapses to 0 → brightness = 1.0 for every vertex, which is
-  // the desired empty-scene look). Sample window is the visible
-  // viewport only; off-viewport vertices in the 15% extension
-  // inherit that scale — typically benign since gravity sources
-  // are normally inside the viewport, but a body parked just
-  // outside the visible area could under-dim some off-screen
-  // grid vertices. Acceptable since those vertices are clipped.
-  const liveMax = _computeFieldMaxIntensity(mode, dispScale, state.epsilon);
-  if (_intensityHalfEMA < 0) {
-    _intensityHalfEMA = liveMax;     // first-frame seed avoids cold-start dimness
+  // V9.6: dynamic per-frame min+max → true scene-relative shading.
+  // Anchors smoothstep to [scene min, scene max] so the flattest
+  // visible vertex always renders fully bright relative to the
+  // deepest well. Critical in crowded scenes where every vertex has
+  // nonzero baseline warp — without min anchoring the dynamic range
+  // collapses and the whole scene looks uniformly dim.
+  // EMA-smoothed (α=0.15, ~7-frame half-life) prevents flicker when
+  // a body is deleted / moves off-screen and raw range jumps.
+  // Sample window is viewport only; off-viewport vertices in the
+  // 15% grid extension inherit the same scale (acceptable since
+  // they're clipped).
+  const range = _computeFieldIntensityRange(mode, dispScale, state.epsilon);
+  if (_intensityMinEMA < 0) {
+    _intensityMinEMA = range.min;   // first-frame seed avoids cold-start dimness
+    _intensityMaxEMA = range.max;
   } else {
-    _intensityHalfEMA = _intensityHalfEMA * 0.85 + liveMax * 0.15;
+    _intensityMinEMA = _intensityMinEMA * 0.85 + range.min * 0.15;
+    _intensityMaxEMA = _intensityMaxEMA * 0.85 + range.max * 0.15;
   }
-  const intensityHalf = Math.max(_intensityHalfEMA, 0.5);
+  // Guarantee max - min >= 0.5 to keep smoothstep non-degenerate
+  // (empty / near-uniform scenes → no division blow-up).
+  let intensityMin = _intensityMinEMA;
+  let intensityMax = Math.max(_intensityMaxEMA, intensityMin + 0.5);
   const color = (mode === 0) ? GRID_WARP_COLOR_3D : GRID_WARP_COLOR_2D;
 
   gl.useProgram(_progGridWarp.prog);
@@ -992,7 +1009,8 @@ function _drawGridWarp() {
   gl.uniform1i(_progGridWarp.uMode, mode);
   gl.uniformMatrix4fv(_progGridWarp.uOrtho, false, _orthoMat);
   gl.uniform4f(_progGridWarp.uColor, color[0], color[1], color[2], color[3]);
-  gl.uniform1f(_progGridWarp.uIntensityHalf, intensityHalf);
+  gl.uniform1f(_progGridWarp.uIntensityMin, intensityMin);
+  gl.uniform1f(_progGridWarp.uIntensityMax, intensityMax);
 
   gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
   gl.enableVertexAttribArray(_progGridWarp.aPos);

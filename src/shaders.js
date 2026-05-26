@@ -643,18 +643,23 @@ void main() {
 precision highp float;
 in float vIntensity;
 uniform vec4 uColor;
-uniform float uIntensityHalf;
+uniform float uIntensityMin;
+uniform float uIntensityMax;
 out vec4 outColor;
 void main() {
-  // Relative height-based shading (V9.5): vIntensity is sag depth (3D)
-  // or warp magnitude (2D). uIntensityHalf is set by the renderer to
-  // the per-FRAME MAX vIntensity (sampled across the viewport), so
-  // smoothstep maps the deepest vertex in the current scene → 1.0
-  // (brightness 0.25) and unwarped flat vertices → 0.0 (brightness 1.0).
-  // Result is true scene-relative shading: even mildly warped scenes
-  // show clear bright/dim contrast between flat regions and wells.
-  // Floor at uniform side keeps brightness=1.0 for empty scenes.
-  float t = smoothstep(0.0, uIntensityHalf, vIntensity);
+  // Relative height-based shading (V9.6): smoothstep maps each
+  // vertex's intensity from the per-FRAME [min, max] range into
+  // [0, 1] then into brightness [1.0 .. 0.25]. Crucially uses
+  // MIN (not 0) as the lower bound: in scenes with many bodies
+  // every vertex has nonzero baseline warp, so the "flattest"
+  // point is at intensity = min > 0. Mapping from 0 instead of
+  // min collapses the dynamic range and the whole scene looks
+  // uniformly dim. With min anchoring, the flattest visible spot
+  // always renders fully bright relative to the deepest well —
+  // contrast between bodies remains visible even in crowded scenes.
+  // Renderer guarantees max - min >= 0.5 so smoothstep degenerate
+  // case is avoided.
+  float t = smoothstep(uIntensityMin, uIntensityMax, vIntensity);
   float brightness = mix(1.0, 0.25, t);
   outColor = vec4(uColor.rgb * brightness, uColor.a);
 }`,
