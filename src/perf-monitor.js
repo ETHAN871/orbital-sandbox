@@ -66,10 +66,21 @@ const ctx = {
 
 export function initPerfMonitor() {
   try {
-    const sp = new URLSearchParams(window.location.search);
+    // globalThis.location is available in workers (self.location) and main
+    // (window.location). The worker has no HUD anyway — initPerfMonitor's
+    // hudEl creation needs `document`, which doesn't exist in workers, so
+    // this still gracefully no-ops when called from a worker context.
+    const search = (typeof globalThis !== 'undefined' && globalThis.location)
+      ? globalThis.location.search : '';
+    const sp = new URLSearchParams(search);
     enabled = sp.get('perf') === '1';
   } catch { enabled = false; }
   if (!enabled) return;
+  if (typeof document === 'undefined') {
+    // Worker context — no HUD DOM. Mark enabled so phase tracking runs,
+    // but skip element creation.
+    return;
+  }
 
   hudEl = document.createElement('div');
   hudEl.id = 'perf-hud';

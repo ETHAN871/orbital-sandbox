@@ -134,6 +134,33 @@ This trap has been hit **at least 5 times** across sessions. The lesson decays b
 // Issue a fresh eval to read state. Don't conclude failure from that error.
 ```
 
+## /feature-dev default mode: autonomous iteration
+
+**User-declared default (2026-05-25):** any `/feature-dev` invocation in this
+project SHOULD use autonomous problem-discovery iteration unless the user
+explicitly says otherwise. That means:
+
+- Skip the "wait for approval after planning" step. Make reasonable design
+  calls and proceed.
+- Skip clarifying-question rounds for low-stakes decisions. Pick the
+  recommended option and document the choice in a comment or commit msg.
+- DO ask via `AskUserQuestion` ONLY when the choice is genuinely high-stakes,
+  irreversible, or the user-supplied request is missing essential info that
+  cannot be inferred from codebase patterns.
+- Drive the loop yourself: hypothesis → measurement → fix → verify → repeat.
+  Use the per-iteration discipline from the Optimization-loop methodology
+  section below.
+- code-reviewer pass after each implementation batch is still mandatory.
+- Commit + deploy at the end without asking permission (unless commit is
+  on a protected branch or the change is genuinely destructive).
+
+The user's mental model: `/feature-dev` = "go figure it out, ship it, tell
+me what you did." Not "draft a plan, wait for me, then maybe build it."
+
+If the project's CLAUDE.md, `/feature-dev` skill, or workspace rules
+ever conflict with this default, the workspace rules win — but a friendly
+inline reminder of this preference is fine.
+
 ## Optimization-loop methodology (LEARN FROM PAST WINS)
 
 The session ending 2026-05-25 had a **6-stage thrash** (Stages 0-6 produced

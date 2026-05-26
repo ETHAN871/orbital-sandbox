@@ -459,13 +459,33 @@ export async function createBackend() {
       // Rapier bug. Real Chrome runs Rapier at 240fps stable.
       const params = new URLSearchParams(window.location.search);
       const engineParam = params.get('engine');
-      const wantRapier = engineParam === 'rapier' ||
+      const wantRapierWorker = engineParam === 'rapier-worker';
+      // When rapier-worker is requested but init fails, fall back to in-thread
+      // Rapier instead of the CPU path. Otherwise wantRapier is set by the
+      // explicit `rapier` flag or by the default (no engine param) path.
+      let wantRapier = engineParam === 'rapier' ||
         (engineParam === null && params.get('backend') !== 'force-cpu');
       const wantPlanck = engineParam === 'planck';
       let usingExternalEngine = false;
-      if (wantRapier) {
+      if (wantRapierWorker) {
         try {
-          const { makeRapierBackend } = await import('./physics-rapier.js');
+          active = makeRapierWorkerBackend();
+          await active.init(entities);
+          usingExternalEngine = true;
+        } catch (e) {
+          console.warn('[physics-backend] rapier-worker init failed; falling back to in-thread Rapier:', e);
+          wantRapier = true;   // promote to in-thread fallback
+        }
+      }
+      if (!usingExternalEngine && wantRapier) {
+        try {
+          // Import the Rapier module via bare specifier (resolved by index.html
+          // import map) and inject it into physics-rapier.js. The same module
+          // can also be loaded by physics-rapier-worker.js with the full CDN
+          // URL — both paths funnel through setRapier() before init().
+          const RAPIER = (await import('@dimforge/rapier2d-compat')).default;
+          const { makeRapierBackend, setRapier } = await import('./physics-rapier.js');
+          setRapier(RAPIER);
           active = makeRapierBackend();
           await active.init(entities);
           usingExternalEngine = true;
@@ -501,6 +521,299 @@ export async function createBackend() {
 
     destroy() {
       active.destroy();
+    },
+  };
+}
+
+// ── Rapier worker backend ──────────────────────────────────────────
+// Proxies the in-thread Rapier API across a postMessage round-trip to a
+// Web Worker. The worker owns the Rapier instance and runs step() off the
+// main thread; main packs entity state into a transferable Float32Array
+// each substep and waits for the worker's response.
+//
+// Activated via ?engine=rapier-worker. Falls back to in-thread Rapier on
+// any init failure (no Worker support, module load error, etc.).
+//
+// v1 limitations (deferred to follow-up iterations):
+//   - State-dump tracing happens worker-side only; main thread receives
+//     no trace data. The 状态录制 UI button is a no-op when worker active.
+//   - perf-monitor's per-phase ms breakdown collapses into a single
+//     "workerRoundTrip" phase from main's perspective. Per-phase data
+//     still exists worker-side but isn't surfaced yet.
+//   - GPU gravity is bypassed inside the worker (navigator.gpu is rarely
+//     available in workers; the worker uses CPU gravity exclusively).
+//   - Spawn/delete/mutate detection from input.js is best-effort via a
+//     prepareFrame-time diff; rapid spawn bursts during a single RAF
+//     might land in the next-next substep.
+
+function makeRapierWorkerBackend() {
+  let worker = null;
+  let readyPromise = null;
+  let inFlight = null;        // Promise resolving on next stepDone / error
+  let resolveInFlight = null;
+  let rejectInFlight  = null;
+  // `dead` short-circuits step() after destroy() or a fatal worker error,
+  // so the substep loop fails fast instead of hanging on a postMessage to
+  // a terminated worker. Code-review HIGH 2026-05-26.
+  let dead = false;
+  // Snapshot of last-known entity ids — used to diff against state.entities
+  // each prepareFrame to compute the delta the worker needs.
+  const knownIds = new Set();
+  // Per-id snapshot of mutable meta fields — used to detect slider-driven
+  // changes (mass / radius / type / pinned / charge) that need worker rebuild.
+  const lastMeta = new Map();
+
+  // Helpers ──────────────────────────────────────────────────────────
+  function snapshotEntity(e) {
+    return {
+      id: e.id, type: e.type,
+      x: e.x, y: e.y, vx: e.vx, vy: e.vy,
+      mass: e.mass, radius: e.radius, charge: e.charge,
+      pinned: !!e.pinned,
+      color: e.color,
+    };
+  }
+  function recordMeta(e) {
+    lastMeta.set(e.id, {
+      mass: e.mass, radius: e.radius, type: e.type,
+      pinned: !!e.pinned, charge: e.charge,
+    });
+  }
+  function metaChanged(e) {
+    const last = lastMeta.get(e.id);
+    if (!last) return false;
+    return last.mass !== e.mass || last.radius !== e.radius ||
+           last.type !== e.type || last.pinned !== !!e.pinned ||
+           last.charge !== e.charge;
+  }
+
+  function computeDelta(entities) {
+    const seen = new Set();
+    const spawned = [];
+    const mutated = [];
+    for (const e of entities) {
+      seen.add(e.id);
+      if (!knownIds.has(e.id)) {
+        spawned.push(snapshotEntity(e));
+        knownIds.add(e.id);
+        recordMeta(e);
+      } else if (metaChanged(e)) {
+        mutated.push({
+          id: e.id,
+          mass: e.mass, radius: e.radius, type: e.type,
+          pinned: !!e.pinned, charge: e.charge,
+        });
+        recordMeta(e);
+      }
+    }
+    const deleted = [];
+    for (const id of knownIds) {
+      if (!seen.has(id)) {
+        deleted.push(id);
+        knownIds.delete(id);
+        lastMeta.delete(id);
+      }
+    }
+    return (spawned.length || deleted.length || mutated.length)
+      ? { spawned, deleted, mutated }
+      : null;
+  }
+
+  function packEntityData(entities) {
+    const N = entities.length;
+    const data = new Float32Array(N * 4);
+    const ids = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      const e = entities[i];
+      data[i * 4    ] = e.x;
+      data[i * 4 + 1] = e.y;
+      data[i * 4 + 2] = e.vx;
+      data[i * 4 + 3] = e.vy;
+      ids[i] = e.id;
+    }
+    return { data, ids };
+  }
+
+  function applyStepDone(msg, entities, sentIds) {
+    const { entityData, entityIds } = msg;
+    // Phase 1: update positions of returned entities.
+    const idMap = new Map();
+    for (let i = 0; i < entities.length; i++) idMap.set(entities[i].id, entities[i]);
+    for (let i = 0; i < entityIds.length; i++) {
+      const e = idMap.get(entityIds[i]);
+      if (!e || e.absorbing) continue;  // don't overwrite mid-absorbing animation
+      e.x  = entityData[i * 4    ];
+      e.y  = entityData[i * 4 + 1];
+      e.vx = entityData[i * 4 + 2];
+      e.vy = entityData[i * 4 + 3];
+    }
+    // Phase 2: reconcile absorptions / boundary-destroys. Anything that was
+    // sent TO the worker but didn't come back was removed worker-side. We
+    // splice it from main's state.entities to keep the renderer in sync.
+    // Anything in main's entities NOT in sentIds is "newer than this step"
+    // (e.g. spawned by input.js mid-flight) and is left alone.
+    //
+    // EXCEPTION: entities main has flagged `absorbing` (mid-animation) must
+    // NOT be spliced even if the worker removed them. main's updateAbsorptions
+    // owns the animation lifecycle and will splice them when the animation
+    // completes. Splicing here would cause a body to vanish mid-animation
+    // if it also triggered a worker-side absorption simultaneously.
+    // Code-review HIGH 2026-05-26.
+    if (sentIds && sentIds.length > 0) {
+      const returnedSet = new Set();
+      for (let i = 0; i < entityIds.length; i++) returnedSet.add(entityIds[i]);
+      const sentSet = new Set();
+      for (let i = 0; i < sentIds.length; i++) sentSet.add(sentIds[i]);
+      for (let i = entities.length - 1; i >= 0; i--) {
+        const e = entities[i];
+        if (e.absorbing) continue;          // animation owns this entity
+        if (sentSet.has(e.id) && !returnedSet.has(e.id)) {
+          // Worker removed this entity (absorption / boundary destroy).
+          knownIds.delete(e.id);
+          lastMeta.delete(e.id);
+          entities.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  function currentStateParams() {
+    return {
+      G: state.G,
+      epsilon: state.epsilon,
+      contactStiffness: state.contactStiffness,
+      elasticRestitution: state.elasticRestitution,
+      launchSpeedK: state.launchSpeedK,
+      absorptionDuration: state.absorptionDuration,
+      overlapEscalateThreshold: state.overlapEscalateThreshold,
+      overlapCooldownFrames: state.overlapCooldownFrames,
+      overlapBulletThreshold: state.overlapBulletThreshold,
+      stateDumpEnabled: false,   // v1: never enable worker-side trace
+      viewport: { width: state.viewport.width, height: state.viewport.height },
+      boundaryMode: state.boundaryMode,
+    };
+  }
+
+  return {
+    name: 'rapier-worker',
+
+    async init(entities) {
+      // Construct the Worker. Using a relative URL with `type: 'module'`.
+      // If the browser doesn't support module workers OR the URL fails
+      // to resolve, this throws and the caller falls back to in-thread.
+      worker = new Worker(new URL('./physics-rapier-worker.js', import.meta.url), { type: 'module' });
+
+      // Single message handler — multiplexes ready / stepDone / error.
+      worker.addEventListener('message', (ev) => {
+        const m = ev.data;
+        if (m.type === 'stepDone') {
+          if (resolveInFlight) {
+            const r = resolveInFlight; resolveInFlight = null; rejectInFlight = null;
+            r(m);
+          }
+        } else if (m.type === 'error') {
+          console.warn('[physics-backend] worker error:', m.message);
+          if (rejectInFlight) {
+            const r = rejectInFlight; resolveInFlight = null; rejectInFlight = null;
+            r(new Error(m.message));
+          }
+        }
+      });
+      worker.addEventListener('error', (ev) => {
+        console.warn('[physics-backend] worker fatal — marking backend dead:', ev.message || ev);
+        dead = true;
+        if (rejectInFlight) {
+          const r = rejectInFlight; resolveInFlight = null; rejectInFlight = null;
+          r(new Error(ev.message || 'worker error'));
+        }
+      });
+
+      // Seed worker entity mirror.
+      for (const e of entities) {
+        knownIds.add(e.id);
+        recordMeta(e);
+      }
+
+      // Send init + await ready.
+      readyPromise = new Promise((resolve, reject) => {
+        const handler = (ev) => {
+          if (ev.data && ev.data.type === 'ready') {
+            worker.removeEventListener('message', handler);
+            resolve();
+          } else if (ev.data && ev.data.type === 'error') {
+            worker.removeEventListener('message', handler);
+            reject(new Error(ev.data.message));
+          }
+        };
+        worker.addEventListener('message', handler);
+      });
+      worker.postMessage({
+        type: 'init',
+        entities: entities.map(snapshotEntity),
+      });
+      await readyPromise;
+      state.backendName = 'rapier-worker';
+    },
+
+    prepareFrame(entities) {
+      // No-op on main thread — the worker runs prepareFrame internally
+      // when it receives the step message. Delta computation happens in
+      // step() since it needs to ride along on the step payload anyway.
+    },
+
+    async step(entities, dt, viewport, boundaryMode, isLastSubstep) {
+      if (dead) throw new Error('[physics-backend] worker is dead; cannot step');
+      const delta = computeDelta(entities);
+      const { data, ids } = packEntityData(entities);
+      // Snapshot of ids being sent — needed by applyStepDone to detect
+      // absorptions/destroys (entities present here but missing from the
+      // worker's response). Cheap clone; ids buffer itself is transferred.
+      const sentIds = Array.from(ids);
+
+      const result = await new Promise((resolve, reject) => {
+        resolveInFlight = resolve;
+        rejectInFlight = reject;
+        worker.postMessage(
+          {
+            type: 'step',
+            entityData: data,
+            entityIds: ids,
+            stateParams: currentStateParams(),
+            delta,
+            dt,
+            viewport: { width: viewport.width, height: viewport.height },
+            boundaryMode,
+            isLastSubstep,
+          },
+          [data.buffer, ids.buffer]
+        );
+      });
+
+      applyStepDone(result, entities, sentIds);
+    },
+
+    onEntityMetaMaybeChanged() {
+      // No-op — worker detects mutations each step via the delta diff.
+    },
+
+    destroy() {
+      dead = true;
+      // Reject any in-flight step() promise BEFORE terminating the worker.
+      // Otherwise the await in step() hangs forever and the substep loop
+      // freezes silently. Code-review HIGH 2026-05-26.
+      if (rejectInFlight) {
+        const r = rejectInFlight;
+        resolveInFlight = null;
+        rejectInFlight = null;
+        try { r(new Error('worker destroyed before step completed')); } catch {}
+      }
+      if (worker) {
+        try { worker.postMessage({ type: 'destroy' }); } catch {}
+        try { worker.terminate(); } catch {}
+      }
+      worker = null;
+      knownIds.clear();
+      lastMeta.clear();
     },
   };
 }

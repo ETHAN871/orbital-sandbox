@@ -36,7 +36,13 @@ const REQUIRED_LIMITS = {
 };
 
 function queryParam(name) {
-  const params = new URLSearchParams(window.location.search);
+  // globalThis.location works in both window (main thread) and worker
+  // contexts. Workers expose self.location with the worker script URL's
+  // search params; main has window.location. Using globalThis lets this
+  // file be imported into physics-rapier-worker.js without a ReferenceError.
+  const search = (typeof globalThis !== 'undefined' && globalThis.location)
+    ? globalThis.location.search : '';
+  const params = new URLSearchParams(search);
   return params.get(name);
 }
 

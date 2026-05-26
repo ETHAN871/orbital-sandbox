@@ -51,7 +51,17 @@
 //   the force is applied (Rapier's addForce wakes by default).
 //   Otherwise the body stays asleep.
 
-import RAPIER from '@dimforge/rapier2d-compat';
+// RAPIER is injected by the caller — see setRapier() below. Two contexts:
+//   - Main thread (physics-backend.js → makeRapierBackend): imports RAPIER
+//     via the bare specifier `@dimforge/rapier2d-compat` resolved through
+//     index.html's import map, then calls setRapier() before invoking
+//     makeRapierBackend().init().
+//   - Worker thread (physics-rapier-worker.js): cannot use import maps
+//     (workers don't inherit them), so imports via the full CDN URL and
+//     calls setRapier() the same way.
+// Calling makeRapierBackend().init() without setRapier() will throw.
+let RAPIER = null;
+export function setRapier(rapierModule) { RAPIER = rapierModule; }
 import { state } from './state.js';
 import { updateAbsorptions, applyBoundary } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';

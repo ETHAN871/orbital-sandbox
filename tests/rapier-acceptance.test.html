@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>orbital-sandbox · Rapier backend acceptance suite</title>
+  <style>
+    body { font-family: ui-monospace, monospace; padding: 24px; max-width: 1000px; }
+    h1 { font-size: 18px; }
+    h2 { font-size: 14px; margin-top: 22px; color: #555; }
+    pre { white-space: pre-wrap; font-size: 13px; line-height: 1.45; margin: 4px 0; }
+    .pass { color: #2a8a2a; }
+    .fail { color: #c33; font-weight: bold; }
+    .skip { color: #888; font-style: italic; }
+    .info { color: #555; }
+    .summary { padding: 12px 16px; border-radius: 6px; margin-top: 20px; font-weight: bold; font-size: 14px; }
+    .summary.ok  { background: #e8f6e8; color: #2a8a2a; }
+    .summary.bad { background: #fde8e8; color: #c33; }
+    .running    { background: #fff8e0; color: #b87a00; }
+  </style>
+</head>
+<body>
+  <h1>orbital-sandbox · Rapier backend acceptance suite</h1>
+  <p>
+    Drives the live Rapier physics backend through codified scenarios and
+    asserts on final entity state. No renderer, no UI — pure headless
+    physics. Open via a static server (ESM needs HTTP, not file://).
+  </p>
+  <p class="info">
+    Coverage: B1 (orbit), B2 (cluster stability), B6 (black-hole absorption),
+    B7 (pinned), stiffness gate scenarios, wrap-mode ghost forces, plus a
+    smoke test that CPU gravity is reachable (F1/F3 surface).
+  </p>
+  <pre id="output"></pre>
+  <div id="summary" class="summary running">Running…</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "d3-quadtree": "https://esm.sh/d3-quadtree@3",
+      "planck":      "https://esm.sh/planck@1.5.0",
+      "stats.js":    "https://esm.sh/stats.js@0.17.0",
+      "@dimforge/rapier2d-compat": "https://esm.sh/@dimforge/rapier2d-compat@0.19.3"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import { state, nextEntityId, clearEntities, DEFAULTS_TUNING } from '../src/state.js';
+    import { createBackend } from '../src/physics-backend.js';
+
+    // ─── Test harness ──────────────────────────────────────────────────
+    const out = document.getElementById('output');
+    const summary = document.getElementById('summary');
+    let passed = 0, failed = 0, skipped = 0;
+
+    function log(line, cls) { out.innerHTML += `<span class="${cls || ''}">${line}</span>\n`; }
+    function group(title) { log(`\n── ${title} ──`, 'info'); }
+    function pass(name, detail = '') { passed++; log(`  ✓ ${name}${detail ? '  ' + detail : ''}`, 'pass'); }
+    function fail(name, detail) { failed++; log(`  ✗ ${name}  ${detail}`, 'fail'); }
+    function skip(name, reason) { skipped++; log(`  ~ ${name}  (skipped: ${reason})`, 'skip'); }
+    function info(line) { log(`  · ${line}`, 'info'); }
+
+    // ─── Backend lifecycle helpers ─────────────────────────────────────
+    let backend = null;
+
+    async function freshBackend() {
+      if (backend) { try { backend.destroy(); } catch {} }
+      clearEntities();
+      state.viewport.width = 800;
+      state.viewport.height = 600;
+      state.boundaryMode = 'destroy';
+      state.contactStiffness = DEFAULTS_TUNING.contactStiffness;
+      // createBackend() is async and returns a NEW backend wrapper per call.
+      // Each wrapper owns its own `active` field and `initialized` flag —
+      // we still have to invoke init() explicitly to actually pick the
+      // engine (default is CPU before init runs).
+      backend = await createBackend(state.entities);
+      await backend.init(state.entities);
+      return backend;
+    }
+
+    // Engine name shown in title for clarity (?engine=rapier-worker etc.).
+    const eng = new URLSearchParams(location.search).get('engine') || 'rapier';
+    document.title = `Rapier acceptance suite — engine=${eng}`;
+    const h1 = document.querySelector('h1');
+    if (h1) h1.textContent += `  (engine=${eng})`;
+
+    async function runSubsteps(N, dt = 1/60) {
+      for (let i = 0; i < N; i++) {
+        backend.prepareFrame(state.entities);
+        await backend.step(state.entities, dt, state.viewport, state.boundaryMode, /*isLast=*/ i === N - 1);
+      }
+    }
+
+    function makeEntity(props) {
+      return {
+        id: nextEntityId(),
+        type: 'planet',
+        x: 400, y: 300,
+        vx: 0, vy: 0,
+        mass: 100, radius: 14, charge: 1,
+        pinned: false, color: '#88f',
+        trail: [], absorbing: false,
+        ...props,
+      };
+    }
+
+    // ─── Test scenarios ────────────────────────────────────────────────
+    async function testB1_TwoBodyOrbit() {
+      group('B1 — Two-body orbit stability');
+      await freshBackend();
+      const v0 = 4.47;
+      state.entities.push(makeEntity({ x: 300, y: 300, vy:  v0, color: '#f88' }));
+      state.entities.push(makeEntity({ x: 500, y: 300, vy: -v0, color: '#88f' }));
+      const KE_initial = 0.5 * 100 * v0 * v0 * 2;
+
+      await runSubsteps(60 * 5);
+
+      const alive = state.entities.length;
+      if (alive !== 2) { fail('both bodies survive 5s', `alive=${alive}`); return; }
+      pass('both bodies survive 5s');
+
+      const cx = (state.entities[0].x + state.entities[1].x) / 2;
+      const cy = (state.entities[0].y + state.entities[1].y) / 2;
+      const comDrift = Math.hypot(cx - 400, cy - 300);
+      if (comDrift > 10) fail('CoM stable', `drifted ${comDrift.toFixed(2)}px`);
+      else pass('CoM stable', `drift ${comDrift.toFixed(2)}px ≤ 10`);
+
+      const v1 = Math.hypot(state.entities[0].vx, state.entities[0].vy);
+      const v2 = Math.hypot(state.entities[1].vx, state.entities[1].vy);
+      const KE_final = 0.5 * 100 * v1*v1 + 0.5 * 100 * v2*v2;
+      if (KE_final > 10 * KE_initial) fail('KE bounded', `KE blew up ${(KE_final/KE_initial).toFixed(1)}×`);
+      else if (KE_final < 0.05 * KE_initial) fail('KE bounded', `KE collapsed to ${(KE_final/KE_initial).toFixed(2)}×`);
+      else pass('KE bounded', `KE_final/KE_initial = ${(KE_final/KE_initial).toFixed(2)}`);
+    }
+
+    async function testB2_DenseCluster() {
+      group('B2 — Dense cluster (49 bodies) does not explode');
+      await freshBackend();
+      const seedRng = (s => () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296)(0xC0FFEE);
+      for (let i = 0; i < 7; i++) {
+        for (let j = 0; j < 7; j++) {
+          state.entities.push(makeEntity({
+            x: 280 + i * 35 + seedRng() * 5,
+            y: 200 + j * 35 + seedRng() * 5,
+            mass: 80, radius: 12,
+          }));
+        }
+      }
+      await runSubsteps(60 * 3);
+
+      let maxSpeed = 0, anyNaN = false, alive = 0;
+      for (const e of state.entities) {
+        if (Number.isNaN(e.x) || Number.isNaN(e.vx)) { anyNaN = true; break; }
+        const sp = Math.hypot(e.vx, e.vy);
+        if (sp > maxSpeed) maxSpeed = sp;
+        alive++;
+      }
+      if (anyNaN) { fail('no NaN', 'NaN observed'); return; }
+      pass('no NaN');
+      if (maxSpeed > 1500) fail('no explosive velocity', `max |v| = ${maxSpeed.toFixed(0)} px/s`);
+      else pass('no explosive velocity', `max |v| = ${maxSpeed.toFixed(0)} px/s ≤ 1500`);
+      info(`alive after 3s: ${alive}/49`);
+    }
+
+    async function testB6_BlackHoleAbsorption() {
+      group('B6 — Black-hole absorption');
+      await freshBackend();
+      // Geometry: d=60 starting separation gives a_grav ≈ 22 px/s² → planet
+      // crosses BH radius (30 px) within ~1.5 s. Plus initial vx=20 toward BH
+      // accelerates the timeline. 3 sim-seconds is more than enough headroom.
+      const bh = makeEntity({
+        x: 400, y: 300, vx: 0, vy: 0, mass: 1000, radius: 30,
+        type: 'black_hole', charge: 1,
+      });
+      const planet = makeEntity({
+        x: 340, y: 300, vx: 20, vy: 0, mass: 10, radius: 8,
+      });
+      state.entities.push(bh, planet);
+
+      await runSubsteps(60 * 3);
+
+      const planetStill = state.entities.find(e => e.id === planet.id);
+      const bhStill     = state.entities.find(e => e.id === bh.id);
+      if (!bhStill) { fail('black hole survives', 'BH destroyed'); return; }
+      pass('black hole survives');
+
+      if (!planetStill) {
+        pass('planet absorbed', 'destroyed');
+      } else if (planetStill.absorbing) {
+        pass('planet absorbed', 'absorbing=true');
+      } else {
+        const d = Math.hypot(planetStill.x - bh.x, planetStill.y - bh.y);
+        if (d <= bh.radius) pass('planet absorbed', `inside BH (d=${d.toFixed(1)})`);
+        else fail('planet absorbed', `planet free at d=${d.toFixed(1)}px after 4s`);
+      }
+    }
+
+    async function testB7_PinnedBody() {
+      group('B7 — Pinned body holds position');
+      await freshBackend();
+      const pinned = makeEntity({
+        x: 400, y: 300, mass: 200, radius: 14,
+        pinned: true, charge: 1, color: '#aaa',
+      });
+      const planet = makeEntity({
+        x: 300, y: 300, mass: 50, radius: 10, charge: 1,
+      });
+      state.entities.push(pinned, planet);
+
+      await runSubsteps(60 * 2);
+
+      const pinnedNow = state.entities.find(e => e.id === pinned.id);
+      if (!pinnedNow) { fail('pinned body survives', 'destroyed'); return; }
+      const drift = Math.hypot(pinnedNow.x - 400, pinnedNow.y - 300);
+      if (drift > 1) fail('pinned holds position', `drifted ${drift.toFixed(2)}px`);
+      else pass('pinned holds position', `drift ${drift.toFixed(3)}px ≤ 1`);
+    }
+
+    async function testStiffness_2BodyClickPlace() {
+      group('Stiffness — 2-body spawn-overlap @ ω₀=60 stays zero');
+      await freshBackend();
+      state.contactStiffness = 60;
+      const cx = state.viewport.width / 2, cy = state.viewport.height / 2;
+      state.entities.push(makeEntity({ x: cx,      y: cy }));
+      state.entities.push(makeEntity({ x: cx + 20, y: cy }));
+      await runSubsteps(60 * 2);
+
+      const maxSpeed = Math.max(...state.entities.map(e => Math.hypot(e.vx, e.vy)));
+      if (maxSpeed > 1) fail('2-body @ ω₀=60 residual', `maxSpeed=${maxSpeed.toFixed(2)}`);
+      else pass('2-body @ ω₀=60 residual', `maxSpeed=${maxSpeed.toFixed(2)} ≤ 1`);
+    }
+
+    async function testStiffness_GravPile() {
+      group('Stiffness — 8-body grav pile-up @ ω₀=60');
+      await freshBackend();
+      state.contactStiffness = 60;
+      const cx = state.viewport.width / 2, cy = state.viewport.height / 2;
+      const R = 120, N = 8;
+      for (let i = 0; i < N; i++) {
+        const ang = (i / N) * Math.PI * 2;
+        state.entities.push(makeEntity({
+          x: cx + R * Math.cos(ang),
+          y: cy + R * Math.sin(ang),
+          color: '#f88',
+        }));
+      }
+      await runSubsteps(60 * 5);
+      const maxSpeed = Math.max(...state.entities.map(e => Math.hypot(e.vx, e.vy)));
+      const alive = state.entities.length;
+      if (alive !== N) fail('all bodies alive', `alive=${alive}/${N}`);
+      else pass('all bodies alive', `${alive}/${N}`);
+      if (maxSpeed > 50) fail('bounded velocity', `maxSpeed=${maxSpeed.toFixed(1)} px/s`);
+      else pass('bounded velocity', `maxSpeed=${maxSpeed.toFixed(1)} ≤ 50`);
+    }
+
+    async function testWrap_GhostMomentum() {
+      group('Wrap — gravity pulls cross-edge pair via minimum-image');
+      await freshBackend();
+      state.boundaryMode = 'wrap';
+      state.entities.push(makeEntity({ x:  50, y: 300, mass: 100, color: '#f88' }));
+      state.entities.push(makeEntity({ x: 750, y: 300, mass: 100, color: '#88f' }));
+
+      await runSubsteps(60 * 1);
+
+      const a = state.entities[0], b = state.entities[1];
+      if (a.vx >= 0) fail('A accelerates left (wrap)', `A.vx=${a.vx.toFixed(3)} (expected <0)`);
+      else pass('A accelerates left (wrap)', `A.vx=${a.vx.toFixed(3)}`);
+      if (b.vx <= 0) fail('B accelerates right (wrap)', `B.vx=${b.vx.toFixed(3)} (expected >0)`);
+      else pass('B accelerates right (wrap)', `B.vx=${b.vx.toFixed(3)}`);
+    }
+
+    async function testF_CPUGravityReachable() {
+      group('F1/F3 — CPU gravity path is reachable');
+      await freshBackend();
+      for (let i = 0; i < 100; i++) {
+        const a = (i / 100) * Math.PI * 2;
+        state.entities.push(makeEntity({
+          x: 400 + Math.cos(a) * 100, y: 300 + Math.sin(a) * 100,
+          mass: 10, radius: 6, charge: 1,
+        }));
+      }
+      try {
+        await runSubsteps(10);
+        let anyMoved = 0;
+        for (const e of state.entities) if (Math.abs(e.vx) + Math.abs(e.vy) > 0.001) anyMoved++;
+        if (anyMoved < 80) fail('gravity actually applies', `only ${anyMoved}/100 moved`);
+        else pass('gravity actually applies', `${anyMoved}/100 have nonzero v`);
+      } catch (e) {
+        fail('CPU gravity path runs', e.message);
+      }
+    }
+
+    async function runAll() {
+      const t0 = performance.now();
+      try {
+        await testB1_TwoBodyOrbit();
+        await testB2_DenseCluster();
+        await testB6_BlackHoleAbsorption();
+        await testB7_PinnedBody();
+        await testStiffness_2BodyClickPlace();
+        await testStiffness_GravPile();
+        await testWrap_GhostMomentum();
+        await testF_CPUGravityReachable();
+      } catch (e) {
+        fail('harness crashed', e.stack || e.message);
+      }
+      const ms = (performance.now() - t0).toFixed(0);
+      const total = passed + failed;
+      summary.classList.remove('running');
+      summary.classList.add(failed === 0 ? 'ok' : 'bad');
+      summary.textContent = failed === 0
+        ? `✓ ${passed}/${total} passed (${skipped} skipped) in ${ms} ms`
+        : `✗ ${failed} failed, ${passed} passed, ${skipped} skipped in ${ms} ms`;
+    }
+
+    runAll();
+  </script>
+</body>
+</html>
