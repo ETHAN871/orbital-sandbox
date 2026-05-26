@@ -595,11 +595,30 @@ uniform int uEntityCount;
 uniform float uEpsilon;
 uniform float uDispScale;     // amplitude of warp (px)
 uniform float uTiltY;         // 3D: how much Z projects into screen-Y (0..1)
-uniform int uMode;            // 0 = 3D oblique, 1 = 2D in-plane
+uniform int uMode;            // 0 = 3D oblique (per-vertex φ), 1 = 2D in-plane, 2 = rubber-sheet (sag texture)
 uniform mat4 uOrtho;          // CSS-px → NDC
 uniform float uCellPx;        // grid cell spacing — caps displacement so adjacent vertices can't swap
 out float vIntensity;         // displacement magnitude — drives brightness in FS
+${SAG_VS_HELPER}
 void main() {
+  // V10 rubber-sheet branch — uMode == 2.
+  // Reads the same per-frame normalized sag texture used by bodies,
+  // trails, UI, and the prediction line. Per-vertex φ calculation
+  // in the legacy uMode == 0 path saturates the depth cap (φ values
+  // are O(hundreds), depth = -φ × dispScale hits the 250-px clamp
+  // for every vertex within a body's footprint → mesh looks flat
+  // regardless of how many bodies are placed). Sharing the sag
+  // texture path lets the mesh, bodies, and UI all dip into wells
+  // together with a single normalization pass owned by the CPU.
+  if (uMode == 2) {
+    vec2 wp = sagProject(aPos);
+    // intensity drives the FS height-shading. For rubber-sheet mode
+    // we want the FS ramp to expose the same depth signal the user
+    // sees in the projection, so feed it the screen-Y delta (= sag).
+    vIntensity = max(0.0, wp.y - aPos.y);
+    gl_Position = uOrtho * vec4(wp, 0.0, 1.0);
+    return;
+  }
   float eps2 = uEpsilon * uEpsilon;
   vec2 p = aPos;
   // (V9.4) No alpha edge-fade — the prior viewport-distance smoothstep

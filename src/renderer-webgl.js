@@ -426,10 +426,19 @@ function _initPrograms() {
   _progParticleFlow.uPointSize = gl.getUniformLocation(_progParticleFlow.prog, 'uPointSize');
 
   // V10 rubber-sheet: bind sag uniforms on every shader whose vertices
-  // need to sink into gravity wells. GRID_WARP is skipped (it has its
-  // own 3D oblique path); EQUIPOTENTIAL/STREAMLINE/TRAIL_DECAY/TRAIL_BLIT
-  // are field-only / fullscreen passes that stay flat.
-  for (const p of [_progTrailDot, _progEntity, _progCircleFill, _progCircleRing, _progLineSeg, _progParticleFlow]) {
+  // need to sink into gravity wells. GRID_WARP is included because the
+  // V10 fix added a `uMode == 2` branch that samples the sag texture so
+  // the mesh agrees with the bodies on well depth (the legacy uMode == 0
+  // per-vertex φ path saturates the depth clamp and produces a flat
+  // surface regardless of body count).
+  // EQUIPOTENTIAL/STREAMLINE/TRAIL_DECAY/TRAIL_BLIT are field-only /
+  // fullscreen passes that stay flat.
+  //
+  // NOTE: uSagTex/uSagMode/uSagViewport are declared in the VS only (via
+  // SAG_VS_HELPER); WebGL2 spec keeps them resolvable as long as the
+  // linked program references them anywhere, so getUniformLocation
+  // returns valid non-null handles even though the FS never reads them.
+  for (const p of [_progTrailDot, _progEntity, _progCircleFill, _progCircleRing, _progLineSeg, _progParticleFlow, _progGridWarp]) {
     p.uSagTex      = gl.getUniformLocation(p.prog, 'uSagTex');
     p.uSagMode     = gl.getUniformLocation(p.prog, 'uSagMode');
     p.uSagViewport = gl.getUniformLocation(p.prog, 'uSagViewport');
@@ -717,11 +726,25 @@ function _initSagTexture() {
 // data already packed in _fieldEntityData (includes 9-ghost copies in
 // wrap mode). Upload via texSubImage2D so the GPU shaders can sample.
 //
-// Sag formula matches the 3D branch of GRID_WARP.VS:
-//   phi = Σ -e.z / sqrt((x-e.x)² + (y-e.y)² + ε²)
-//   depth = clamp(-phi * SAG_DISP_SCALE, 0, SAG_MAX)
-// SAG_MAX = 140 caps the visual sag depth so adjacent bodies don't
-// project to wildly different screen-y positions.
+// PER-FRAME NORMALIZATION (V10.1 — fix for "everything sags by the same
+// constant" bug). The user's spec was: z = 1 - |φ|/|φ_max|, where
+// φ_max is the per-frame max |φ|. Linear scaling by a constant
+// SAG_DISP_SCALE saturates at SAG_MAX everywhere except true infinity,
+// because |φ| values at typical body distances (e.g., G=80, m=200,
+// r=100) are ~160, and SAG_DISP_SCALE × that is 800 ≫ SAG_MAX = 140.
+// → everything caps to SAG_MAX, surface looks flat, hover ghost off
+// by a constant.
+//
+// Normalized formula:
+//   |φ_max| = max over sampled pixels of |φ(x,y)|
+//   sag(x,y) = SAG_MAX * |φ(x,y)| / |φ_max|
+// Now: at the deepest pixel sag = SAG_MAX; far-from-body sag → 0.
+// Surface varies smoothly between 0 and SAG_MAX across the viewport.
+//
+// EMA-smooth |φ_max| across frames so adding/removing a body doesn't
+// instantly rescale every other body's apparent depth (would look like
+// a "breathing" surface). 7-frame half-life.
+let _phiMaxAbsEMA = -1;   // sentinel -1 = uninitialized
 function _updateSagTexture() {
   if (!_gl || !_sagTexture) return;
   const gl = _gl;
@@ -731,13 +754,18 @@ function _updateSagTexture() {
   const eps2 = eps * eps;
   const sx = _vpW / _SAG_TEX_W;
   const sy = _vpH / _SAG_TEX_H;
-  // Bake sag values. At cnt=0 the loop produces all zeros (already
-  // initialized by Float32Array constructor — but we overwrite each
-  // frame so re-zero defensively).
   if (cnt === 0) {
     _sagPixels.fill(0);
+    // Reset |φ_max| EMA so the next non-empty frame seeds from a clean
+    // hard value instead of carrying a stale ghost of the prior scene
+    // through a 7-frame fade. Without this reset, clearing the sandbox
+    // and re-spawning a very different body set would produce a visible
+    // first-second normalization wobble.
+    _phiMaxAbsEMA = -1;
   } else {
+    // Pass 1: compute |φ| at each pixel, store in scratch, track max.
     let idx = 0;
+    let phiMaxAbs = 1e-9;
     for (let j = 0; j < _SAG_TEX_H; j++) {
       const y = (j + 0.5) * sy;
       for (let i = 0; i < _SAG_TEX_W; i++) {
@@ -750,9 +778,20 @@ function _updateSagTexture() {
           const r2 = dx * dx + dy * dy + eps2;
           phi += -ents[o + 2] / Math.sqrt(r2);
         }
-        const depth = -phi * _SAG_DISP_SCALE;
-        _sagPixels[idx++] = depth > _SAG_MAX ? _SAG_MAX : (depth > 0 ? depth : 0);
+        const phiAbs = phi < 0 ? -phi : phi;
+        _sagPixels[idx++] = phiAbs;
+        if (phiAbs > phiMaxAbs) phiMaxAbs = phiAbs;
       }
+    }
+    // EMA-smooth max.
+    if (_phiMaxAbsEMA < 0) _phiMaxAbsEMA = phiMaxAbs;
+    else _phiMaxAbsEMA = _phiMaxAbsEMA * 0.85 + phiMaxAbs * 0.15;
+    // Pass 2: scale each pixel by SAG_MAX / |φ_max| so deepest sag = SAG_MAX.
+    const total = _SAG_TEX_W * _SAG_TEX_H;
+    const scale = _SAG_MAX / _phiMaxAbsEMA;
+    for (let k = 0; k < total; k++) {
+      const v = _sagPixels[k] * scale;
+      _sagPixels[k] = v > _SAG_MAX ? _SAG_MAX : v;
     }
   }
   gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
@@ -1025,6 +1064,28 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
     _intensityRange.max = 0;
     return _intensityRange;
   }
+  // V10 rubber-sheet (mode 2): sag-texture pixels already encode the
+  // per-frame normalized depth in [0, SAG_MAX]. The mesh VS outputs
+  // vIntensity = sag · sin(45°), so the range is sin(45°) × { min,max }
+  // of _sagPixels. Scanning the 128×128 buffer is cheap (~16k px /
+  // frame, hot in L1) and gives a tight scene-relative ramp that
+  // moves with the deepest live well. NB: the `_fieldEntityCount === 0`
+  // early-return above is load-bearing for this branch — without it, the
+  // scan would run on a zero-filled buffer and produce a max=0 range,
+  // breaking the smoothstep degenerate guard in _drawGridWarp.
+  if (mode === 2) {
+    const SIN45 = 0.70710678;
+    let mn = Infinity, mx = 0;
+    const N = _sagPixels.length;
+    for (let i = 0; i < N; i++) {
+      const v = _sagPixels[i];
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    _intensityRange.min = (mn === Infinity ? 0 : mn) * SIN45;
+    _intensityRange.max = mx * SIN45;
+    return _intensityRange;
+  }
   const ents = _fieldEntityData;
   const cnt = _fieldEntityCount;
   const eps2 = epsilon * epsilon;
@@ -1093,21 +1154,34 @@ function _drawGridWarp() {
   const gl = _gl;
   if (!_progGridWarp || !_bufGridVerts || !_bufGridIndices) return;
   if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
-  const mode = (state.fieldStyle === '2d') ? 1 : 0;
+  // mode dispatch:
+  //   0 = legacy 3D oblique (per-vertex φ, saturates at depth clamp)
+  //   1 = 2D in-plane warp
+  //   2 = V10 rubber-sheet — sample the per-frame normalized sag texture
+  //       so the mesh dips into wells in lockstep with bodies / trails /
+  //       UI. Replaces (and supersedes) the broken legacy 3D path for
+  //       any modern fieldStyle='rubber-sheet'.
+  const mode =
+      (state.fieldStyle === '2d') ? 1
+    : (state.fieldStyle === 'rubber-sheet') ? 2
+    : 0;
   // Displacement scale tuned so the 2D in-plane warp matches the
   // mockup_2d.py reference visually: cap=28 px saturates within
   // ~300px of a mass=200 body at G=80, leaving clean far-field.
   // 3D mode stays mild (5.0) to avoid the iconic-but-overwhelming
   // global-bowl effect — but acknowledged as a known v1 limitation
-  // since user picked 2D+particles direction.
-  const dispScale = (mode === 0) ? 5.0 : 175.0;
-  // V10 rubber-sheet: align mesh tilt with sag-texture projection so the
-  // wireframe mesh sinks by the same screen-y amount as bodies/UI.
-  // sag-texture uses screen_y += sag·sin(45°) ≈ sag·0.7071, so use the
-  // same factor for GRID_WARP's mesh in rubber-sheet mode. Other 3D
-  // mode users (fieldStyle === '3d' legacy) keep the original 1.0 for
-  // backward visual compat.
-  const tiltY = (mode === 0 && state.fieldStyle === 'rubber-sheet') ? 0.70710678 : 1.0;
+  // since user picked 2D+particles direction. Mode 2 explicitly sets
+  // 0.0 — the VS early-returns before reading uDispScale, but sending
+  // 0 documents the intent and prevents a future VS edit that drops
+  // the early-return from silently inheriting the 2D 175.0 value
+  // (which would massively over-scale the legacy 3D oblique path).
+  const dispScale = (mode === 0) ? 5.0 : (mode === 2) ? 0.0 : 175.0;
+  // V10 rubber-sheet: tiltY is encoded inside the sag texture (we baked
+  // sin(45°) into sagProject already), so mode 2 doesn't read uTiltY at
+  // all. Legacy mode 0 stays at 1.0; the rubber-sheet legacy code-path
+  // that re-used mode=0 with a 0.7071 override is now unreachable.
+  const TILT_Y_DEFAULT = 1.0;
+  const tiltY = TILT_Y_DEFAULT;
   // V9.6: dynamic per-frame min+max → true scene-relative shading.
   // Anchors smoothstep to [scene min, scene max] so the flattest
   // visible vertex always renders fully bright relative to the
@@ -1139,7 +1213,9 @@ function _drawGridWarp() {
   // (empty / near-uniform scenes → no division blow-up).
   let intensityMin = _intensityMinEMA;
   let intensityMax = Math.max(_intensityMaxEMA, intensityMin + 0.5);
-  const color = (mode === 0) ? GRID_WARP_COLOR_3D : GRID_WARP_COLOR_2D;
+  // Mode 2 uses the same 3D ramp color as legacy 3D — the visual is a
+  // wireframe rubber sheet either way.
+  const color = (mode === 1) ? GRID_WARP_COLOR_2D : GRID_WARP_COLOR_3D;
 
   gl.useProgram(_progGridWarp.prog);
   gl.uniform2f(_progGridWarp.uViewport, _vpW, _vpH);
@@ -1151,6 +1227,11 @@ function _drawGridWarp() {
   gl.uniform1i(_progGridWarp.uMode, mode);
   gl.uniformMatrix4fv(_progGridWarp.uOrtho, false, _orthoMat);
   gl.uniform4f(_progGridWarp.uColor, color[0], color[1], color[2], color[3]);
+  // V10 rubber-sheet: bind the per-frame sag texture so the VS branch
+  // for uMode == 2 can sample sag(world_x, world_y). Calling unconditionally
+  // is cheap (one texture rebind + 2 uniform sets) and means the mesh
+  // never sees stale sag uniforms regardless of which mode runs first.
+  _bindSagUniforms(_progGridWarp);
   gl.uniform1f(_progGridWarp.uIntensityMin, intensityMin);
   gl.uniform1f(_progGridWarp.uIntensityMax, intensityMax);
   // contrast slider: state.fieldContrast 0..1, floor = 1 - contrast
@@ -2028,9 +2109,11 @@ export function drawField() {
   } else if (state.fieldStyle === 'legacy') {
     _drawEquipotential();
   } else if (state.fieldStyle === 'rubber-sheet') {
-    // V10: 3D oblique mesh (mode=0 in GRID_WARP) — vertex shader does
-    // its own per-vertex sag projection. Bodies + trails + UI sink via
-    // the sag texture path set up by prepareFrameRenderer.
+    // V10: rubber-sheet mesh (mode=2 in GRID_WARP) — VS samples the
+    // per-frame normalized sag texture so the mesh dips into wells
+    // in lockstep with bodies / trails / UI (all sharing the same
+    // texture via _bindSagUniforms). Avoids the legacy mode=0 path's
+    // per-vertex φ saturation that made the surface look flat.
     _drawGridWarp();
   } else {
     _drawGridWarp();
