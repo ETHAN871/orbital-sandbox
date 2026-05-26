@@ -476,12 +476,96 @@ def mockup_wrap():
     return path
 
 
+# ───────────────────────────────────────────────────────────────────
+# MOCKUP 6 — Hard cap vs smooth saturation at m=1000 (bug fix demo)
+# ───────────────────────────────────────────────────────────────────
+def mockup_hard_vs_smooth():
+    """Side-by-side demonstration of the high-mass bug.
+
+    Top band:    hard cap (current bug)  — vertices all saturate to 28 px,
+                 grid folds + no differential.
+    Bottom band: smooth rational saturation (fix) — preserves the
+                 gradient at all magnitudes → clean compression.
+    Single mass=1000 body at the center of each band.
+    """
+    im = Image.new("RGBA", (W, H), BG + (255,))
+    draw = ImageDraw.Draw(im, "RGBA")
+    HEAVY_BODY = {"x": 300, "y": 0, "r": 32, "m": 1000, "color": (255, 130, 70)}
+
+    def _heavy_grad(x, y, body_y):
+        ez = 80.0 * 1000.0
+        dx = x - HEAVY_BODY["x"]
+        dy = y - body_y
+        r2 = dx * dx + dy * dy + 16.0
+        invR3 = 1.0 / (r2 * math.sqrt(r2))
+        return (-ez * dx * invR3, -ez * dy * invR3)
+
+    def _draw_band(y_top, y_bot, mode_smooth, label):
+        cols, rows = 56, 28
+        X_LEFT, X_RIGHT = 30, 600
+        cw = (X_RIGHT - X_LEFT) / (cols - 1)
+        rh = (y_bot - y_top) / (rows - 1)
+        body_y = (y_top + y_bot) / 2
+        pts = [[(0.0, 0.0)] * cols for _ in range(rows)]
+        DISP_SCALE = 175.0
+        CAP = 35.0 if mode_smooth else 28.0
+        for r in range(rows):
+            for c in range(cols):
+                x = X_LEFT + c * cw
+                y = y_top + r * rh
+                gx, gy = _heavy_grad(x, y, body_y)
+                disp_x = gx * DISP_SCALE
+                disp_y = gy * DISP_SCALE
+                mag = math.sqrt(disp_x * disp_x + disp_y * disp_y)
+                if mode_smooth:
+                    factor = CAP / (CAP + mag)
+                else:
+                    factor = (CAP / mag) if mag > CAP else 1.0
+                pts[r][c] = (x + disp_x * factor, y + disp_y * factor)
+        for r in range(rows):
+            for c in range(cols - 1):
+                (x1, y1), (x2, y2) = pts[r][c], pts[r][c + 1]
+                draw.line([(x1, y1), (x2, y2)], fill=(150, 195, 240, 150), width=1)
+        for c in range(cols):
+            for r in range(rows - 1):
+                (x1, y1), (x2, y2) = pts[r][c], pts[r + 1][c]
+                draw.line([(x1, y1), (x2, y2)], fill=(150, 195, 240, 150), width=1)
+        b = HEAVY_BODY
+        for i in range(6, 0, -1):
+            rr = b["r"] + i * 4
+            draw.ellipse(
+                [b["x"] - rr, body_y - rr, b["x"] + rr, body_y + rr],
+                fill=(*b["color"], max(0, 30 - i * 4)),
+            )
+        draw.ellipse(
+            [b["x"] - b["r"], body_y - b["r"], b["x"] + b["r"], body_y + b["r"]],
+            fill=(*b["color"], 255),
+            outline=(255, 255, 255, 90), width=1,
+        )
+        draw.text((X_LEFT, y_top - 22), label, font=FONT_CAPTION, fill=(220, 230, 240, 240))
+
+    HALF_H = (H - 130 - 40) // 2
+    _draw_band(140, 140 + HALF_H, mode_smooth=False,
+               label="HARD CAP (bug): vertices saturate → grid folds + no differential")
+    _draw_band(140 + HALF_H + 40, 140 + 2 * HALF_H + 40, mode_smooth=True,
+               label="SMOOTH SATURATION (fix): displacement preserves gradient → grid compresses cleanly")
+    _header(
+        im,
+        "Bug Fix — m=1000 body",
+        "hard-cap vs rational saturation · same gravity field, same scale",
+    )
+    path = os.path.join(OUT_DIR, "mockup_bugfix.png")
+    im.save(path)
+    return path
+
+
 if __name__ == "__main__":
     p1 = mockup_3d()
     p2 = mockup_2d()
     p3 = mockup_flow()
     p4 = mockup_mix()
     p5 = mockup_wrap()
+    p6 = mockup_hard_vs_smooth()
     print("Wrote:")
-    for p in (p1, p2, p3, p4, p5):
+    for p in (p1, p2, p3, p4, p5, p6):
         print(" ", p)

@@ -593,17 +593,25 @@ void main() {
     worldPx = vec2(p.x, p.y + depth * uTiltY);
     intensity = depth;
   } else {
-    // 2D in-plane: displacement TOWARD attractor. Cap is 28 px (matches
-    // mockup_2d.py reference — vertices in mid-field saturate around
-    // the body, leaving the far-field grid clean. Mathematically this
-    // is the same gradient ∇φ but capped per-vertex so the visual
-    // doesn't explode near r → 0.
+    // 2D in-plane: displacement TOWARD attractor with SMOOTH (rational)
+    // saturation instead of a hard cap. Hard-clamping caused two bugs
+    // at high mass (m=1000):
+    //   1. Grid folds — every vertex within r<600px of the body all
+    //      saturated to exactly cap=28 px, piling neighbours onto each
+    //      other around the body center → crossed/overlapping lines.
+    //   2. No visible distortion — uniform-saturation regions have ZERO
+    //      differential, so neighbouring vertices all shift by the same
+    //      amount and the grid looks merely translated rather than warped.
+    //
+    // The rational form disp * cap/(cap+|disp|) asymptotes to cap but
+    // preserves d(disp)/d(grad) > 0 at every magnitude, so the grid
+    // visibly compresses even when each vertex has saturated.
     vec2 disp = gradPhi * uDispScale;
-    float magSq = dot(disp, disp);
-    float cap = 28.0;
-    if (magSq > cap * cap) disp = disp * (cap / sqrt(magSq));
-    worldPx = p + disp;
-    intensity = length(disp);
+    float mag = length(disp);
+    float cap = 35.0;
+    float factor = cap / (cap + mag);
+    worldPx = p + disp * factor;
+    intensity = mag * factor;
   }
   vIntensity = intensity;
   gl_Position = uOrtho * vec4(worldPx, 0.0, 1.0);
