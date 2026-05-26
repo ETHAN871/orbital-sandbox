@@ -552,6 +552,9 @@ function makeRapierWorkerBackend() {
   let inFlight = null;        // Promise resolving on next stepDone / error
   let resolveInFlight = null;
   let rejectInFlight  = null;
+  // v4 pipeline: holds the previous step's in-flight promise + the sentIds
+  // associated with it, so the NEXT step() call can await + apply it.
+  let prevInFlight = null;
   // `dead` short-circuits step() after destroy() or a fatal worker error,
   // so the substep loop fails fast instead of hanging on a postMessage to
   // a terminated worker. Code-review HIGH 2026-05-26.
@@ -659,6 +662,13 @@ function makeRapierWorkerBackend() {
     // completes. Splicing here would cause a body to vanish mid-animation
     // if it also triggered a worker-side absorption simultaneously.
     // Code-review HIGH 2026-05-26.
+    //
+    // RACE NOTE (v4 pipeline): the position write-back in Phase 1 above
+    // could theoretically clobber a "user mid-drag" position. Today this
+    // app does not support dragging EXISTING entities — state.drag is the
+    // placement-preview/slingshot which spawns a new body only on
+    // pointerup (see input.js). No race exists. If drag-existing is ever
+    // added, gate Phase 1 write-back with a `!e._userDragging` check.
     if (sentIds && sentIds.length > 0) {
       const returnedSet = new Set();
       for (let i = 0; i < entityIds.length; i++) returnedSet.add(entityIds[i]);
@@ -763,33 +773,54 @@ function makeRapierWorkerBackend() {
 
     async step(entities, dt, viewport, boundaryMode, isLastSubstep) {
       if (dead) throw new Error('[physics-backend] worker is dead; cannot step');
+      // v4 PIPELINE: 1-deep. step() awaits the PREVIOUS in-flight result
+      // (applying it to entities), then fires the CURRENT step async without
+      // awaiting. Main never blocks on its own step — it blocks only on the
+      // PREVIOUS step's worker compute, which has been overlapping with
+      // main's render of the prior frame.
+      //
+      // Trade-off: rendered entity state is from physics frame N-1, not N.
+      // At 60 FPS the lag is 16.7 ms — visually imperceptible for orbital
+      // motion (velocity-extrapolation could close it further, deferred).
+      //
+      // On the very first step() call, prevInFlight is null and we skip
+      // the await — the rendered frame uses pre-init entity state.
+      if (prevInFlight) {
+        const { promise: pendingPromise, sentIds: pendingSentIds } = prevInFlight;
+        prevInFlight = null;
+        const result = await pendingPromise;
+        applyStepDone(result, entities, pendingSentIds);
+      }
+
+      if (dead) throw new Error('[physics-backend] worker died between pipeline drain and resend');
+
       const delta = computeDelta(entities);
       const { data, ids } = packEntityData(entities);
-      // Snapshot of ids being sent — needed by applyStepDone to detect
-      // absorptions/destroys (entities present here but missing from the
-      // worker's response). Cheap clone; ids buffer itself is transferred.
       const sentIds = Array.from(ids);
 
-      const result = await new Promise((resolve, reject) => {
+      const newPromise = new Promise((resolve, reject) => {
         resolveInFlight = resolve;
         rejectInFlight = reject;
-        worker.postMessage(
-          {
-            type: 'step',
-            entityData: data,
-            entityIds: ids,
-            stateParams: currentStateParams(),
-            delta,
-            dt,
-            viewport: { width: viewport.width, height: viewport.height },
-            boundaryMode,
-            isLastSubstep,
-          },
-          [data.buffer, ids.buffer]
-        );
       });
 
-      applyStepDone(result, entities, sentIds);
+      worker.postMessage(
+        {
+          type: 'step',
+          entityData: data,
+          entityIds: ids,
+          stateParams: currentStateParams(),
+          delta,
+          dt,
+          viewport: { width: viewport.width, height: viewport.height },
+          boundaryMode,
+          isLastSubstep,
+        },
+        [data.buffer, ids.buffer]
+      );
+
+      prevInFlight = { promise: newPromise, sentIds };
+      // step() returns resolved — main moves on to render. The result of
+      // THIS step is awaited on the NEXT step() call.
     },
 
     onEntityMetaMaybeChanged() {
@@ -807,6 +838,7 @@ function makeRapierWorkerBackend() {
         rejectInFlight = null;
         try { r(new Error('worker destroyed before step completed')); } catch {}
       }
+      prevInFlight = null;   // v4: drop the pending pipeline slot
       if (worker) {
         try { worker.postMessage({ type: 'destroy' }); } catch {}
         try { worker.terminate(); } catch {}
