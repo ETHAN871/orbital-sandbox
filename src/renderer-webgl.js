@@ -116,6 +116,20 @@ const _particleVel = new Float32Array(PARTICLE_COUNT * 2);   // vx,vy × N
 const _particleLife = new Uint16Array(PARTICLE_COUNT);       // frames-remaining
 let _particlesSeeded = false;
 
+// V10 (2026-05-26): sag texture for rubber-sheet oblique projection.
+// CPU computes sag(x,y) = how far the rubber sheet sags DOWN at each
+// (x, y) world point. 128×128 R32F texture, uploaded each frame when
+// state.fieldStyle === 'rubber-sheet'. All entity / UI / trail shaders
+// sample it via uSagTex to apply screen_y += sag * sin(45°). See
+// .claude/rubber-sheet-blueprint.md for the full design.
+const _SAG_TEX_W = 128;
+const _SAG_TEX_H = 128;
+const _SAG_MAX = 140.0;            // CSS-px depth cap (architect default)
+const _SAG_DISP_SCALE = 5.0;       // matches GRID_WARP.VS 3D mode dispScale
+let _sagTexture = null;            // GL texture handle (R32F)
+const _sagPixels = new Float32Array(_SAG_TEX_W * _SAG_TEX_H);
+let _sagActive = false;            // true iff this frame uses sag — drives uSagMode
+
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
 let _bufUnitQuad = null;        // unit quad centered (vec2 in [-1,+1]) for trail dots
@@ -646,6 +660,73 @@ function _initFbos(w, h) {
   _trailReadIdx = 0;
 }
 
+// V10 rubber-sheet: one-time sag-texture creation. Allocated at fixed
+// 128×128 resolution regardless of viewport; the shader samples in
+// world-uv space (worldPx / viewport) so the lookup adapts automatically.
+function _initSagTexture() {
+  if (!_gl) return;
+  if (_sagTexture) return;   // already created
+  const gl = _gl;
+  _sagTexture = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
+  // R32F: single-channel float. WebGL 2 core supports R32F as a sampled
+  // texture format (the EXT_color_buffer_float extension is only required
+  // if we wanted to RENDER to it). We only sample, so no extension guard.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, _SAG_TEX_W, _SAG_TEX_H, 0, gl.RED, gl.FLOAT, null);
+  // Linear filtering — gives smooth sag values between texels for sub-px body placement.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+// Per-frame: sample sag(x, y) at 128×128 grid points using the entity
+// data already packed in _fieldEntityData (includes 9-ghost copies in
+// wrap mode). Upload via texSubImage2D so the GPU shaders can sample.
+//
+// Sag formula matches the 3D branch of GRID_WARP.VS:
+//   phi = Σ -e.z / sqrt((x-e.x)² + (y-e.y)² + ε²)
+//   depth = clamp(-phi * SAG_DISP_SCALE, 0, SAG_MAX)
+// SAG_MAX = 140 caps the visual sag depth so adjacent bodies don't
+// project to wildly different screen-y positions.
+function _updateSagTexture() {
+  if (!_gl || !_sagTexture) return;
+  const gl = _gl;
+  const ents = _fieldEntityData;
+  const cnt = _fieldEntityCount;
+  const eps = state.epsilon;
+  const eps2 = eps * eps;
+  const sx = _vpW / _SAG_TEX_W;
+  const sy = _vpH / _SAG_TEX_H;
+  // Bake sag values. At cnt=0 the loop produces all zeros (already
+  // initialized by Float32Array constructor — but we overwrite each
+  // frame so re-zero defensively).
+  if (cnt === 0) {
+    _sagPixels.fill(0);
+  } else {
+    let idx = 0;
+    for (let j = 0; j < _SAG_TEX_H; j++) {
+      const y = (j + 0.5) * sy;
+      for (let i = 0; i < _SAG_TEX_W; i++) {
+        const x = (i + 0.5) * sx;
+        let phi = 0;
+        for (let k = 0; k < cnt; k++) {
+          const o = k * 4;
+          const dx = x - ents[o];
+          const dy = y - ents[o + 1];
+          const r2 = dx * dx + dy * dy + eps2;
+          phi += -ents[o + 2] / Math.sqrt(r2);
+        }
+        const depth = -phi * _SAG_DISP_SCALE;
+        _sagPixels[idx++] = depth > _SAG_MAX ? _SAG_MAX : (depth > 0 ? depth : 0);
+      }
+    }
+  }
+  gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, _SAG_TEX_W, _SAG_TEX_H, gl.RED, gl.FLOAT, _sagPixels);
+}
+
 export function resizeRenderer(w, h, dpr) {
   if (_disabled || !_gl) return;
   _vpW = Math.max(1, w | 0);
@@ -653,6 +734,7 @@ export function resizeRenderer(w, h, dpr) {
   _dpr = dpr || 1;
   _updateOrthoMat();
   _initFbos(_vpW, _vpH);
+  _initSagTexture();
   _rebuildStreamlineSeeds();
   _rebuildGridWarpVerts();
 }

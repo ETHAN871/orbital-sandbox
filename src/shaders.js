@@ -28,6 +28,30 @@ void main() {
   gl_Position = vec4(aPos, 0.0, 1.0);
 }`;
 
+// ─── V10 rubber-sheet oblique projection helper ───────────────────
+// Inlined into the VS of every shader whose world-space vertices need
+// to "sink into the gravity well" when rubber-sheet mode is active:
+// TRAIL_DOT, ENTITY, CIRCLE_FILL, CIRCLE_RING, LINE_SEG, PARTICLE_FLOW.
+//
+// Sampling: uSagTex is a 128×128 R32F texture pre-baked by the CPU
+// each frame with sag(world_x, world_y) in CSS-px. uSagMode gates the
+// effect (0 = flat / passthrough, 1 = apply oblique). uSagViewport
+// is the CSS-px viewport (W, H) used to map worldPx → uv.
+//
+// Projection: screen_y = world_y + sag * sin(45°). No global y-axis
+// compression — flat regions render unchanged; only the gravity wells
+// pull bodies + UI + trails downward visually. sin(45°) ≈ 0.7071.
+const SAG_VS_HELPER = `
+uniform sampler2D uSagTex;
+uniform float uSagMode;
+uniform vec2 uSagViewport;
+vec2 sagProject(vec2 worldPx) {
+  if (uSagMode < 0.5) return worldPx;
+  vec2 uv = clamp(worldPx / uSagViewport, 0.0, 1.0);
+  float sag = texture(uSagTex, uv).r;
+  return vec2(worldPx.x, worldPx.y + sag * 0.70710678);
+}`;
+
 // ─── Trail FBO: decay pass ────────────────────────────────────────
 // Linear alpha decrement per frame: a_new = max(0, a_old - uDec).
 // RGB carried through unchanged. Render target = the "write" trail FBO;

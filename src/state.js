@@ -217,16 +217,20 @@ export const state = {
   // OFF so the GPU work is fully gated (zero overhead when not displayed).
   showField: false,
 
-  // V9.9 (2026-05-26 rewrite): field visualization style.
-  //   'curvilinear' (default) — equipotential contour rings +
-  //                    radial geodesic field lines from each body.
-  //                    Orthogonal contour pair = natural curvilinear
-  //                    grid, fold-free by construction.
-  //   '2d'           — Cartesian grid warped by ∇φ (anti-fold capped).
-  //   '3d'           — spacetime-fabric / rubber-sheet oblique.
-  //   'legacy'       — equipotential contour rings only (no field lines).
-  // Set via ?field=curvilinear|2d|3d|legacy URL param at boot.
-  fieldStyle: 'curvilinear',
+  // V10 (2026-05-26 rewrite): field visualization style.
+  //   'rubber-sheet' — WIP target (V10). oblique-45° projection of the
+  //                    3D sagging potential surface. Mesh + bodies +
+  //                    trails + UI all share the same projection so
+  //                    bodies visually sit at the bottom of their
+  //                    gravity wells. See .claude/rubber-sheet-blueprint.md.
+  //                    Not yet wired into drawField — Sprint 1-2 (state +
+  //                    sag-texture infra) shipped; Sprints 3-8 remaining.
+  //   '2d' (default) — Cartesian grid warped by ∇φ (anti-fold capped).
+  //   '3d'           — oblique GRID_WARP (mesh-only oblique).
+  //   'legacy'       — equipotential contour rings only.
+  //   'curvilinear'  — equipotential + ψ contours (rejected iteration).
+  // Set via ?field=rubber-sheet|2d|3d|legacy|curvilinear URL param at boot.
+  fieldStyle: '2d',
 
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
