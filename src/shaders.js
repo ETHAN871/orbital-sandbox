@@ -646,12 +646,14 @@ uniform vec4 uColor;
 uniform float uIntensityHalf;
 out vec4 outColor;
 void main() {
-  // Height-based shading: vIntensity is the sag depth (3D) or warp
-  // magnitude (2D). High intensity = vertex is deep in a gravity
-  // well → render dim (in shadow). Low intensity = flat plane,
-  // perpendicular to imaginary overhead light → full brightness.
-  // Range 1.0→0.25: deep wells stay visible at 25% so the user can
-  // still read the well's structure, against the dark background.
+  // Relative height-based shading (V9.5): vIntensity is sag depth (3D)
+  // or warp magnitude (2D). uIntensityHalf is set by the renderer to
+  // the per-FRAME MAX vIntensity (sampled across the viewport), so
+  // smoothstep maps the deepest vertex in the current scene → 1.0
+  // (brightness 0.25) and unwarped flat vertices → 0.0 (brightness 1.0).
+  // Result is true scene-relative shading: even mildly warped scenes
+  // show clear bright/dim contrast between flat regions and wells.
+  // Floor at uniform side keeps brightness=1.0 for empty scenes.
   float t = smoothstep(0.0, uIntensityHalf, vIntensity);
   float brightness = mix(1.0, 0.25, t);
   outColor = vec4(uColor.rgb * brightness, uColor.a);
