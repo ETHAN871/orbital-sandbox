@@ -593,11 +593,14 @@ void main() {
     worldPx = vec2(p.x, p.y + depth * uTiltY);
     intensity = depth;
   } else {
-    // 2D in-plane: displacement capped so a body at distance ≈ ε
-    // doesn't pull a vertex onto itself (visual nonsense).
+    // 2D in-plane: displacement TOWARD attractor. Cap is 28 px (matches
+    // mockup_2d.py reference — vertices in mid-field saturate around
+    // the body, leaving the far-field grid clean. Mathematically this
+    // is the same gradient ∇φ but capped per-vertex so the visual
+    // doesn't explode near r → 0.
     vec2 disp = gradPhi * uDispScale;
     float magSq = dot(disp, disp);
-    float cap = 60.0;
+    float cap = 28.0;
     if (magSq > cap * cap) disp = disp * (cap / sqrt(magSq));
     worldPx = p + disp;
     intensity = length(disp);
@@ -615,5 +618,50 @@ void main() {
   float t = smoothstep(0.0, uIntensityHalf, vIntensity);
   float a = mix(0.25, 1.0, t);
   outColor = vec4(uColor.rgb, uColor.a * a);
+}`,
+};
+
+// --- Particle flow (sparse luminous overlay on 2D grid warp) -----------
+// Renders glowing point sprites advected along the gravitational force
+// field. Particle positions are computed on the CPU each frame (cheap at
+// ~200 particles) and uploaded to a VBO. The shader draws each particle
+// as a soft circular sprite via gl_PointSize + radial alpha falloff.
+//
+// Additive blending creates the "luminous dust" feel — particles in
+// dense regions glow brighter as they overlap.
+//
+// Per-vertex attributes: aPos (vec2, CSS-px), aAge (float, 0..1).
+// Per-program uniforms: uOrtho, uColor, uPointSize.
+export const PARTICLE_FLOW = {
+  VS: `#version 300 es
+in vec2 aPos;
+in float aAge;        // 0 = just-spawned, 1 = about to recycle
+uniform mat4 uOrtho;
+uniform float uPointSize;
+out float vAge;
+void main() {
+  vAge = aAge;
+  // Younger particles are slightly bigger so the recycle flicker is
+  // less visible — they fade in/out instead of pop.
+  float ageMul = mix(1.2, 0.6, aAge);
+  gl_PointSize = uPointSize * ageMul;
+  gl_Position = uOrtho * vec4(aPos, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+in float vAge;
+uniform vec4 uColor;
+out vec4 outColor;
+void main() {
+  // gl_PointCoord is [0..1] across the point sprite. Radial alpha:
+  // peaks at center (1.0), zero at edges (0.5 radius). Smooth falloff.
+  vec2 uv = gl_PointCoord - 0.5;
+  float r = length(uv);
+  if (r > 0.5) discard;
+  float radial = 1.0 - smoothstep(0.0, 0.5, r);
+  // Age fade: bright when young, dim when old. Triangle ramp gives a
+  // gentle birth+death so the eye doesn't catch the recycle.
+  float ageFade = 1.0 - abs(vAge * 2.0 - 1.0);
+  outColor = vec4(uColor.rgb, uColor.a * radial * ageFade);
 }`,
 };

@@ -66,7 +66,7 @@ import { resolveDisplayColor } from './entities.js';
 import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
-  EQUIPOTENTIAL, STREAMLINE, GRID_WARP,
+  EQUIPOTENTIAL, STREAMLINE, GRID_WARP, PARTICLE_FLOW,
 } from './shaders.js';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 
@@ -96,15 +96,23 @@ let _progStreamline = null;
 // V9.2 (2026-05-26): grid-warp field viz. Replaces _progEquipotential
 // as the default; _progEquipotential is kept compiled for ?field=legacy.
 let _progGridWarp = null;
-// Grid-warp vertex buffer (CSS-px positions of grid intersections) and
-// index buffer (line-segment endpoints connecting neighbors). Sized
-// based on viewport at first use and on resize.
 let _bufGridVerts = null;
 let _bufGridIndices = null;
 let _gridVertexCount = 0;
 let _gridIndexCount = 0;
 let _gridCols = 0;
 let _gridRows = 0;
+
+// V9.2 sparse particle-flow overlay (companion to grid warp). CPU
+// advection of ~200 particles per frame; rendered as additive-blended
+// soft point sprites for the "luminous dust" aesthetic.
+let _progParticleFlow = null;
+let _bufParticles = null;       // interleaved (x, y, age) Float32Array
+const PARTICLE_COUNT = 240;
+const _particleData = new Float32Array(PARTICLE_COUNT * 3);  // x,y,age × N
+const _particleVel = new Float32Array(PARTICLE_COUNT * 2);   // vx,vy × N
+const _particleLife = new Uint16Array(PARTICLE_COUNT);       // frames-remaining
+let _particlesSeeded = false;
 
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
@@ -389,6 +397,14 @@ function _initPrograms() {
   _progGridWarp.uOrtho         = gl.getUniformLocation(_progGridWarp.prog, 'uOrtho');
   _progGridWarp.uColor         = gl.getUniformLocation(_progGridWarp.prog, 'uColor');
   _progGridWarp.uIntensityHalf = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityHalf');
+
+  // V9.2 particle-flow program (companion overlay).
+  _progParticleFlow = _makeProgram(PARTICLE_FLOW.VS, PARTICLE_FLOW.FS);
+  _progParticleFlow.aPos       = gl.getAttribLocation(_progParticleFlow.prog, 'aPos');
+  _progParticleFlow.aAge       = gl.getAttribLocation(_progParticleFlow.prog, 'aAge');
+  _progParticleFlow.uOrtho     = gl.getUniformLocation(_progParticleFlow.prog, 'uOrtho');
+  _progParticleFlow.uColor     = gl.getUniformLocation(_progParticleFlow.prog, 'uColor');
+  _progParticleFlow.uPointSize = gl.getUniformLocation(_progParticleFlow.prog, 'uPointSize');
 }
 
 function _initBuffers() {
@@ -690,6 +706,150 @@ function _rebuildGridWarpVerts() {
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
 }
 
+// V9.2 particle-flow: CPU-side advection + additive-blended point sprites.
+// Particles drift along the gravitational force field, recycled when they
+// either fall into a body (their nearest entity is closer than that
+// entity's radius) or exceed their lifetime. Recycle spawns them at a
+// random viewport edge with a small inward velocity, so they look like
+// dust streaming in from the periphery.
+//
+// CPU cost at PARTICLE_COUNT=240 entities=N: 240 × N gravity evals per
+// frame = ~3k ops at N=10. Trivial. GPU cost: one draw call with N point
+// sprites — also negligible.
+const PARTICLE_LIFE_FRAMES = 240;
+const PARTICLE_COLOR = [0.78, 0.88, 1.0, 0.55];
+const PARTICLE_POINT_SIZE = 5.0;
+let _particleSeedRng = (() => {
+  let s = 0x12345678 >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+})();
+
+function _seedParticle(i) {
+  const rng = _particleSeedRng;
+  // Spawn at a random edge of the viewport with mild inward velocity so
+  // they look like ambient dust streaming in.
+  const edge = (rng() * 4) | 0;
+  let x, y, vx, vy;
+  if (edge === 0)      { x = 0;        y = rng() * _vpH; vx = +0.4;        vy = (rng() - 0.5) * 0.4; }
+  else if (edge === 1) { x = _vpW;     y = rng() * _vpH; vx = -0.4;        vy = (rng() - 0.5) * 0.4; }
+  else if (edge === 2) { x = rng() * _vpW; y = 0;        vx = (rng() - 0.5) * 0.4; vy = +0.4; }
+  else                 { x = rng() * _vpW; y = _vpH;     vx = (rng() - 0.5) * 0.4; vy = -0.4; }
+  _particleData[i * 3]     = x;
+  _particleData[i * 3 + 1] = y;
+  _particleData[i * 3 + 2] = 0;
+  _particleVel[i * 2]      = vx;
+  _particleVel[i * 2 + 1]  = vy;
+  _particleLife[i] = (rng() * PARTICLE_LIFE_FRAMES) | 0;
+}
+
+function _ensureParticlesSeeded() {
+  if (_particlesSeeded || _vpW <= 0 || _vpH <= 0) return;
+  for (let i = 0; i < PARTICLE_COUNT; i++) _seedParticle(i);
+  _particlesSeeded = true;
+}
+
+// Compute force on a single point from entity array (uses _fieldEntityData
+// already packed by drawField, which includes wrap ghosts when active).
+function _forceAtPoint(x, y) {
+  let gx = 0, gy = 0;
+  const eps2 = state.epsilon * state.epsilon;
+  for (let i = 0; i < _fieldEntityCount; i++) {
+    const o = i * 4;
+    const ex = _fieldEntityData[o];
+    const ey = _fieldEntityData[o + 1];
+    const Gqm = _fieldEntityData[o + 2];
+    const dx = x - ex;
+    const dy = y - ey;
+    const r2 = dx * dx + dy * dy + eps2;
+    const invR3 = 1 / (r2 * Math.sqrt(r2));
+    gx += -Gqm * dx * invR3;
+    gy += -Gqm * dy * invR3;
+  }
+  return [gx, gy];
+}
+
+function _updateParticles() {
+  _ensureParticlesSeeded();
+  const W = _vpW, H = _vpH;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    let age = _particleData[i * 3 + 2];
+    age += 1 / PARTICLE_LIFE_FRAMES;
+    if (age >= 1 || _particleLife[i] <= 0) {
+      _seedParticle(i);
+      continue;
+    }
+    _particleLife[i]--;
+    const x = _particleData[i * 3];
+    const y = _particleData[i * 3 + 1];
+    let vx = _particleVel[i * 2];
+    let vy = _particleVel[i * 2 + 1];
+    const [fx, fy] = _forceAtPoint(x, y);
+    // Scale force so particles drift visibly but not insanely fast.
+    const fScale = 6.0;
+    vx += fx * fScale;
+    vy += fy * fScale;
+    // Speed cap so close approaches don't blow up.
+    const speed = Math.hypot(vx, vy);
+    if (speed > 6) { const k = 6 / speed; vx *= k; vy *= k; }
+    const nx = x + vx;
+    const ny = y + vy;
+    // Recycle if outside viewport or inside a body.
+    let recycle = false;
+    if (nx < -8 || nx > W + 8 || ny < -8 || ny > H + 8) recycle = true;
+    else {
+      for (let j = 0, n = state.entities.length; j < n; j++) {
+        const e = state.entities[j];
+        if (e.absorbing) continue;
+        const dr = Math.hypot(nx - e.x, ny - e.y);
+        if (dr < e.radius + 2) { recycle = true; break; }
+      }
+    }
+    if (recycle) {
+      _seedParticle(i);
+    } else {
+      _particleData[i * 3]     = nx;
+      _particleData[i * 3 + 1] = ny;
+      _particleData[i * 3 + 2] = age;
+      _particleVel[i * 2]      = vx;
+      _particleVel[i * 2 + 1]  = vy;
+    }
+  }
+}
+
+function _drawParticleFlow() {
+  if (!_progParticleFlow || _fieldEntityCount === 0) return;
+  const gl = _gl;
+  _updateParticles();
+  if (!_bufParticles) _bufParticles = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufParticles);
+  gl.bufferData(gl.ARRAY_BUFFER, _particleData, gl.DYNAMIC_DRAW);
+
+  gl.useProgram(_progParticleFlow.prog);
+  gl.uniformMatrix4fv(_progParticleFlow.uOrtho, false, _orthoMat);
+  gl.uniform4f(_progParticleFlow.uColor,
+    PARTICLE_COLOR[0], PARTICLE_COLOR[1], PARTICLE_COLOR[2], PARTICLE_COLOR[3]);
+  gl.uniform1f(_progParticleFlow.uPointSize, PARTICLE_POINT_SIZE * _dpr);
+
+  // Additive blending for the luminous dust look.
+  const prevBlendFunc = [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA];
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+  // Interleaved (x, y, age) stride = 12 bytes.
+  gl.enableVertexAttribArray(_progParticleFlow.aPos);
+  gl.vertexAttribPointer(_progParticleFlow.aPos, 2, gl.FLOAT, false, 12, 0);
+  gl.enableVertexAttribArray(_progParticleFlow.aAge);
+  gl.vertexAttribPointer(_progParticleFlow.aAge, 1, gl.FLOAT, false, 12, 8);
+  gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+  gl.disableVertexAttribArray(_progParticleFlow.aPos);
+  gl.disableVertexAttribArray(_progParticleFlow.aAge);
+
+  // Restore blend func for any subsequent passes.
+  gl.blendFunc(prevBlendFunc[0], prevBlendFunc[1]);
+}
+
 // V9.2: grid-warp draw. Selects between 3D oblique and 2D in-plane via
 // state.fieldStyle ('3d' default | '2d'). Uses the entity array packed
 // into _fieldEntityData by drawField().
@@ -700,13 +860,15 @@ function _drawGridWarp() {
   if (!_progGridWarp || !_bufGridVerts || !_bufGridIndices) return;
   if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
   const mode = (state.fieldStyle === '2d') ? 1 : 0;
-  // Displacement scale: tuned so a single mass-100 body at the screen
-  // center makes its well visible on a 700-px viewport without warping
-  // the entire grid into a vertical line. Empirical; can be exposed as
-  // a slider later.
-  const dispScale = (mode === 0) ? 5.0 : 8.0;
-  const tiltY = 1.0;     // 3D-only: how much depth maps into screen Y
-  const intensityHalf = 40.0;
+  // Displacement scale tuned so the 2D in-plane warp matches the
+  // mockup_2d.py reference visually: cap=28 px saturates within
+  // ~300px of a mass=200 body at G=80, leaving clean far-field.
+  // 3D mode stays mild (5.0) to avoid the iconic-but-overwhelming
+  // global-bowl effect — but acknowledged as a known v1 limitation
+  // since user picked 2D+particles direction.
+  const dispScale = (mode === 0) ? 5.0 : 175.0;
+  const tiltY = 1.0;
+  const intensityHalf = 22.0;
   const color = (mode === 0) ? GRID_WARP_COLOR_3D : GRID_WARP_COLOR_2D;
 
   gl.useProgram(_progGridWarp.prog);
@@ -1498,11 +1660,15 @@ export function drawField() {
 
   // V9.2 rewrite (2026-05-26): default field viz is now grid warp.
   // Legacy equipotential rings are kept gated behind state.fieldStyle
-  // === 'legacy' for regression debugging; default is '3d'.
+  // === 'legacy' for regression debugging; default is '2d' (user pick).
+  // Particle-flow overlay companions the 2D grid for "luminous dust"
+  // feel; in 3D and legacy modes it's omitted (those carry their own
+  // visual character).
   if (state.fieldStyle === 'legacy') {
     _drawEquipotential();
   } else {
     _drawGridWarp();
+    if (state.fieldStyle === '2d') _drawParticleFlow();
   }
   _drawStreamlines();
 
