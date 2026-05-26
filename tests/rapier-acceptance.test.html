@@ -291,6 +291,149 @@
       }
     }
 
+    // ─── Regression tests (AI-blind-spot prevention) ──────────────────
+    // Per /ai-regression-testing skill: write tests for bugs that were
+    // FOUND, not for code that works. Each regression test name carries
+    // the bug it locks in so future readers know why it exists.
+
+    // R1 — After destroy(), the next step() call must throw immediately
+    // (fail fast) rather than hanging on a postMessage to a terminated
+    // worker. Original bug: v1 code-review HIGH #1 — destroy()
+    // terminated the worker without rejecting in-flight, so the substep
+    // loop hung silently. With v4's fire-and-forget step(), the relevant
+    // post-destroy invariant is: subsequent step() throws, doesn't hang.
+    async function testR1_StepAfterDestroyThrows() {
+      group('R1 — step() after destroy() throws immediately (no hang)');
+      const params = new URLSearchParams(location.search);
+      const isWorker = params.get('engine') === 'rapier-worker';
+      if (!isWorker) {
+        skip('R1', 'only applies to worker backend; reload with ?engine=rapier-worker');
+        return;
+      }
+      await freshBackend();
+      state.entities.push(makeEntity({ x: 400, y: 300 }));
+      // Take down the backend.
+      backend.destroy();
+      // The backend reference is now dead. step() must throw within bounded
+      // time. Use a hard 2s race so a hang fails the test instead of stalling
+      // the whole suite.
+      let threw = false;
+      try {
+        await Promise.race([
+          (async () => {
+            backend.prepareFrame(state.entities);
+            await backend.step(state.entities, 1/60, state.viewport, state.boundaryMode, true);
+          })(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('R1 timeout — step hung 2s after destroy')), 2000)),
+        ]);
+      } catch (err) {
+        threw = true;
+        if (err.message.includes('R1 timeout')) {
+          fail('R1', 'step() hung 2s after destroy — regression of v1 HIGH #1');
+          backend = null;
+          return;
+        }
+      }
+      // Reset reference for next test
+      backend = null;
+      if (threw) pass('R1', 'step() after destroy threw synchronously');
+      else fail('R1', 'step() resolved after destroy — dead-flag guard missing');
+    }
+
+    // R2 — During the BH absorption animation, the prey entity must stay
+    // alive in state.entities until updateAbsorptions completes the
+    // animation. Worker-mode applyStepDone (with sentSet/returnedSet
+    // diff) must NOT splice the prey while it's mid-animation, because
+    // the animation lifecycle is owned by main thread. Bug: v1 worker
+    // code-review HIGH #3 — early version would splice on the first
+    // step after the worker absorbed the body, popping it before the
+    // animation finished. Setup uses REAL absorption (matches B6) so
+    // both backends exercise the same lifecycle path.
+    async function testR2_AbsorbingNotSpliced() {
+      group('R2 — mid-absorbing entity stays alive during animation');
+      const params = new URLSearchParams(location.search);
+      const isWorker = params.get('engine') === 'rapier-worker';
+      if (isWorker) {
+        // Worker v1 limitation: absorbing flag is set on the worker-side
+        // entity copy, never propagated back to main. Worker's stepDone
+        // only includes x/y/vx/vy via Float32Array. From main's view, an
+        // absorbed body just disappears (entity in sentSet but not in
+        // returnedSet → spliced). No mid-animation flag is observable.
+        // Worker v2 will need to surface absorption state in stepDone
+        // for animation to work cross-thread.
+        skip('R2', 'worker mode does not surface absorbing flag to main (v1 limitation)');
+        return;
+      }
+      await freshBackend();
+      // Reuse B6's proven geometry: planet OUTSIDE BH sensor with inward
+      // velocity. Must ENTER the BH's sensor to trigger absorption (BHs
+      // are sensors, not solid colliders — spawn-inside misses the enter
+      // event). With G=80, mass=1000, d=60, vx=20: planet crosses BH
+      // surface in ~1.5s. Poll per-substep to catch absorbing flag during
+      // its 0.3s animation window.
+      const bh = makeEntity({
+        x: 400, y: 300, vx: 0, vy: 0, mass: 1000, radius: 30,
+        type: 'black_hole', charge: 1,
+      });
+      const planet = makeEntity({
+        x: 340, y: 300, vx: 20, vy: 0, mass: 10, radius: 8,
+      });
+      state.entities.push(bh, planet);
+
+      let captured = null;
+      let absorbingSeenSubstep = -1;
+      // Poll per-substep up to 3 sim-seconds (180 substeps). Capture
+      // first sighting of absorbing flag.
+      for (let i = 0; i < 180 && !captured; i++) {
+        await runSubsteps(1);
+        captured = state.entities.find(e => e.absorbing);
+        if (captured) absorbingSeenSubstep = i;
+      }
+      if (!captured) {
+        fail('R2', 'absorption never triggered after 180 substeps (3 sim-sec) — collision setup broken');
+        return;
+      }
+      pass('R2', `caught absorbing flag at substep ${absorbingSeenSubstep}`);
+
+      // Sanity: animation completes and entity gets spliced.
+      const targetId = captured.id;
+      await runSubsteps(60 * 2);
+      const stillExistsAfterAnim = state.entities.find(e => e.id === targetId);
+      if (stillExistsAfterAnim) {
+        fail('R2-cleanup', 'absorbing entity never cleaned up — animation stuck');
+      } else {
+        pass('R2-cleanup', 'animation completed, entity spliced');
+      }
+    }
+
+    // R3 — Cross-backend parity. Per /ai-regression-testing skill, the
+    // #1 AI-introduced regression is "fixed one code path, forgot the
+    // other" (sandbox/production parity). Our analogue: in-thread Rapier
+    // and worker Rapier must produce structurally equivalent state for
+    // identical setups. This test runs on whichever backend is active and
+    // asserts known reference invariants from B1 — if worker drifts from
+    // in-thread reference, this catches it before deploy.
+    async function testR3_BackendParity() {
+      group('R3 — backend matches B1 reference invariants');
+      await freshBackend();
+      const v0 = 4.47;
+      state.entities.push(makeEntity({ x: 300, y: 300, vy:  v0 }));
+      state.entities.push(makeEntity({ x: 500, y: 300, vy: -v0 }));
+      await runSubsteps(60 * 2);
+      const a = state.entities[0], b = state.entities[1];
+      const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+      const drift = Math.hypot(cx - 400, cy - 300);
+      const ke = 0.5 * 100 * (a.vx*a.vx + a.vy*a.vy + b.vx*b.vx + b.vy*b.vy);
+      const keInitial = 100 * v0 * v0;
+      const keRatio = ke / keInitial;
+      const ok = state.entities.length === 2 && drift < 8 && keRatio > 0.1 && keRatio < 10;
+      if (!ok) {
+        fail('R3', `backend output diverged from reference: alive=${state.entities.length}, drift=${drift.toFixed(2)}, keRatio=${keRatio.toFixed(2)}`);
+      } else {
+        pass('R3', `matches reference (drift=${drift.toFixed(2)}px, keRatio=${keRatio.toFixed(2)})`);
+      }
+    }
+
     async function runAll() {
       const t0 = performance.now();
       try {
@@ -302,6 +445,9 @@
         await testStiffness_GravPile();
         await testWrap_GhostMomentum();
         await testF_CPUGravityReachable();
+        await testR1_StepAfterDestroyThrows();
+        await testR2_AbsorbingNotSpliced();
+        await testR3_BackendParity();
       } catch (e) {
         fail('harness crashed', e.stack || e.message);
       }

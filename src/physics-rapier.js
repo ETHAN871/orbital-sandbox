@@ -1273,10 +1273,16 @@ function detectAndStartBHAbsorptions(entities) {
       else if (b.mass < a.mass) prey = b;
       else continue;
       const predator = (prey === a) ? b : a;
+      // Shape MUST match physics.js's updateAbsorptions reader contract:
+      // { blackHoleId, elapsedSim, startX, startY, startRadius }.
+      // Earlier versions wrote { t, duration, predator } which caused
+      // updateAbsorptions's `idMap.get(undefined)` lookup to fail → the
+      // entity was spliced immediately (no animation). Bug surfaced via
+      // /ai-regression-testing R2 test 2026-05-26 — exact "AI fixed one
+      // call site, forgot the other contract" pattern from the skill.
       prey.absorbing = {
-        t: 0,
-        duration: state.absorptionDuration,
-        predator,
+        blackHoleId: predator.id,
+        elapsedSim: 0,
         startX: prey.x,
         startY: prey.y,
         startRadius: prey.radius,
