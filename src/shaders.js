@@ -33,7 +33,7 @@ void main() {
 // to "sink into the gravity well" when rubber-sheet mode is active:
 // TRAIL_DOT, ENTITY, CIRCLE_FILL, CIRCLE_RING, LINE_SEG, PARTICLE_FLOW.
 //
-// Sampling: uSagTex is a 128×128 R32F texture pre-baked by the CPU
+// Sampling: uSagTex is a 256×256 R32F texture pre-baked by the CPU
 // each frame with sag(world_x, world_y) in CSS-px. uSagMode gates the
 // effect (0 = flat / passthrough, 1 = apply oblique). uSagViewport
 // is the CSS-px viewport (W, H) used to map worldPx → uv.

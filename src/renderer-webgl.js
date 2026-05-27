@@ -116,16 +116,19 @@ const _particleVel = new Float32Array(PARTICLE_COUNT * 2);   // vx,vy × N
 const _particleLife = new Uint16Array(PARTICLE_COUNT);       // frames-remaining
 let _particlesSeeded = false;
 
-// V10 (2026-05-26): sag texture for rubber-sheet oblique projection.
-// CPU computes sag(x,y) = how far the rubber sheet sags DOWN at each
-// (x, y) world point. 128×128 R32F texture, uploaded each frame when
-// state.fieldStyle === 'rubber-sheet'. All entity / UI / trail shaders
-// sample it via uSagTex to apply screen_y += sag * sin(45°). See
-// .claude/rubber-sheet-blueprint.md for the full design.
-const _SAG_TEX_W = 128;
-const _SAG_TEX_H = 128;
-const _SAG_MAX = 140.0;            // CSS-px depth cap (architect default)
-const _SAG_DISP_SCALE = 5.0;       // matches GRID_WARP.VS 3D mode dispScale
+// V11 (2026-05-27): rubber-sheet sag texture, fixed-scale model.
+// CPU computes sag(x,y) = |φ(x,y)| / G_vert directly — no per-frame
+// normalization, no EMA, no clamp. The slope ∇h then equals g_field/G_vert,
+// so a body on the slope feels the same horizontal force the 2D sim
+// applies at that point. G_vert tracks state.G and state.epsilon so the
+// visual depth at the reference body (mass = m_ref) equals D_TARGET_SAG_PX
+// regardless of those sliders. 256×256 R32F texture, uploaded each frame
+// when state.fieldStyle === 'rubber-sheet'. All entity / UI / trail
+// shaders sample via uSagTex and add screen_y += sag * sin(45°).
+const _SAG_TEX_W = 256;
+const _SAG_TEX_H = 256;
+const _D_TARGET_SAG_PX = 120.0;    // visual depth at the reference body
+const _SAG_REF_MASS    = 100.0;    // reference mass (default slider value)
 let _sagTexture = null;            // GL texture handle (R32F)
 const _sagPixels = new Float32Array(_SAG_TEX_W * _SAG_TEX_H);
 let _sagActive = false;            // true iff this frame uses sag — drives uSagMode
@@ -696,8 +699,8 @@ function _initFbos(w, h) {
   _trailReadIdx = 0;
 }
 
-// V10 rubber-sheet: one-time sag-texture creation. Allocated at fixed
-// 128×128 resolution regardless of viewport; the shader samples in
+// V11 rubber-sheet: one-time sag-texture creation. Allocated at fixed
+// 256×256 resolution regardless of viewport; the shader samples in
 // world-uv space (worldPx / viewport) so the lookup adapts automatically.
 function _initSagTexture() {
   if (!_gl) return;
@@ -717,87 +720,61 @@ function _initSagTexture() {
   // Linear filtering — gives smooth sag values between texels.
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // V11: REPEAT (not CLAMP_TO_EDGE) so wrap-mode ghost copies at world
+  // X > vpW or Y > vpH sample the correct tile of the sag field. The
+  // CPU pass already includes 9-ghost contributions when boundary mode
+  // is 'wrap', so the texture is tileable by construction. In bounded
+  // mode the visible viewport stays in UV [0,1] anyway, so REPEAT has
+  // no visible effect there.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
   gl.bindTexture(gl.TEXTURE_2D, null);
 }
 
-// Per-frame: sample sag(x, y) at 128×128 grid points using the entity
+// Per-frame: sample sag(x, y) at 256×256 grid points using the entity
 // data already packed in _fieldEntityData (includes 9-ghost copies in
 // wrap mode). Upload via texSubImage2D so the GPU shaders can sample.
 //
-// SCALE NORMALIZATION (V10.2 — fix for "bodies bob up and down as
-// they orbit" bug; V10.1's fix for "flat surface" preserved).
+// V11 (2026-05-27 — current): h(x,y) = |φ(x,y)| / G_vert. Fixed scale
+// with G_vert calibrated live from state.G and state.epsilon so a
+// reference body of mass=_SAG_REF_MASS produces a well of depth
+// =_D_TARGET_SAG_PX. No normalization, no EMA, no clamp — slopes are
+// a direct function of the simulated field strength. xy plane is
+// preserved exactly (height is a pure vertical rescaling of φ).
 //
-// History:
-//   - V10.0: constant SAG_DISP_SCALE × |φ| → saturated SAG_MAX
-//     everywhere within a body's footprint (|φ| ~ hundreds, ×5 cap
-//     hit at 140). Surface looked flat regardless of body count.
-//   - V10.1: per-frame |φ_max| from sampled grid; pixel scaled by
-//     SAG_MAX / |φ_max|. Surface dynamic but bodies bobbed: as
-//     orbit moved bodies across 128×128 sample boundaries, the
-//     sampled max wobbled → every frame's rescale shifted every
-//     body's apparent depth → user saw 1-2 Hz vertical jitter.
-//   - V10.2 (current): scale anchored to a POSITION-INVARIANT
-//     baseline |φ_baseline| = max(|G·q·m|) / ε — the deepest
-//     possible self-contribution at any body's own center under
-//     Plummer softening. Depends only on per-body mass + state.
-//     epsilon, NOT on coordinates. effective = max(baseline,
-//     observed sampled max). Heavy EMA (α=0.04, 17-frame
-//     half-life) further damps any residual cluster wobble.
-//
-// Trade-off: in dense clusters where multi-body field stacking
-// produces |φ_max| > |φ_baseline|, the depth dynamic range is
-// slightly compressed (some pixels clamp to SAG_MAX where the old
-// V10.1 would have rescaled them lower). User explicitly accepted
-// this — "visualization precision not needed; stability required."
-//
-// Sentinel _phiMaxAbsEMA = -1 means uninitialized; first non-
-// empty frame seeds it from effective_phi_max directly (no EMA
-// lag). Reset to -1 whenever the scene becomes empty.
-let _phiMaxAbsEMA = -1;   // sentinel -1 = uninitialized
+// History (kept for reference):
+//   - V10.0: constant scale × |φ| → saturated cap everywhere within
+//     a body footprint (|φ|~hundreds, ×5 hit cap immediately).
+//   - V10.1: per-frame |φ_max| EMA rescale → surface dynamic but
+//     bodies bobbed as orbit moved across 128² sample boundaries.
+//   - V10.2: anchored EMA to position-invariant baseline G·max|qm|/ε
+//     to kill scale-induced bobbing; texel aliasing residual remained.
+//   - V11: drop EMA entirely. Scale is f(state.G, state.epsilon) only.
+//     Bumping texture to 256² halves residual texel-stride wobble.
 function _updateSagTexture() {
   if (!_gl || !_sagTexture) return;
   const gl = _gl;
   const ents = _fieldEntityData;
   const cnt = _fieldEntityCount;
-  const eps = state.epsilon;
+  const eps = Math.max(1, state.epsilon);   // guard ÷0 if ε slider is at floor
   const eps2 = eps * eps;
   const sx = _vpW / _SAG_TEX_W;
   const sy = _vpH / _SAG_TEX_H;
   if (cnt === 0) {
     _sagPixels.fill(0);
-    // Reset |φ_max| EMA so the next non-empty frame seeds from a clean
-    // hard value instead of carrying a stale ghost of the prior scene
-    // through a 7-frame fade. Without this reset, clearing the sandbox
-    // and re-spawning a very different body set would produce a visible
-    // first-second normalization wobble.
-    _phiMaxAbsEMA = -1;
   } else {
-    // Pass 0: compute a POSITION-INVARIANT baseline for the scale,
-    // derived from the heaviest body's self-contribution at its own
-    // center: |φ_self| = |G·q·m| / ε (Plummer-softened, r=0). This is
-    // the dominant term in any well's depth and depends only on per-
-    // body mass + state.epsilon — NOT on body coordinates. Using it
-    // as the scale floor eliminates the up-down body bobbing the user
-    // reported: previously the scale was tied to the per-frame sampled
-    // |φ_max|, which fluctuates as bodies cross the 128×128 grid
-    // sample boundaries → every frame's rescale moved every body
-    // vertically by a few pixels (visible as 1-2 Hz orbital wobble).
-    // The user explicitly opted out of visualization precision in
-    // exchange for stability, so this trades a tiny bit of cluster-
-    // depth dynamic range for a rock-still orbital trajectory.
-    let maxAbsGqm = 0;
-    for (let k = 0; k < cnt; k++) {
-      const Gqm = ents[k * 4 + 2];
-      const a = Gqm < 0 ? -Gqm : Gqm;
-      if (a > maxAbsGqm) maxAbsGqm = a;
-    }
-    const baselinePhiMax = maxAbsGqm / eps;
-
-    // Pass 1: compute |φ| at each pixel, store in scratch, track max.
+    // G_vert: vertical-gravity coefficient calibrated so the reference
+    // body (mass=_SAG_REF_MASS=100 at default ε) produces a well of
+    // depth _D_TARGET_SAG_PX=120 CSS px. Derivation:
+    //   sag at body center = |φ_self|/G_vert = (G·m_ref/ε)/G_vert
+    //   want this = D_TARGET → G_vert = G·m_ref / (D_TARGET·ε)
+    // Tracking state.G and state.epsilon live keeps the visual depth
+    // calibrated through any slider change, without per-frame rescale.
+    // The result: h(x,y) = |φ(x,y)|/G_vert — a fixed-scale rubber sheet
+    // whose slope ∇h equals the simulated gravity g_field at every point.
+    const G_vert = (state.G * _SAG_REF_MASS) / (_D_TARGET_SAG_PX * eps);
+    const invG_vert = 1 / G_vert;
     let idx = 0;
-    let phiMaxAbs = 1e-9;
     for (let j = 0; j < _SAG_TEX_H; j++) {
       const y = (j + 0.5) * sy;
       for (let i = 0; i < _SAG_TEX_W; i++) {
@@ -811,28 +788,8 @@ function _updateSagTexture() {
           phi += -ents[o + 2] / Math.sqrt(r2);
         }
         const phiAbs = phi < 0 ? -phi : phi;
-        _sagPixels[idx++] = phiAbs;
-        if (phiAbs > phiMaxAbs) phiMaxAbs = phiAbs;
+        _sagPixels[idx++] = phiAbs * invG_vert;
       }
-    }
-    // Anchor: take the larger of (stable baseline, observed sampled
-    // max). For 1–2 body scenes the sampled max never quite reaches
-    // baselinePhiMax (the body center rarely lands on a sample point),
-    // so the baseline dominates and the scale becomes a constant
-    // function of mass + ε → zero bobbing. In dense clusters where
-    // multiple bodies' fields stack, the sampled max can exceed the
-    // baseline; the EMA below smooths whatever residual wobble that
-    // produces. Heavy α=0.04 (~17-frame half-life) damps cluster-case
-    // oscillation by ~5× vs the previous α=0.15.
-    const effectivePhiMax = phiMaxAbs > baselinePhiMax ? phiMaxAbs : baselinePhiMax;
-    if (_phiMaxAbsEMA < 0) _phiMaxAbsEMA = effectivePhiMax;
-    else _phiMaxAbsEMA = _phiMaxAbsEMA * 0.96 + effectivePhiMax * 0.04;
-    // Pass 2: scale each pixel by SAG_MAX / |φ_max| so deepest sag = SAG_MAX.
-    const total = _SAG_TEX_W * _SAG_TEX_H;
-    const scale = _SAG_MAX / _phiMaxAbsEMA;
-    for (let k = 0; k < total; k++) {
-      const v = _sagPixels[k] * scale;
-      _sagPixels[k] = v > _SAG_MAX ? _SAG_MAX : v;
     }
   }
   gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
@@ -1049,13 +1006,10 @@ function _drawParticleFlow() {
   gl.uniform4f(_progParticleFlow.uColor,
     PARTICLE_COLOR[0], PARTICLE_COLOR[1], PARTICLE_COLOR[2], PARTICLE_COLOR[3]);
   gl.uniform1f(_progParticleFlow.uPointSize, PARTICLE_POINT_SIZE * _dpr);
-  // V10.2: particle flow is companion-only to the '2d' field style, so
-  // _sagActive is always false here and uSagMode comes out as 0 from
-  // _bindSagUniforms. Force it explicitly for consistency with the
-  // rest of the diff — keeps the defensive pattern even if particle
-  // flow is ever extended into rubber-sheet mode.
+  // V10.3: particle flow is companion-only to the '2d' field style, so
+  // _sagActive is always false here and _bindSagUniforms sets uSagMode=0
+  // naturally.
   _bindSagUniforms(_progParticleFlow);
-  gl.uniform1f(_progParticleFlow.uSagMode, 0.0);
 
   // Additive blending for the luminous dust look.
   const prevBlendFunc = [gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA];
@@ -1111,15 +1065,16 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
     _intensityRange.max = 0;
     return _intensityRange;
   }
-  // V10 rubber-sheet (mode 2): sag-texture pixels already encode the
-  // per-frame normalized depth in [0, SAG_MAX]. The mesh VS outputs
-  // vIntensity = sag · sin(45°), so the range is sin(45°) × { min,max }
-  // of _sagPixels. Scanning the 128×128 buffer is cheap (~16k px /
-  // frame, hot in L1) and gives a tight scene-relative ramp that
-  // moves with the deepest live well. NB: the `_fieldEntityCount === 0`
-  // early-return above is load-bearing for this branch — without it, the
-  // scan would run on a zero-filled buffer and produce a max=0 range,
-  // breaking the smoothstep degenerate guard in _drawGridWarp.
+  // V11 rubber-sheet (mode 2): sag-texture pixels encode absolute
+  // CSS-px sag = |φ|/G_vert (no clamp, no normalization). The mesh VS
+  // outputs vIntensity = sag · sin(45°), so the range is sin(45°) ×
+  // { min, max } of _sagPixels. Scanning the 256×256 buffer is ~65k
+  // px / frame, hot in L1, sub-ms. Gives a scene-relative brightness
+  // ramp that moves with the deepest live well. NB: the
+  // `_fieldEntityCount === 0` early-return above is load-bearing for
+  // this branch — without it, the scan would run on a zero-filled
+  // buffer and produce a max=0 range, breaking the smoothstep
+  // degenerate guard in _drawGridWarp.
   if (mode === 2) {
     const SIN45 = 0.70710678;
     let mn = Infinity, mx = 0;
@@ -1341,13 +1296,10 @@ function _drawFieldLines() {
   const gl = _gl;
   gl.useProgram(_progLineSeg.prog);
   gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
-  // V10.2: field lines (curvilinear mode) push through _pushLineSeg
-  // which now bakes sag analytically — but the curvilinear and
-  // rubber-sheet field styles are mutually exclusive, so _sagAtPoint
-  // returns 0 here. Still, force uSagMode=0 explicitly so a future
-  // multi-mode feature can't accidentally double-project field lines.
+  // V10.3: field lines are curvilinear-mode only; rubber-sheet uses
+  // GRID_WARP mesh instead — so _sagActive is false here and the
+  // shader's sagProject is a passthrough via _bindSagUniforms.
   _bindSagUniforms(_progLineSeg);
-  gl.uniform1f(_progLineSeg.uSagMode, 0.0);
   gl.bindVertexArray(_vaoLineSeg);
   gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
   gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
@@ -1597,13 +1549,11 @@ export function updateTrailCanvas(simDeltaTime) {
     if (e.absorbing) continue;
     const rgb = _colorToRgbNorm(e.color);
     const o = count * 5;
-    // V10.2: same pre-baked sag offset the bodies use. Writing each
-    // trail dot at the same screen-Y as the body that produced it
-    // means the trail traces the body's visible path exactly (no
-    // body-floats-above-or-below-trail mismatch). The trail-dot shader
-    // also has uSagMode forced to 0 below so sagProject is a no-op.
+    // V10.3: trail dot at raw world coords; the trail-dot VS's
+    // sagProject samples the same sag texture as the mesh / body,
+    // so the dot lands exactly under the body that drew it.
     _trailInstanceData[o]     = e.x;
-    _trailInstanceData[o + 1] = e.y + _entitySagY(e.id);
+    _trailInstanceData[o + 1] = e.y;
     _trailInstanceData[o + 2] = rgb[0];
     _trailInstanceData[o + 3] = rgb[1];
     _trailInstanceData[o + 4] = rgb[2];
@@ -1623,10 +1573,9 @@ export function updateTrailCanvas(simDeltaTime) {
     gl.uniformMatrix4fv(_progTrailDot.uOrtho, false, _orthoMat);
     gl.uniform1f(_progTrailDot.uRinner, Ri);
     gl.uniform1f(_progTrailDot.uRouter, Ro);
-    // V10.2: trail iCenter already has sag baked in (CPU-exact). Force
-    // uSagMode=0 so the shader's sagProject doesn't double-offset.
+    // V10.3: trail dot iCenter is raw world; the shader's sagProject
+    // does the projection from the shared sag texture.
     _bindSagUniforms(_progTrailDot);
-    gl.uniform1f(_progTrailDot.uSagMode, 0.0);
 
     // MAX blend: dest = max(src, dest) per channel.
     gl.enable(gl.BLEND);
@@ -1701,19 +1650,10 @@ function _drawEntities() {
     if (!sprite) continue;
     let arr = buckets.get(sprite);
     if (!arr) { arr = []; buckets.set(sprite, arr); }
-    // V10.2: pre-bake the rubber-sheet sag offset on CPU using the
-    // exact analytical phi-sum, so the body's rendered Y depends only
-    // on its physics position — NOT on whether its center happens to
-    // sit close to a 128×128 grid sample point. The shader's
-    // sagProject is bypassed for entities via uSagMode=0 below.
-    // Ghost copies (wrap mode) use the same offset because the sag
-    // texture is built from already-wrapped ghost contributions, so
-    // each ghost's local well depth is encoded there too — but for
-    // entity rendering we apply the real body's analytical sag to
-    // every ghost copy. That keeps the body + all its 8 mirrors at a
-    // consistent visual depth (no per-ghost sampling jitter either).
-    const sagYOffset = _entitySagY(e.id);
-    arr.push(e.x, e.y + sagYOffset, 1);
+    // V10.3: push raw world coords; the entity VS's sagProject samples
+    // the same sag texture as the mesh so the body lands at the mesh's
+    // visible well bottom by construction.
+    arr.push(e.x, e.y, 1);
 
     if (wrap) {
       // Threshold uses sprite half-extent (sprite.width / 2), not entity
@@ -1728,14 +1668,14 @@ function _drawEntities() {
       const nearRight  = e.x > W - r;
       const nearTop    = e.y < r;
       const nearBottom = e.y > H - r;
-      if (nearLeft)   arr.push(e.x + W, e.y + sagYOffset, 1);
-      if (nearRight)  arr.push(e.x - W, e.y + sagYOffset, 1);
-      if (nearTop)    arr.push(e.x, e.y + H + sagYOffset, 1);
-      if (nearBottom) arr.push(e.x, e.y - H + sagYOffset, 1);
-      if (nearLeft && nearTop)     arr.push(e.x + W, e.y + H + sagYOffset, 1);
-      if (nearLeft && nearBottom)  arr.push(e.x + W, e.y - H + sagYOffset, 1);
-      if (nearRight && nearTop)    arr.push(e.x - W, e.y + H + sagYOffset, 1);
-      if (nearRight && nearBottom) arr.push(e.x - W, e.y - H + sagYOffset, 1);
+      if (nearLeft)   arr.push(e.x + W, e.y, 1);
+      if (nearRight)  arr.push(e.x - W, e.y, 1);
+      if (nearTop)    arr.push(e.x, e.y + H, 1);
+      if (nearBottom) arr.push(e.x, e.y - H, 1);
+      if (nearLeft && nearTop)     arr.push(e.x + W, e.y + H, 1);
+      if (nearLeft && nearBottom)  arr.push(e.x + W, e.y - H, 1);
+      if (nearRight && nearTop)    arr.push(e.x - W, e.y + H, 1);
+      if (nearRight && nearBottom) arr.push(e.x - W, e.y - H, 1);
     }
   }
 
@@ -1747,14 +1687,10 @@ function _drawEntities() {
 
   gl.useProgram(_progEntity.prog);
   gl.uniformMatrix4fv(_progEntity.uOrtho, false, _orthoMat);
-  // V10.2: entity sag is pre-baked on the CPU per body (exact analytical
-  // sum, no texture sampling). The shader uniform machinery still binds
-  // the sag texture for consistency, but we force uSagMode = 0 so the
-  // shader's sagProject is a passthrough — preventing a double offset
-  // (CPU-baked + shader-sampled). The texture stays available for any
-  // future paths that want sampling without an early-out.
+  // V10.3: entity VS's sagProject samples the same sag texture as the
+  // mesh, so the body lands at the mesh's visible well bottom. No CPU
+  // pre-bake; the texture binding + uSagMode comes from _bindSagUniforms.
   _bindSagUniforms(_progEntity);
-  gl.uniform1f(_progEntity.uSagMode, 0.0);
   gl.bindVertexArray(_vaoEntity);
 
   for (const [sprite, posArr] of buckets) {
@@ -1811,15 +1747,11 @@ const UI_HOVER_DASH_OFF = 3;
 const UI_SELECT_DASH_ON = 4;         // px (V8.1c [4, 4])
 const UI_SELECT_DASH_OFF = 4;
 
-// V10.2: bake the rubber-sheet sag offset into each UI push at the
-// CPU side using the exact analytical phi-sum. The UI shaders then
-// see already-projected coordinates and we force uSagMode=0 on them
-// to keep sagProject as a passthrough (no double offset). This
-// eliminates the 128×128 texture sampling jitter for hover ghost /
-// drag preview / prediction line / selection ring / absorbing
-// fallback — the same fix applied to bodies + trails. _sagAtPoint
-// returns 0 cheaply when sag is inactive (state.showField off or
-// fieldStyle !== 'rubber-sheet'), so all other modes are unaffected.
+// V10.3: UI overlays push raw world coordinates. The UI shaders
+// (CIRCLE_FILL / CIRCLE_RING / LINE_SEG) sample the shared sag
+// texture via sagProject so hover ghost / drag preview / prediction
+// line / selection ring / absorbing fallback all align with the
+// mesh's visible depression at their world position.
 function _pushCircleFill(cx, cy, radius, r, g, b, a) {
   const need = (_circleFillCount + 1) * 7;
   if (_circleFillData.length < need) {
@@ -1827,7 +1759,7 @@ function _pushCircleFill(cx, cy, radius, r, g, b, a) {
   }
   const o = _circleFillCount * 7;
   _circleFillData[o]     = cx;
-  _circleFillData[o + 1] = cy + _sagAtPoint(cx, cy) * 0.70710678;
+  _circleFillData[o + 1] = cy;
   _circleFillData[o + 2] = radius;
   _circleFillData[o + 3] = r;
   _circleFillData[o + 4] = g;
@@ -1843,7 +1775,7 @@ function _pushCircleRing(cx, cy, radius, r, g, b, a, lineW, dashOn, dashPeriod) 
   }
   const o = _circleRingCount * 10;
   _circleRingData[o]     = cx;
-  _circleRingData[o + 1] = cy + _sagAtPoint(cx, cy) * 0.70710678;
+  _circleRingData[o + 1] = cy;
   _circleRingData[o + 2] = radius;
   _circleRingData[o + 3] = r;
   _circleRingData[o + 4] = g;
@@ -1862,9 +1794,9 @@ function _pushLineSeg(x0, y0, x1, y1, r, g, b, a, arcStart, lineW, dashOn, dashP
   }
   const o = _lineSegCount * 12;
   _lineSegData[o]      = x0;
-  _lineSegData[o + 1]  = y0 + _sagAtPoint(x0, y0) * 0.70710678;
+  _lineSegData[o + 1]  = y0;
   _lineSegData[o + 2]  = x1;
-  _lineSegData[o + 3]  = y1 + _sagAtPoint(x1, y1) * 0.70710678;
+  _lineSegData[o + 3]  = y1;
   _lineSegData[o + 4]  = r;
   _lineSegData[o + 5]  = g;
   _lineSegData[o + 6]  = b;
@@ -1912,15 +1844,12 @@ export function drawUI() {
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
   // Draw filled circles first (under outlines / lines).
-  // V10.2: UI coordinates already have sag baked in by the _pushXxx
-  // helpers (CPU-exact via _sagAtPoint). Force uSagMode=0 on each UI
-  // shader so the VS sagProject is a passthrough — preventing the
-  // double-offset that would otherwise stack baked + shader-sampled.
+  // V10.3: each UI shader's sagProject samples the shared sag texture
+  // so overlays align with the mesh well at their world position.
   if (_circleFillCount > 0) {
     gl.useProgram(_progCircleFill.prog);
     gl.uniformMatrix4fv(_progCircleFill.uOrtho, false, _orthoMat);
     _bindSagUniforms(_progCircleFill);
-    gl.uniform1f(_progCircleFill.uSagMode, 0.0);
     gl.bindVertexArray(_vaoCircleFill);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleFill);
     gl.bufferData(gl.ARRAY_BUFFER, _circleFillData.subarray(0, _circleFillCount * 7), gl.DYNAMIC_DRAW);
@@ -1932,7 +1861,6 @@ export function drawUI() {
     gl.useProgram(_progLineSeg.prog);
     gl.uniformMatrix4fv(_progLineSeg.uOrtho, false, _orthoMat);
     _bindSagUniforms(_progLineSeg);
-    gl.uniform1f(_progLineSeg.uSagMode, 0.0);
     gl.bindVertexArray(_vaoLineSeg);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceLineSeg);
     gl.bufferData(gl.ARRAY_BUFFER, _lineSegData.subarray(0, _lineSegCount * 12), gl.DYNAMIC_DRAW);
@@ -1944,7 +1872,6 @@ export function drawUI() {
     gl.useProgram(_progCircleRing.prog);
     gl.uniformMatrix4fv(_progCircleRing.uOrtho, false, _orthoMat);
     _bindSagUniforms(_progCircleRing);
-    gl.uniform1f(_progCircleRing.uSagMode, 0.0);
     gl.bindVertexArray(_vaoCircleRing);
     gl.bindBuffer(gl.ARRAY_BUFFER, _bufInstanceCircleRing);
     gl.bufferData(gl.ARRAY_BUFFER, _circleRingData.subarray(0, _circleRingCount * 10), gl.DYNAMIC_DRAW);
@@ -2165,68 +2092,24 @@ export function prepareFrameRenderer() {
   if (rubberSheet) {
     _packFieldEntities();
     _updateSagTexture();
-    _computeEntitySags();
     _sagActive = true;
   } else {
     _sagActive = false;
-    // Drop stale per-entity sag values so re-enabling rubber-sheet starts
-    // clean instead of mixing stale precomputed offsets with fresh ones.
-    _entitySagYById.clear();
   }
 }
 
-// V10.2: exact analytical sag at any world position. Bypasses the
-// 128×128 sag-texture sampling — the texture's pitch (~5px at typical
-// viewports) is wide vs ε (~4px), so each body's deep self-spike at
-// its own center is under-sampled by ~25% and bilinear interpolation
-// can't recover it. The result was: bodies orbiting smoothly LOOKED
-// like they bobbed up and down by 10-25 px as their position drifted
-// across grid cells. Computing per-body sag from the closed-form
-// Plummer sum eliminates that aliasing for bodies / trails / UI; the
-// texture stays only for GRID_WARP mesh (which has many vertices and
-// can tolerate some interpolation softness).
-//
-// Cost: O(visible_points × packed_entity_count). For N entities the
-// pack already costs O(N) (or 9N in wrap mode), and _computeEntitySags
-// adds another O(N × 9N) = O(N²). Same complexity floor as gravity
-// itself; runs sub-ms at N ≤ 200.
-function _sagAtPoint(x, y) {
-  if (!_sagActive || _fieldEntityCount === 0 || _phiMaxAbsEMA <= 0) return 0;
-  const ents = _fieldEntityData;
-  const cnt = _fieldEntityCount;
-  const eps2 = state.epsilon * state.epsilon;
-  let phi = 0;
-  for (let k = 0; k < cnt; k++) {
-    const o = k * 4;
-    const dx = x - ents[o];
-    const dy = y - ents[o + 1];
-    const r2 = dx * dx + dy * dy + eps2;
-    phi += -ents[o + 2] / Math.sqrt(r2);
-  }
-  const phiAbs = phi < 0 ? -phi : phi;
-  const v = phiAbs * (_SAG_MAX / _phiMaxAbsEMA);
-  return v > _SAG_MAX ? _SAG_MAX : v;
-}
-
-// Per-entity precomputed sag screen-Y offset, keyed by entity id.
-// _drawEntities reads this during instance packing so the GPU sees
-// already-projected body Y coordinates (and we override uSagMode=0
-// on the entity shader so sagProject is a passthrough).
-const _entitySagYById = new Map();
-function _computeEntitySags() {
-  _entitySagYById.clear();
-  if (_fieldEntityCount === 0) return;
-  for (const e of state.entities) {
-    if (e.absorbing) continue;   // absorbing bodies draw via _progCircleFill, handled separately
-    _entitySagYById.set(e.id, _sagAtPoint(e.x, e.y) * 0.70710678);
-  }
-}
-function _entitySagY(entityId) {
-  // `?? 0` (not `|| 0`) — a legitimately computed sag of exactly 0
-  // (e.g., for a body sitting in a flat region) is a real value the
-  // caller should see, distinct from "no entry in the cache".
-  return _entitySagYById.get(entityId) ?? 0;
-}
+// V10.3 (2026-05-27): the V10.2 analytical Newton-sum per-body sag was
+// pulled out per user direction — "投影前后的物体在2D平面上呈现相
+// 近 … 通过对齐网格凹陷处和物体就行" (the body before/after projection
+// looks similar in 2D; just align it with the mesh's depression).
+// Bodies, trails, and UI overlays now sample the SAME 256×256 sag
+// texture the GRID_WARP mesh uses (via sagProject in the VS). The
+// body's sampled Y at its world position equals the mesh's bilinearly-
+// interpolated well bottom at that same position by construction —
+// they wobble together as the body crosses sample boundaries but stay
+// visually locked. Trade-off: both have texture-aliasing wobble in
+// unison (preferred); the previous analytical path eliminated wobble
+// for bodies but left them visually disjoint from the mesh.
 
 export function drawField() {
   if (_disabled || !_gl) return;
