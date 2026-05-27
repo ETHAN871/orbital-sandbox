@@ -104,6 +104,17 @@ let _gridIndexCount = 0;
 let _gridCols = 0;
 let _gridRows = 0;
 let _gridCellPx = 8;   // grid spacing — uploaded as uCellPx for the anti-fold cap
+// V11.2 painter's algorithm caches. Static segment midpoints + index
+// pairs are precomputed once in _rebuildGridWarpVerts; per-frame the
+// sag at each midpoint is bilinear-sampled from _sagPixels (CPU side),
+// segment screen-y mid is computed, and segments are sorted back-to-
+// front so foreground mesh lines overpaint the lines behind them.
+let _gridSegCount = 0;                       // number of line segments
+let _gridSegMidWorld = new Float32Array(0);  // (mx, my) per seg — static
+let _gridIndexPairs  = new Uint32Array(0);   // (i0, i1) per seg — static
+let _gridSortKeys    = new Float32Array(0);  // screen-y mid per seg — dynamic
+let _gridSortPerm    = null;                 // Array<number> of seg indices, sorted
+let _gridIndicesScratch = new Uint32Array(0); // reordered index buffer for upload
 
 // V9.2 sparse particle-flow overlay (companion to grid warp). CPU
 // advection of ~200 particles per frame; rendered as additive-blended
@@ -132,6 +143,10 @@ const _SAG_REF_MASS    = 100.0;    // reference mass (default slider value)
 let _sagTexture = null;            // GL texture handle (R32F)
 const _sagPixels = new Float32Array(_SAG_TEX_W * _SAG_TEX_H);
 let _sagActive = false;            // true iff this frame uses sag — drives uSagMode
+// V11.2: per-body quadratic coefficients (a, c, R²) for inside-radius
+// C¹ interpolation. 3 floats per body, grown on demand. Float64 keeps
+// the (3R²/2 + ε²)/(R²+ε²)^(3/2) ratio precise at small radii.
+let _quadCache = new Float64Array(64 * 3);
 
 // Buffers
 let _bufFsQuad = null;          // fullscreen quad NDC (vec2 in [-1,+1])
@@ -790,6 +805,53 @@ function _updateSagTexture() {
     // whose slope ∇h equals the simulated gravity g_field at every point.
     const G_vert = (state.G * _SAG_REF_MASS) / (_D_TARGET_SAG_PX * eps);
     const invG_vert = 1 / G_vert;
+    // V11.2 (2026-05-27): inside-radius C¹ quadratic interpolation.
+    //
+    // Plummer φ(r) = -Gqm / sqrt(r² + ε²) has a steep gradient near
+    // body centers (max slope around r≈ε). When the body sits at a
+    // sub-texel position relative to the 256² sag grid, the bilinear-
+    // interpolated sag at the body's exact location changes sharply
+    // as the body crosses texel boundaries — visible as orbital
+    // jitter / vibration.
+    //
+    // Physical reality: bodies are solid spheres of radius R. Other
+    // bodies can never get closer than R, so the field strength
+    // INSIDE R is unphysical anyway. Replace it with a smooth quadratic
+    //   f(r) = -(a + c·r²)
+    // matching three constraints:
+    //   1.  f(R)  = φ(R)        (boundary value continuous)
+    //   2.  f'(R) = φ'(R)       (boundary slope continuous, C¹)
+    //   3.  f'(0) = 0           (smooth peak at center — radial RBF)
+    // Solving:
+    //   rr2  = R² + ε²
+    //   rr32 = (R² + ε²)^(3/2)
+    //   c    = -Gqm / (2·rr32)                        (signed, < 0 for attractor)
+    //   a    = Gqm · (3R²/2 + ε²) / rr32              (signed)
+    // Inside the body |φ| has zero gradient at r=0 → body's apparent
+    // sag is O(Δr²)-invariant to sub-pixel position drift → no jitter.
+    //
+    // Precompute (a, c, R²) per body once; the hot pixel loop just
+    // does one squared-distance compare per (pixel, body) pair.
+    if (_quadCache.length < cnt * 3) {
+      _quadCache = new Float64Array(Math.max(cnt * 3, _quadCache.length * 2));
+    }
+    for (let k = 0; k < cnt; k++) {
+      const o = k * 4;
+      const Gqm = ents[o + 2];
+      const R = ents[o + 3];
+      const R2 = R * R;
+      const rr2 = R2 + eps2;
+      const rr32 = rr2 * Math.sqrt(rr2);
+      // R=0 (theoretical degenerate, doesn't occur today since
+      // _packFieldEntities skips absorbing bodies whose radius shrinks
+      // to 0): rr2 → eps2 > 0, so no div-by-zero. The quadratic branch
+      // condition `r2raw < R²=0` is then always false → coefficients
+      // computed but unused → falls through to Plummer for all pixels.
+      // Conservative, correct.
+      _quadCache[k * 3]     = Gqm * (1.5 * R2 + eps2) / rr32;   // a
+      _quadCache[k * 3 + 1] = -Gqm / (2 * rr32);                 // c
+      _quadCache[k * 3 + 2] = R2;                                // R²
+    }
     let idx = 0;
     for (let j = 0; j < _SAG_TEX_H; j++) {
       const y = (j + 0.5) * sy;
@@ -800,8 +862,17 @@ function _updateSagTexture() {
           const o = k * 4;
           const dx = x - ents[o];
           const dy = y - ents[o + 1];
-          const r2 = dx * dx + dy * dy + eps2;
-          phi += -ents[o + 2] / Math.sqrt(r2);
+          const r2raw = dx * dx + dy * dy;
+          const qo = k * 3;
+          const R2 = _quadCache[qo + 2];
+          if (r2raw < R2) {
+            // Inside body's collision radius → smooth quadratic.
+            // f(r) = -(a + c·r²), where r² is unsoftened (raw).
+            phi -= _quadCache[qo] + _quadCache[qo + 1] * r2raw;
+          } else {
+            // Outside → standard Plummer (with ε² softening).
+            phi += -ents[o + 2] / Math.sqrt(r2raw + eps2);
+          }
         }
         const phiAbs = phi < 0 ? -phi : phi;
         _sagPixels[idx++] = phiAbs * invG_vert;
@@ -875,17 +946,49 @@ function _rebuildGridWarpVerts() {
   // Last column gets no horizontal; last row gets no vertical.
   const numHorizontal = (cols - 1) * rows;
   const numVertical = cols * (rows - 1);
-  const idxCount = (numHorizontal + numVertical) * 2;
+  const segCount = numHorizontal + numVertical;
+  const idxCount = segCount * 2;
   _gridIndexCount = idxCount;
+  _gridSegCount   = segCount;
   // Use Uint32 — index counts can exceed 65535 (e.g. 80×60 = 4800 verts,
   // ~9500 line endpoints).
   const indices = new Uint32Array(idxCount);
+  // V11.2: parallel caches for painter's algorithm.
+  //   _gridIndexPairs   — (i0, i1) per segment, immutable, original order.
+  //   _gridSegMidWorld  — (mx, my) world-space midpoint, immutable.
+  //   _gridSortKeys     — per-frame screen-y midpoint (sort key).
+  //   _gridIndicesScratch — reorder destination uploaded each frame.
+  _gridIndexPairs     = new Uint32Array(segCount * 2);
+  _gridSegMidWorld    = new Float32Array(segCount * 2);
+  _gridSortKeys       = new Float32Array(segCount);
+  _gridIndicesScratch = new Uint32Array(idxCount);
+  _gridSortPerm       = new Array(segCount);
+  for (let s = 0; s < segCount; s++) _gridSortPerm[s] = s;
   let ii = 0;
+  let segIdx = 0;
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const v = r * cols + c;
-      if (c < cols - 1) { indices[ii++] = v; indices[ii++] = v + 1; }       // horizontal
-      if (r < rows - 1) { indices[ii++] = v; indices[ii++] = v + cols; }    // vertical
+      const vx = verts[v * 2];
+      const vy = verts[v * 2 + 1];
+      if (c < cols - 1) {
+        const vr = v + 1;
+        indices[ii++] = v;  indices[ii++] = vr;
+        _gridIndexPairs[segIdx * 2]     = v;
+        _gridIndexPairs[segIdx * 2 + 1] = vr;
+        _gridSegMidWorld[segIdx * 2]     = (vx + verts[vr * 2]) * 0.5;
+        _gridSegMidWorld[segIdx * 2 + 1] = (vy + verts[vr * 2 + 1]) * 0.5;
+        segIdx++;
+      }
+      if (r < rows - 1) {
+        const vd = v + cols;
+        indices[ii++] = v;  indices[ii++] = vd;
+        _gridIndexPairs[segIdx * 2]     = v;
+        _gridIndexPairs[segIdx * 2 + 1] = vd;
+        _gridSegMidWorld[segIdx * 2]     = (vx + verts[vd * 2]) * 0.5;
+        _gridSegMidWorld[segIdx * 2 + 1] = (vy + verts[vd * 2 + 1]) * 0.5;
+        segIdx++;
+      }
     }
   }
   if (!_bufGridVerts) _bufGridVerts = gl.createBuffer();
@@ -893,7 +996,11 @@ function _rebuildGridWarpVerts() {
   gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
   if (!_bufGridIndices) _bufGridIndices = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+  // V11.2: DYNAMIC_DRAW because the painter's-algorithm sort re-uploads
+  // a reordered version of this index buffer per frame when fieldStyle
+  // is 'rubber-sheet'. For other field styles the buffer stays at its
+  // original contents (no per-frame upload) — still safe with DYNAMIC.
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.DYNAMIC_DRAW);
 }
 
 // V9.2 particle-flow: CPU-side advection + additive-blended point sprites.
@@ -1174,6 +1281,81 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
   return _intensityRange;
 }
 
+// V11.2 painter's algorithm for the rubber-sheet mesh.
+// Goal: lines further into the scene (back) draw FIRST so foreground
+// lines overpaint them where they cross in screen space. Without
+// this, the static index order produces a uniform blend that loses
+// the front/back occlusion cue the user expects in oblique 3D.
+//
+// Approach: each segment has a static world-space midpoint (cached
+// in _gridSegMidWorld). Per frame, we bilinear-sample the CPU-side
+// _sagPixels at that midpoint, compute screen-y = world-y +
+// sag·cos(viewTilt), sort segment indices ascending (back = smaller
+// screen-y first), reorder _gridIndexPairs into _gridIndicesScratch,
+// and re-upload.
+//
+// Bilinear sampling on CPU mirrors what the GPU does via the R32F
+// texture's LINEAR filter, so the painter's sort uses the same
+// projected position the GPU will render at.
+//
+// Cost: O(S log S) sort with S ≈ 10k segments → ~1-2 ms. Only runs
+// in rubber-sheet mode; other modes use the static buffer.
+function _sortGridIndicesPainter() {
+  if (!_gl) return false;
+  if (_gridSegCount === 0) return false;
+  const seg = _gridSegCount;
+  const mid = _gridSegMidWorld;
+  const keys = _gridSortKeys;
+  const pixels = _sagPixels;
+  const W = _vpW;
+  const H = _vpH;
+  if (W <= 0 || H <= 0) return false;
+  const yFactor = _sagYFactor();
+  const TW = _SAG_TEX_W;
+  const TH = _SAG_TEX_H;
+  // Bilinear-sample the sag texture at each segment midpoint and
+  // compute screen-y. Off-viewport midpoints (negative or > viewport)
+  // sample via REPEAT (mod-then-clamp arithmetic mirrors gl.REPEAT).
+  for (let s = 0; s < seg; s++) {
+    const mx = mid[s * 2];
+    const my = mid[s * 2 + 1];
+    // World→tex coords. REPEAT: u = fract(mx/W) × TW.
+    // u, v are fract(…) ∈ [0,1) by construction, so fx ∈ [0,TW) and
+    // ix0 = fx|0 lands in [0, TW-1] — no extra clamp needed.
+    let u = (mx / W) - Math.floor(mx / W);   // [0, 1)
+    let v = (my / H) - Math.floor(my / H);
+    const fx = u * TW;
+    const fy = v * TH;
+    const ix0 = fx | 0;
+    const iy0 = fy | 0;
+    const ix1 = (ix0 + 1) % TW;     // REPEAT wrap to column 0 at right edge
+    const iy1 = (iy0 + 1) % TH;
+    const tx = fx - ix0;
+    const ty = fy - iy0;
+    const p00 = pixels[iy0 * TW + ix0];
+    const p10 = pixels[iy0 * TW + ix1];
+    const p01 = pixels[iy1 * TW + ix0];
+    const p11 = pixels[iy1 * TW + ix1];
+    const sag = (p00 * (1 - tx) + p10 * tx) * (1 - ty)
+              + (p01 * (1 - tx) + p11 * tx) * ty;
+    keys[s] = my + sag * yFactor;
+  }
+  // Sort segment indices ascending by screen-y midpoint (back first).
+  // _gridSortPerm holds the segment indices; we sort the array in
+  // place by comparator reading from keys.
+  const perm = _gridSortPerm;
+  perm.sort((a, b) => keys[a] - keys[b]);
+  // Materialize the reordered index pairs into the scratch buffer.
+  const src = _gridIndexPairs;
+  const dst = _gridIndicesScratch;
+  for (let s = 0; s < seg; s++) {
+    const srcSeg = perm[s];
+    dst[s * 2]     = src[srcSeg * 2];
+    dst[s * 2 + 1] = src[srcSeg * 2 + 1];
+  }
+  return true;
+}
+
 function _drawGridWarp() {
   const gl = _gl;
   if (!_progGridWarp || !_bufGridVerts || !_bufGridIndices) return;
@@ -1269,6 +1451,14 @@ function _drawGridWarp() {
   gl.enableVertexAttribArray(_progGridWarp.aPos);
   gl.vertexAttribPointer(_progGridWarp.aPos, 2, gl.FLOAT, false, 0, 0);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
+  // V11.2: painter's algorithm — only rubber-sheet mode (mode==2) has
+  // a real notion of front/back, so it's the only mode that re-uploads
+  // a per-frame sorted index buffer. Modes 0/1 use the build-time
+  // order (the buffer still holds those indices since the sort path
+  // never writes for non-rubber-sheet modes).
+  if (mode === 2 && _sagActive && _sortGridIndicesPainter()) {
+    gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, _gridIndicesScratch);
+  }
   gl.drawElements(gl.LINES, _gridIndexCount, gl.UNSIGNED_INT, 0);
   gl.disableVertexAttribArray(_progGridWarp.aPos);
 }
@@ -2097,7 +2287,10 @@ function _packFieldEntities() {
         _fieldEntityData[o]     = e.x + ox * W;
         _fieldEntityData[o + 1] = e.y + oy * H;
         _fieldEntityData[o + 2] = Gqm;
-        _fieldEntityData[o + 3] = 0;
+        // V11.2: slot 3 = body collision radius, consumed by
+        // _updateSagTexture for inside-radius quadratic interpolation.
+        // 0 was unused before; readers that only need (x,y,Gqm) ignore it.
+        _fieldEntityData[o + 3] = e.radius;
         _fieldEntityCount++;
       }
     }
