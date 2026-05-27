@@ -65,6 +65,17 @@ export const DEFAULTS_TUNING = Object.freeze({
   // roughly [10, 80].
   fieldLineSpacing: 30,
 
+  // V11.1 (2026-05-27): rubber-sheet viewing tilt angle in degrees.
+  //   90° = camera looks straight down (top-down); sag projects to
+  //         zero screen-Y offset — surface looks flat 2D.
+  //   45° = classic isometric-ish oblique (cos(45°) ≈ 0.707).
+  //   30° = strongly oblique (cos(30°) ≈ 0.866); wells lean further
+  //         into the screen-Y axis, more dramatic depth feel.
+  // The screen-Y offset applied to sag is cos(viewTilt) — see
+  // SAG_VS_HELPER in shaders.js. Only affects 'rubber-sheet' style;
+  // 2d / 3d / legacy / curvilinear modes ignore it.
+  viewTilt: 45,
+
   // Contact spring stiffness: angular natural frequency ω₀ for the
   // TGS-Soft contact constraint. Effective spring k = m·ω₀² (the F=kx
   // form the user asked for). Higher → snappier rebounds, faster
@@ -202,6 +213,7 @@ export const state = {
   contactStiffness:         DEFAULTS_TUNING.contactStiffness,
   fieldContrast:            DEFAULTS_TUNING.fieldContrast,
   fieldLineSpacing:         DEFAULTS_TUNING.fieldLineSpacing,
+  viewTilt:                 DEFAULTS_TUNING.viewTilt,
 
   // Canvas background color — toggled by the 深/浅 button.
   // '#0a0a0f' = dark default; '#ececf0' = near-white-gray light.

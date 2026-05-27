@@ -38,18 +38,23 @@ void main() {
 // effect (0 = flat / passthrough, 1 = apply oblique). uSagViewport
 // is the CSS-px viewport (W, H) used to map worldPx → uv.
 //
-// Projection: screen_y = world_y + sag * sin(45°). No global y-axis
-// compression — flat regions render unchanged; only the gravity wells
-// pull bodies + UI + trails downward visually. sin(45°) ≈ 0.7071.
+// Projection: screen_y = world_y + sag * cos(viewTilt). Renderer
+// supplies uSagYFactor = cos(state.viewTilt * π / 180), 0..1.
+//   viewTilt = 45° → factor ≈ 0.7071 (classic oblique, V11 default)
+//   viewTilt = 90° → factor = 0       (top-down: sag invisible, flat)
+//   viewTilt = 30° → factor ≈ 0.866   (strong oblique)
+// No global y-axis compression — flat regions render unchanged; only
+// the gravity wells pull bodies + UI + trails downward visually.
 const SAG_VS_HELPER = `
 uniform sampler2D uSagTex;
 uniform float uSagMode;
+uniform float uSagYFactor;
 uniform vec2 uSagViewport;
 vec2 sagProject(vec2 worldPx) {
   if (uSagMode < 0.5) return worldPx;
   vec2 uv = clamp(worldPx / uSagViewport, 0.0, 1.0);
   float sag = texture(uSagTex, uv).r;
-  return vec2(worldPx.x, worldPx.y + sag * 0.70710678);
+  return vec2(worldPx.x, worldPx.y + sag * uSagYFactor);
 }`;
 
 // ─── Trail FBO: decay pass ────────────────────────────────────────

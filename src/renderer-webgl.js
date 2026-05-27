@@ -445,6 +445,7 @@ function _initPrograms() {
     p.uSagTex      = gl.getUniformLocation(p.prog, 'uSagTex');
     p.uSagMode     = gl.getUniformLocation(p.prog, 'uSagMode');
     p.uSagViewport = gl.getUniformLocation(p.prog, 'uSagViewport');
+    p.uSagYFactor  = gl.getUniformLocation(p.prog, 'uSagYFactor');
   }
 }
 
@@ -454,6 +455,17 @@ function _initPrograms() {
 // the entity sprite texture binding in _drawEntities; safe to keep
 // sag in 1 for the whole frame).
 const _SAG_TEX_UNIT = 1;
+const _DEG_TO_RAD = Math.PI / 180;
+// Guarded cos(viewTilt): clamps to [30°, 90°] and substitutes the
+// default 45° if state.viewTilt is non-finite. Prevents a NaN from
+// any out-of-band mutation (URL preset, future serializer, …) from
+// turning every sag uniform into NaN and silently producing a black
+// or scrambled frame with no console error.
+function _sagYFactor() {
+  const t = state.viewTilt;
+  const safe = (Number.isFinite(t) && t >= 30 && t <= 90) ? t : 45;
+  return Math.cos(safe * _DEG_TO_RAD);
+}
 function _bindSagUniforms(prog) {
   if (!_gl) return;
   const gl = _gl;
@@ -462,6 +474,10 @@ function _bindSagUniforms(prog) {
   gl.uniform1i(prog.uSagTex, _SAG_TEX_UNIT);
   gl.uniform1f(prog.uSagMode, _sagActive ? 1.0 : 0.0);
   gl.uniform2f(prog.uSagViewport, _vpW, _vpH);
+  // V11.1: uSagYFactor = cos(viewTilt) — projection factor for sag
+  // onto screen-Y. viewTilt is in degrees, 30°..90° via UI slider.
+  // 90° → 0 (top-down flat), 45° → 0.707 (default), 30° → 0.866.
+  gl.uniform1f(prog.uSagYFactor, _sagYFactor());
   gl.activeTexture(gl.TEXTURE0);   // restore default
 }
 
@@ -1067,16 +1083,22 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
   }
   // V11 rubber-sheet (mode 2): sag-texture pixels encode absolute
   // CSS-px sag = |φ|/G_vert (no clamp, no normalization). The mesh VS
-  // outputs vIntensity = sag · sin(45°), so the range is sin(45°) ×
-  // { min, max } of _sagPixels. Scanning the 256×256 buffer is ~65k
-  // px / frame, hot in L1, sub-ms. Gives a scene-relative brightness
-  // ramp that moves with the deepest live well. NB: the
-  // `_fieldEntityCount === 0` early-return above is load-bearing for
-  // this branch — without it, the scan would run on a zero-filled
-  // buffer and produce a max=0 range, breaking the smoothstep
-  // degenerate guard in _drawGridWarp.
+  // outputs vIntensity = sag · cos(viewTilt), so the range is the
+  // shared cos(viewTilt) factor × { min, max } of _sagPixels (see
+  // SAG_VS_HELPER in shaders.js and _sagYFactor() above). Scanning
+  // the 256×256 buffer is ~65k px / frame, hot in L1, sub-ms. Gives a
+  // scene-relative brightness ramp that moves with the deepest live
+  // well. NB: the `_fieldEntityCount === 0` early-return above is
+  // load-bearing for this branch — without it, the scan would run on
+  // a zero-filled buffer and produce a max=0 range, breaking the
+  // smoothstep degenerate guard in _drawGridWarp.
   if (mode === 2) {
-    const SIN45 = 0.70710678;
+    // V11.1: brightness ramp tracks the visible projected depth, via
+    // the SAME guarded helper the uniform-bind uses — so any view-tilt
+    // change is reflected here in lockstep. At viewTilt=90° this
+    // collapses to 0 and the smoothstep degenerate guard in
+    // _drawGridWarp takes over.
+    const yFactor = _sagYFactor();
     let mn = Infinity, mx = 0;
     const N = _sagPixels.length;
     for (let i = 0; i < N; i++) {
@@ -1084,8 +1106,8 @@ function _computeFieldIntensityRange(mode, dispScale, epsilon) {
       if (v < mn) mn = v;
       if (v > mx) mx = v;
     }
-    _intensityRange.min = (mn === Infinity ? 0 : mn) * SIN45;
-    _intensityRange.max = mx * SIN45;
+    _intensityRange.min = (mn === Infinity ? 0 : mn) * yFactor;
+    _intensityRange.max = mx * yFactor;
     return _intensityRange;
   }
   const ents = _fieldEntityData;
