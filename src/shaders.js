@@ -761,6 +761,128 @@ void main() {
 }`,
 };
 
+// ─── V12 rubber-sheet — full-screen fragment-shader pass ──────────
+// User pivoted away from the indexed-LINE mesh approach (V11) because
+// the 15% viewport-expansion "skirt" remained a finite-extent band-aid:
+// under heavy mass / many bodies the mesh-skirt stretched enough that
+// the viewport edge re-emerged. After 4 parallel research agents + 3
+// architect/critic rounds, the chosen path is PATH B: a single full-
+// screen quad whose fragment shader computes world coords per pixel
+// via single-step forward-warp:
+//   screenPx = vUv * viewport
+//   sag      = sample(uSagTex, screenPx / viewport)
+//   worldPx  = (screenPx.x, screenPx.y - sag · yFactor)
+// and draws grid lines in world space via Made-by-Evan's fwidth-AA
+// pattern. Boundary-free by construction (no mesh = no skirt = no
+// finite extent). In wrap mode the sag texture is toroidal (9-ghost
+// pack in _packFieldEntities), so fract(uv) sampling at any screen
+// position gives a valid sag value. In bounded mode clamp at the
+// viewport edge — sag freezes at edge-row value, no visible artifact.
+//
+// Visual gestalt trade-off (R1's known issue): lines bend AROUND
+// wells rather than diving INTO them. The forward-warp is single-
+// valued by construction; an inverse warp would be multi-valued at
+// deep wells (folding) and any inverse-style approach (Newton, LUT,
+// hybrid) flickers at the fold rim. User explicitly accepted this
+// trade-off after seeing the option list. Lines drape over the rim
+// of wells like a true rubber sheet would — physically defensible.
+//
+// Depth fade: dimmer where sag is deeper, used as a soft proxy for
+// painter-style occlusion. uContrastFloor controls how dark the
+// deepest wells render (slider semantic: 0 = no dimming, 1 = max).
+//
+// Used ONLY for state.fieldStyle === 'rubber-sheet'. Modes '2d' and
+// '3d' continue to use the mesh-based GRID_WARP program unchanged.
+export const RUBBER_SHEET_FS = {
+  VS: VS_FULLSCREEN,                   // vUv ∈ [0,1]² covers the viewport
+  FS: `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uSagTex;             // 256² R32F, REPEAT-wrap
+uniform vec2  uViewport;               // (vpW, vpH) in CSS-px
+uniform float uSagYFactor;             // cos(viewTilt) ∈ [0, 0.866]
+uniform float uSagWrap;                // 1.0 wrap (fract uv), 0.0 bounded (clamp uv)
+uniform float uCellPx;                 // grid cell spacing in world-space CSS-px
+uniform vec4  uColor;                  // RGBA grid color
+uniform float uContrastFloor;          // 1 - state.fieldContrast, depth-fade floor
+uniform float uMaxSag;                 // max(_sagPixels) (raw, pre-yFactor) — for normalization
+out vec4 outColor;
+
+vec2 sagUV(vec2 worldPx) {
+  vec2 raw = worldPx / uViewport;
+  // +1.0 before fract guards against negative raw (e.g. world_y < 0
+  // in the inverse-warp output below). fract is C0-continuous because
+  // the sag texture is REPEAT-wrap with toroidal 9-ghost content in
+  // wrap mode. In bounded mode just clamp to [0, 1] — no ghosts,
+  // edge-row sag is the only physically meaningful boundary value.
+  return (uSagWrap > 0.5) ? fract(raw + 1.0) : clamp(raw, 0.0, 1.0);
+}
+
+float sagAt(vec2 worldPx) {
+  return texture(uSagTex, sagUV(worldPx)).r;
+}
+
+void main() {
+  // Each fragment's "screen" position in CSS-px (the canvas pixel it
+  // covers). vUv is [0,1] over the viewport, so vUv*viewport = px.
+  vec2 screenPx = vUv * uViewport;
+
+  // Single-step forward-warp inverse. The forward projection is
+  //   screen_y = world_y + sag(world_x, world_y) · yFactor
+  // The single-step approximation samples sag at the screen position
+  // (not the true world position) — sub-pixel accurate when sag is
+  // shallow, slightly off near deep-well centers. The visual gestalt
+  // (lines bend around wells) is the documented trade-off. Choosing
+  // this over Newton iteration because Newton diverges where sag is
+  // multi-valued (fold-over near deep wells), which is the exact
+  // visual region we want to render correctly.
+  float sag = sagAt(screenPx);
+  vec2 worldPx = vec2(screenPx.x, screenPx.y - sag * uSagYFactor);
+
+  // Grid line coverage via Made-by-Evan / Inigo Quilez fwidth-AA.
+  //   uvW = worldPx / cellPx → integer values at grid lines
+  //   abs(fract(uvW - 0.5) - 0.5) is sawtooth peaking at 0.5 mid-cell,
+  //   zero at grid lines (uvW = integer).
+  //   Dividing by fwidth gives screen-px distance to nearest line.
+  //   1 - clamp(min(d.x, d.y), 0, 1) is line coverage: 1 at line,
+  //   linearly falling to 0 within one fragment-quad of derivative.
+  vec2 uvW = worldPx / uCellPx;
+  vec2 fw = max(fwidth(uvW), vec2(1e-6));
+  vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
+  float lineDist = min(g.x, g.y);
+  // Line coverage with smooth AA across ~2 backing-px. smoothstep
+  // (0.5, 1.5, lineDist) gives full coverage where lineDist ≤ 0.5
+  // fragment-units, smooth fade to 0 at lineDist = 1.5. Result: a
+  // 1-fragment-bright core + 1-fragment AA tail on each side =
+  // visually ~2-3 backing-px wide line. Wider lines than the
+  // canonical 1-fragment Made-by-Evan pattern, but more legible on
+  // hi-DPR displays where 1 backing-px is sub-pixel-visible.
+  float line = 1.0 - smoothstep(0.5, 1.5, lineDist);
+
+  // Early discard for non-line fragments. Saves ~95% of the depth
+  // fade math for typical line widths. Without this, the alpha-blend
+  // path still has to do per-fragment work even where line ≈ 0.
+  if (line < 0.01) discard;
+
+  // Depth fade: replaces V11.2's painter's algorithm sort. The painter
+  // sort darkened lines occluded by foreground geometry — here we use
+  // sag amplitude as a proxy: deeper sag → dimmer line. Not bit-
+  // equivalent to painter sort (back rims and front rims of the same
+  // well dim equally), but it gives the same "you are above, the well
+  // is below" visual cue and avoids the painter-sort's per-frame CPU
+  // cost (~1-2 ms for the segment sort).
+  //   uMaxSag is the per-frame peak sag (raw, before yFactor).
+  //   Normalizing by uMaxSag keeps the dynamic range adapted to the
+  //   scene — flat scenes get no dimming, deep scenes get the full
+  //   1.0 → uContrastFloor ramp. The 0.5 floor for uMaxSag avoids
+  //   divide-by-tiny in nearly-empty scenes.
+  float depthFactor = clamp(sag / max(uMaxSag, 0.5), 0.0, 1.0);
+  float brightness = mix(1.0, uContrastFloor, depthFactor);
+
+  outColor = vec4(uColor.rgb * brightness, uColor.a * line);
+}`,
+};
+
 // --- Particle flow (sparse luminous overlay on 2D grid warp) -----------
 // Renders glowing point sprites advected along the gravitational force
 // field. Particle positions are computed on the CPU each frame (cheap at

@@ -66,7 +66,7 @@ import { resolveDisplayColor } from './entities.js';
 import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
-  EQUIPOTENTIAL, STREAMLINE, GRID_WARP, PARTICLE_FLOW,
+  EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
 } from './shaders.js';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
@@ -97,6 +97,13 @@ let _progStreamline = null;
 // V9.2 (2026-05-26): grid-warp field viz. Replaces _progEquipotential
 // as the default; _progEquipotential is kept compiled for ?field=legacy.
 let _progGridWarp = null;
+// V12 (2026-05-28): full-screen fragment-shader rubber-sheet renderer.
+// Replaces the GRID_WARP indexed-LINE mesh for state.fieldStyle ===
+// 'rubber-sheet' specifically. Modes '2d' and '3d' continue to use
+// _progGridWarp unchanged. No mesh = no finite extent = no boundary
+// visible at any warp magnitude (the original V200 skirt's hard limit).
+// See shaders.js RUBBER_SHEET_FS for the full design rationale.
+let _progRubberSheetFS = null;
 let _bufGridVerts = null;
 let _bufGridIndices = null;
 let _gridVertexCount = 0;
@@ -290,6 +297,7 @@ export function initWebGL(canvas) {
     _progTrailDecay = _progTrailBlit = _progTrailDot = _progEntity = null;
     _progCircleFill = _progCircleRing = _progLineSeg = null;
     _progEquipotential = _progStreamline = null;
+    _progGridWarp = _progRubberSheetFS = _progParticleFlow = null;
     _bufFsQuad = _bufUnitQuad = _bufEntityCornerQuad = null;
     _bufInstanceTrail = _bufInstanceEntity = null;
     _bufInstanceCircleFill = _bufInstanceCircleRing = _bufInstanceLineSeg = null;
@@ -434,6 +442,22 @@ function _initPrograms() {
   _progGridWarp.uIntensityMax  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMax');
   _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
   _progGridWarp.uCellPx        = gl.getUniformLocation(_progGridWarp.prog, 'uCellPx');
+
+  // V12 (2026-05-28): full-screen FS rubber-sheet renderer. Shares the
+  // VS_FULLSCREEN VAO (_vaoFsQuad) with the trail-decay/blit programs.
+  // See shaders.js RUBBER_SHEET_FS for the chosen-technique rationale
+  // and shader source. Used only for state.fieldStyle === 'rubber-sheet';
+  // modes '2d'/'3d' continue to dispatch the mesh GRID_WARP program.
+  _progRubberSheetFS = _makeProgram(RUBBER_SHEET_FS.VS, RUBBER_SHEET_FS.FS);
+  _progRubberSheetFS.aPos           = gl.getAttribLocation(_progRubberSheetFS.prog, 'aPos');
+  _progRubberSheetFS.uSagTex        = gl.getUniformLocation(_progRubberSheetFS.prog, 'uSagTex');
+  _progRubberSheetFS.uViewport      = gl.getUniformLocation(_progRubberSheetFS.prog, 'uViewport');
+  _progRubberSheetFS.uSagYFactor    = gl.getUniformLocation(_progRubberSheetFS.prog, 'uSagYFactor');
+  _progRubberSheetFS.uSagWrap       = gl.getUniformLocation(_progRubberSheetFS.prog, 'uSagWrap');
+  _progRubberSheetFS.uCellPx        = gl.getUniformLocation(_progRubberSheetFS.prog, 'uCellPx');
+  _progRubberSheetFS.uColor         = gl.getUniformLocation(_progRubberSheetFS.prog, 'uColor');
+  _progRubberSheetFS.uContrastFloor = gl.getUniformLocation(_progRubberSheetFS.prog, 'uContrastFloor');
+  _progRubberSheetFS.uMaxSag        = gl.getUniformLocation(_progRubberSheetFS.prog, 'uMaxSag');
 
   // V9.2 particle-flow program (companion overlay).
   _progParticleFlow = _makeProgram(PARTICLE_FLOW.VS, PARTICLE_FLOW.FS);
@@ -1200,6 +1224,11 @@ const _intensityRange = { min: 0, max: 0 };
 // Computed in prepareFrameRenderer after _updateSagTexture; 0 when
 // _sagActive is false (any non-rubber-sheet field style or field off).
 let _maxSagY = 0;
+// V12 (2026-05-28): same scan, kept in RAW (pre-yFactor) form for the
+// RUBBER_SHEET_FS depth-fade normalization. The FS multiplies by yFactor
+// internally for projection; we need the raw sag amplitude to scale the
+// brightness ramp. Set to 0 when sag is off (same lifecycle as _maxSagY).
+let _maxSagRaw = 0;
 function _computeFieldIntensityRange(mode, dispScale, epsilon) {
   if (_fieldEntityCount === 0) {
     _intensityRange.min = 0;
@@ -1376,18 +1405,23 @@ function _sortGridIndicesPainter() {
 
 function _drawGridWarp() {
   const gl = _gl;
+  // V12 (2026-05-28): rubber-sheet now uses a full-screen FS pass
+  // (_drawRubberSheetFS) instead of the indexed-LINE mesh. Dispatch
+  // here BEFORE the mesh-validity guard below so an uninitialized
+  // mesh doesn't block the FS path. Modes '2d'/'3d' still use the
+  // mesh path unchanged.
+  if (state.fieldStyle === 'rubber-sheet') {
+    _drawRubberSheetFS();
+    return;
+  }
   if (!_progGridWarp || !_bufGridVerts || !_bufGridIndices) return;
   if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
   // mode dispatch:
   //   0 = legacy 3D oblique (per-vertex φ, saturates at depth clamp)
   //   1 = 2D in-plane warp
-  //   2 = V10 rubber-sheet — sample the per-frame normalized sag texture
-  //       so the mesh dips into wells in lockstep with bodies / trails /
-  //       UI. Replaces (and supersedes) the broken legacy 3D path for
-  //       any modern fieldStyle='rubber-sheet'.
+  //   (mode == 2 / rubber-sheet now handled by _drawRubberSheetFS above)
   const mode =
       (state.fieldStyle === '2d') ? 1
-    : (state.fieldStyle === 'rubber-sheet') ? 2
     : 0;
   // Displacement scale tuned so the 2D in-plane warp matches the
   // mockup_2d.py reference visually: cap=28 px saturates within
@@ -1479,6 +1513,76 @@ function _drawGridWarp() {
   }
   gl.drawElements(gl.LINES, _gridIndexCount, gl.UNSIGNED_INT, 0);
   gl.disableVertexAttribArray(_progGridWarp.aPos);
+}
+
+// V12 (2026-05-28): rubber-sheet renderer via full-screen FS pass.
+// User pivoted away from V11's indexed-LINE mesh after determining the
+// 15% viewport-expansion "skirt" couldn't keep up with heavy warps —
+// dense scenes stretched the mesh enough that the finite extent re-
+// emerged at the viewport edge.
+//
+// Approach: a single full-screen quad runs the RUBBER_SHEET_FS program.
+// Each fragment treats its screen-px position as world-x, samples the
+// sag texture there, and subtracts sag·yFactor from screen-y to obtain
+// its world-y (single-step forward-warp). Grid coverage is then
+// computed in world space via fwidth-AA against fract(uvW - 0.5). No
+// mesh, no skirt — there is no finite extent that could leak. In wrap
+// mode the sag texture is toroidal (9-ghost pack); fract(uv) sampling
+// continues across the seam without discontinuity.
+//
+// Cost: 1 sag texture fetch + ~10 ALU ops per fragment. Discard on
+// non-line fragments drops most of the work. ~0.5 ms on iGPU at
+// 1440×900. Cheaper than V11 mesh pipeline (~1.5 ms with painter sort).
+//
+// Dispatched from _drawGridWarp's top branch when state.fieldStyle ===
+// 'rubber-sheet'. Modes '2d' and '3d' still use _drawGridWarp's mesh.
+const RUBBER_SHEET_COLOR = GRID_WARP_COLOR_3D;
+function _drawRubberSheetFS() {
+  if (!_gl || !_progRubberSheetFS) return;
+  if (_vpW <= 0 || _vpH <= 0) return;
+  const gl = _gl;
+
+  gl.enable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.useProgram(_progRubberSheetFS.prog);
+  gl.uniform2f(_progRubberSheetFS.uViewport, _vpW, _vpH);
+  // Bind the per-frame sag texture (R32F, REPEAT-wrap). The FS samples
+  // it via sagUV() which selects fract (wrap) or clamp (bounded) per
+  // state.boundaryMode — same convention SAG_VS_HELPER uses for bodies/
+  // trails so visual consistency is automatic.
+  gl.activeTexture(gl.TEXTURE0 + _SAG_TEX_UNIT);
+  gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
+  gl.uniform1i(_progRubberSheetFS.uSagTex, _SAG_TEX_UNIT);
+  gl.uniform1f(_progRubberSheetFS.uSagYFactor, _sagYFactor());
+  gl.uniform1f(_progRubberSheetFS.uSagWrap, state.boundaryMode === 'wrap' ? 1.0 : 0.0);
+  // Cell spacing comes from the same source as the V11 mesh (user-
+  // controlled state.fieldLineSpacing slider, range 12-80 px). Using
+  // it directly here keeps slider behavior visually consistent across
+  // mesh ↔ FS path.
+  gl.uniform1f(_progRubberSheetFS.uCellPx, Math.max(8, state.fieldLineSpacing));
+  gl.uniform4f(_progRubberSheetFS.uColor,
+    RUBBER_SHEET_COLOR[0], RUBBER_SHEET_COLOR[1],
+    RUBBER_SHEET_COLOR[2], RUBBER_SHEET_COLOR[3]);
+  // Contrast slider: state.fieldContrast 0..1, floor = 1 - contrast.
+  // Same semantic as the V11 mesh path — preserved across the swap.
+  gl.uniform1f(_progRubberSheetFS.uContrastFloor, 1 - state.fieldContrast);
+  // Per-frame peak sag (raw, pre-yFactor) — drives the depth-fade
+  // dynamic range. _maxSagRaw is set in prepareFrameRenderer next to
+  // the V11.4 _maxSagY (same scan, two outputs). 0 when sag is off,
+  // which makes the FS's depthFactor degenerate to 0 → brightness 1.
+  gl.uniform1f(_progRubberSheetFS.uMaxSag, _maxSagRaw);
+  gl.activeTexture(gl.TEXTURE0);   // restore default
+
+  // Use the shared fullscreen-quad VAO (location-0 attrib pointer at
+  // _bufFsQuad). RUBBER_SHEET_FS.VS === VS_FULLSCREEN, so the same
+  // VAO that decay/blit use works here unchanged.
+  gl.bindVertexArray(_vaoFsQuad);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindVertexArray(null);
+
+  gl.disable(gl.BLEND);
 }
 
 // V9.9 curvilinear mode: render gravitational geodesics as polylines.
@@ -2369,9 +2473,11 @@ export function prepareFrameRenderer() {
       if (v > mx) mx = v;
     }
     _maxSagY = mx * _sagYFactor();
+    _maxSagRaw = mx;
   } else {
     _sagActive = false;
     _maxSagY = 0;
+    _maxSagRaw = 0;
   }
 }
 
@@ -2398,7 +2504,11 @@ export function drawField() {
   // prepareFrameRenderer for the sag texture; safe to repack here as
   // it's idempotent given the same state).
   _packFieldEntities();
-  if (_fieldEntityCount === 0) return;       // empty scene → nothing to draw
+  // V12 (2026-05-28): rubber-sheet FS path renders a flat grid even when
+  // the scene is empty (no bodies = no warp → straight grid lines). The
+  // mesh paths (curvilinear/legacy/2d/3d) still early-out because their
+  // CPU uniform uploads + N-body inner loops are wasted with no bodies.
+  if (_fieldEntityCount === 0 && state.fieldStyle !== 'rubber-sheet') return;
 
   // Common GL state for both passes.
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
