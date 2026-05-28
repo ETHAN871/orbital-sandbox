@@ -461,6 +461,7 @@ function _initPrograms() {
     p.uSagMode     = gl.getUniformLocation(p.prog, 'uSagMode');
     p.uSagViewport = gl.getUniformLocation(p.prog, 'uSagViewport');
     p.uSagYFactor  = gl.getUniformLocation(p.prog, 'uSagYFactor');
+    p.uSagWrap     = gl.getUniformLocation(p.prog, 'uSagWrap');
   }
 }
 
@@ -493,6 +494,14 @@ function _bindSagUniforms(prog) {
   // onto screen-Y. viewTilt is in degrees, 30°..90° via UI slider.
   // 90° → 0 (top-down flat), 45° → 0.707 (default), 30° → 0.866.
   gl.uniform1f(prog.uSagYFactor, _sagYFactor());
+  // V11.3: uSagWrap selects fract (wrap) vs clamp (bounded) UV sampling.
+  // _packFieldEntities packs 9 ghosts ONLY in wrap mode, so the sag
+  // texture is toroidally correct only in wrap mode — fract sampling
+  // is then valid and gives continuous sag at world edges and across
+  // the GRID_EXPAND_FRAC mesh skirt. In bounded mode the texture's
+  // content outside the viewport is meaningless, so we clamp to the
+  // edge row (no regression vs pre-V11.3 behavior).
+  gl.uniform1f(prog.uSagWrap, state.boundaryMode === 'wrap' ? 1.0 : 0.0);
   gl.activeTexture(gl.TEXTURE0);   // restore default
 }
 

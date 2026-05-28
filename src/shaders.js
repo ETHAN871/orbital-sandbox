@@ -45,14 +45,33 @@ void main() {
 //   viewTilt = 30° → factor ≈ 0.866   (strong oblique)
 // No global y-axis compression — flat regions render unchanged; only
 // the gravity wells pull bodies + UI + trails downward visually.
+// V11.3 (2026-05-28): mode-aware UV. uSagWrap selects between:
+//   uSagWrap = 1 → fract(uv)  (wrap-boundary: 9-ghost pack in
+//                              _packFieldEntities makes the texture
+//                              toroidally correct, so fract sampling
+//                              + gl.REPEAT on the texture gives
+//                              continuous sag across world edges and
+//                              the GRID_EXPAND_FRAC mesh skirt).
+//   uSagWrap = 0 → clamp(uv)  (bounded: world truly ends at the
+//                              viewport. CPU bake has no ghosts, so
+//                              fract would mirror in-viewport content
+//                              into the skirt → phantom wells. Clamp
+//                              freezes the skirt at edge-row sag —
+//                              today's behavior, no regression).
+// The previous unconditional clamp killed wrap-aware sampling for
+// every ghost copy (e.g. body mirror at worldPx.y = H+0.5) and for
+// every mesh vertex outside the viewport in wrap mode — symptom: 1-3
+// px leap as bodies cross the seam.
 const SAG_VS_HELPER = `
 uniform sampler2D uSagTex;
 uniform float uSagMode;
 uniform float uSagYFactor;
+uniform float uSagWrap;
 uniform vec2 uSagViewport;
 vec2 sagProject(vec2 worldPx) {
   if (uSagMode < 0.5) return worldPx;
-  vec2 uv = clamp(worldPx / uSagViewport, 0.0, 1.0);
+  vec2 raw = worldPx / uSagViewport;
+  vec2 uv = (uSagWrap > 0.5) ? fract(raw) : clamp(raw, 0.0, 1.0);
   float sag = texture(uSagTex, uv).r;
   return vec2(worldPx.x, worldPx.y + sag * uSagYFactor);
 }`;
