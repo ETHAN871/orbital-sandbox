@@ -1191,6 +1191,15 @@ let _intensityModePrev = -1;   // detect 2D↔3D switch → reset EMA seed
 // Scratch returned by _computeFieldIntensityRange — reused each
 // frame to avoid GC churn from allocating a fresh {min, max}.
 const _intensityRange = { min: 0, max: 0 };
+// V11.4 (2026-05-28): cache the peak screen-Y offset added by the sag
+// projection on this frame, so _drawEntities can widen the wrap-mode
+// ghost-spawn threshold accordingly. With rubber-sheet ON, a body
+// sprite renders at screen_y = world_y + sag·yFactor, so a wrap-mirror
+// ghost is visible on canvas for a band of width (sprite._ox + _maxSagY)
+// from each Y-edge — wider than the original sprite-only threshold.
+// Computed in prepareFrameRenderer after _updateSagTexture; 0 when
+// _sagActive is false (any non-rubber-sheet field style or field off).
+let _maxSagY = 0;
 function _computeFieldIntensityRange(mode, dispScale, epsilon) {
   if (_fieldEntityCount === 0) {
     _intensityRange.min = 0;
@@ -1773,6 +1782,13 @@ export function updateTrailCanvas(simDeltaTime) {
     // V10.3: trail dot at raw world coords; the trail-dot VS's
     // sagProject samples the same sag texture as the mesh / body,
     // so the dot lands exactly under the body that drew it.
+    // TODO(v11.5): trail dots emit no wrap-mirror copies, unlike body
+    // sprites (see _drawEntities's wrap block). In rubber-sheet + wrap
+    // mode the dot drawn just after a body wraps lands at
+    // screen_y ≈ +sag·yFactor (up to ~84 px below the top edge) with
+    // no mirror on the opposite side. Visually subtle because the
+    // trail FBO is a phosphor-decay accumulator — a single missed dot
+    // smears into neighbors within ~2 frames. Acceptable for V11.4.
     _trailInstanceData[o]     = e.x;
     _trailInstanceData[o + 1] = e.y;
     _trailInstanceData[o + 2] = rgb[0];
@@ -1884,11 +1900,22 @@ function _drawEntities() {
       // would cause the pinned-ring / AA edge to clip at the wrap boundary
       // even though the mirror copy hasn't been spawned yet. `sprite._ox`
       // (= sprite.width / 2) is exactly the half-extent we need.
-      const r = sprite._ox;
-      const nearLeft   = e.x < r;
-      const nearRight  = e.x > W - r;
-      const nearTop    = e.y < r;
-      const nearBottom = e.y > H - r;
+      //
+      // V11.4 (2026-05-28): split X and Y thresholds. With rubber-sheet
+      // sag ON, a body sprite renders at screen_y = world_y + sag·yFactor
+      // (see SAG_VS_HELPER in shaders.js). When the body sits near the
+      // top edge, its sprite can extend up to `_maxSagY` (the frame's
+      // peak projected offset) below the body center on screen. So the
+      // wrap-mirror needs to spawn whenever world_y is within
+      // (sprite._ox + _maxSagY) of the edge — wider than the X-axis,
+      // which has no projection. _maxSagY = 0 when sag is off, restoring
+      // the old single-`r` behavior for the non-rubber-sheet path.
+      const rX = sprite._ox;
+      const rY = sprite._ox + _maxSagY;
+      const nearLeft   = e.x < rX;
+      const nearRight  = e.x > W - rX;
+      const nearTop    = e.y < rY;
+      const nearBottom = e.y > H - rY;
       if (nearLeft)   arr.push(e.x + W, e.y, 1);
       if (nearRight)  arr.push(e.x - W, e.y, 1);
       if (nearTop)    arr.push(e.x, e.y + H, 1);
@@ -2317,8 +2344,34 @@ export function prepareFrameRenderer() {
     _packFieldEntities();
     _updateSagTexture();
     _sagActive = true;
+    // V11.4 (2026-05-28): scan _sagPixels for the peak sag value, then
+    // multiply by the cos(viewTilt) factor to get the maximum screen-Y
+    // offset the sag projection adds this frame. _drawEntities uses this
+    // to widen the wrap-mode ghost-spawn threshold on the Y axis so a
+    // body whose visible sprite sits at world_y + max_sag·yFactor still
+    // gets a mirror copy spawned in time when it nears the top/bottom
+    // edge. Without this, bodies disappear for ~0.4 s after wrapping in
+    // rubber-sheet mode because the wrap teleport happens at world_y=0
+    // while the sprite is still drawn at screen_y ≈ 84 px (sag tail) —
+    // far outside the old `sprite._ox` (~24 px) ghost-spawn band.
+    //
+    // Cost: ~65 k pass over the L1-hot Float32Array, < 0.5 ms. This is
+    // a *second* scan of _sagPixels (the first happens inside
+    // _computeFieldIntensityRange's mode==2 branch during drawField),
+    // because that call sits later in the frame than _drawEntities. The
+    // two could be fused by either tracking max inline in
+    // _updateSagTexture or running _computeFieldIntensityRange earlier,
+    // but the win is sub-ms and not worth the ordering refactor today.
+    let mx = 0;
+    const N = _sagPixels.length;
+    for (let i = 0; i < N; i++) {
+      const v = _sagPixels[i];
+      if (v > mx) mx = v;
+    }
+    _maxSagY = mx * _sagYFactor();
   } else {
     _sagActive = false;
+    _maxSagY = 0;
   }
 }
 
