@@ -459,6 +459,7 @@ function _initPrograms() {
   _progScreenDent.uWarpGain      = gl.getUniformLocation(_progScreenDent.prog, 'uWarpGain');
   _progScreenDent.uSlope         = gl.getUniformLocation(_progScreenDent.prog, 'uSlope');
   _progScreenDent.uAmbient       = gl.getUniformLocation(_progScreenDent.prog, 'uAmbient');
+  _progScreenDent.uContrast      = gl.getUniformLocation(_progScreenDent.prog, 'uContrast');
   _progScreenDent.uCellPx        = gl.getUniformLocation(_progScreenDent.prog, 'uCellPx');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
@@ -1429,6 +1430,7 @@ function _sortGridIndicesPainter() {
 const _MEMBRANE_CORE_FRAC = 0.08;    // well core radius = CORE_FRAC · min(vp); larger = wider
 const _MEMBRANE_SLOPE_K   = 2.2;     // ∇h→normal scale (× core); larger = stronger relief
 const _MEMBRANE_WARP_K    = 0.8;     // grid-pinch gain (×, kept below fold)
+const _MEMBRANE_AMBIENT   = 0.45;    // base z-ambient relief floor (slope darkening)
 const _MEMBRANE_COLOR     = [0.82, 0.86, 0.94];   // cool grayscale membrane tint
 function _drawScreenDent() {
   const gl = _gl;
@@ -1448,9 +1450,10 @@ function _drawScreenDent() {
   //   / (r²+core²) with heightK = core²/maxWeight peaks at 1 per body.
   const heightK = maxWeight > 0 ? core2 / maxWeight : 0;
   const warpGain = maxWeight > 0 ? (_MEMBRANE_WARP_K * core2) / maxWeight : 0;
-  // contrast slider → ambient floor (shadow depth). High contrast = low
-  // ambient = deep shadows; contrast 0 = flat lighting.
-  const ambient = 0.55 - 0.45 * Math.min(1, Math.max(0, state.fieldContrast));
+  // Fixed base z-ambient relief floor; the contrast slider now drives the
+  // 45° directional highlight/shadow group instead (uContrast in the FS).
+  const ambient = _MEMBRANE_AMBIENT;
+  const contrast = Math.min(1, Math.max(0, state.fieldContrast));
 
   gl.useProgram(_progScreenDent.prog);
   gl.uniform2f(_progScreenDent.uViewport, _vpW, _vpH);
@@ -1461,6 +1464,7 @@ function _drawScreenDent() {
   gl.uniform1f(_progScreenDent.uWarpGain, warpGain);
   gl.uniform1f(_progScreenDent.uSlope, core * _MEMBRANE_SLOPE_K);
   gl.uniform1f(_progScreenDent.uAmbient, ambient);
+  gl.uniform1f(_progScreenDent.uContrast, contrast);
   gl.uniform1f(_progScreenDent.uCellPx, Math.max(8, state.fieldLineSpacing));
   gl.uniform4f(_progScreenDent.uColor,
     _MEMBRANE_COLOR[0], _MEMBRANE_COLOR[1], _MEMBRANE_COLOR[2], 1.0);

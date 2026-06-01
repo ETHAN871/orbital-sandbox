@@ -798,7 +798,8 @@ uniform float uHeightK;              // sag amplitude (= core²/maxWeight, norma
 uniform float uCore2;                // softening² (px²): well core size
 uniform float uWarpGain;             // grid-pinch gain (kept below fold)
 uniform float uSlope;                // ∇h→normal scale (relief strength)
-uniform float uAmbient;              // ambient floor (shadow depth)
+uniform float uAmbient;              // base z-ambient relief floor (fixed)
+uniform float uContrast;             // 45° highlight/shadow group strength (slider)
 uniform float uCellPx;               // grid spacing (px)
 uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
@@ -825,10 +826,21 @@ void main() {
   // Surface normal of the dipping sheet (z = -h). Matte Lambert diffuse
   // against a 45°-elevation point light from the upper-left.
   vec3 N = normalize(vec3(grad * uSlope, 1.0));
-  // Ambient light straight down the +z axis: brightness = N·(+z) = N.z.
-  // Flat membrane (N = +z) is brightest; well slopes tilt away → darker,
-  // symmetrically (no directional point light, no cast shadow).
-  float gray = uAmbient + (1.0 - uAmbient) * N.z;
+  // Base: z-axis ambient relief. Flat (N=+z) = 1, slopes dip to uAmbient.
+  float base = mix(uAmbient, 1.0, N.z);
+  // 45° point light (upper-left) added on top, its highlight + shadow
+  // strength driven by the contrast slider (uContrast).
+  const float C = 0.70710678;
+  vec3 L = normalize(vec3(-C * C, C * C, C));        // 45° elev, az 135°
+  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));       // half-vec, top-down view
+  float softDiff = dot(N, L) * 0.5 + 0.5;            // half-Lambert: soft terminator
+  float spec = pow(max(0.0, dot(N, H)), 20.0);       // glossy highlight (not matte)
+  const float SHADOW_DEPTH = 0.5;                    // <1 → shadows stay shallow
+  const float SPEC_STRENGTH = 1.3;                   // highlight pop
+  float k = clamp(uContrast, 0.0, 1.0);
+  // Soft shallow shadow pulls base down on back slopes; glossy highlight
+  // adds on light-facing slopes. Both scale with the contrast slider.
+  float gray = base * (1.0 - k * SHADOW_DEPTH * (1.0 - softDiff)) + k * spec * SPEC_STRENGTH;
   // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look.
   vec2 uvW = (p + warp) / uCellPx;
   vec2 fw = max(fwidth(uvW), vec2(1e-6));
