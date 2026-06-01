@@ -809,7 +809,9 @@ const float PMAX = 0.45;             // per-body max grid pinch (single-valued g
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
-const float LINE_DARK = 0.5;         // base per-line darkening (× on-screen density = const ink)
+const float FILL_SHADE = 0.2;        // membrane fill shading weight (0 = no color block; lines carry it)
+const float LINE_DARK_MIN = 0.3;     // line darkening in bright regions (light lines)
+const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clamp — never solid black)
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
 
@@ -891,10 +893,15 @@ void main() {
   float s0 = exp2(-n0);
   float s1 = exp2(-(n0 + 1.0));
   float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
-  // Constant ink: on-screen density = base · 2^bias (LOD cancels compression),
-  // so fade lines by 2^bias → region brightness stays decoupled from density.
-  float dark = LINE_DARK / exp2(bias);
-  vec3 rgb = uColor.rgb * gray * (1.0 - line * dark);
+  // Region brightness is carried by the LINES (darkness + count), not a filled
+  // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
+  // where the lighting `gray` is dark, and the depth bias also packs MORE
+  // lines there (denser = darker). On-screen density is constant under the LOD
+  // except for the bias, so line count meaningfully encodes depth here. The
+  // per-line darkening is clamped (LINE_DARK_MAX) so deep lines never go solid.
+  float fill = mix(1.0, gray, FILL_SHADE);
+  float lineDark = clamp(mix(LINE_DARK_MIN, LINE_DARK_MAX, 1.0 - gray), 0.0, LINE_DARK_MAX);
+  vec3 rgb = uColor.rgb * fill * (1.0 - line * lineDark);
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,
