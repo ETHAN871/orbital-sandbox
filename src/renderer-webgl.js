@@ -447,16 +447,16 @@ function _initPrograms() {
   _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
   _progGridWarp.uCellPx        = gl.getUniformLocation(_progGridWarp.prog, 'uCellPx');
 
-  // Punched fly-screen program (default field viz). Reuses the grid LINE
-  // mesh + ortho; see SCREEN_DENT in shaders.js for the dimple model.
+  // Punched fly-screen program (default field viz). Full-screen FS lens
+  // warp on the shared VS_FULLSCREEN quad (_vaoFsQuad); see SCREEN_DENT
+  // in shaders.js for the technique.
   _progScreenDent = _makeProgram(SCREEN_DENT.VS, SCREEN_DENT.FS);
-  _progScreenDent.aPos           = gl.getAttribLocation(_progScreenDent.prog, 'aPos');
+  _progScreenDent.uViewport      = gl.getUniformLocation(_progScreenDent.prog, 'uViewport');
   _progScreenDent.uEntities      = gl.getUniformLocation(_progScreenDent.prog, 'uEntities[0]');
   _progScreenDent.uEntityCount   = gl.getUniformLocation(_progScreenDent.prog, 'uEntityCount');
-  _progScreenDent.uDentRadius    = gl.getUniformLocation(_progScreenDent.prog, 'uDentRadius');
-  _progScreenDent.uPerspC        = gl.getUniformLocation(_progScreenDent.prog, 'uPerspC');
+  _progScreenDent.uWarpScale     = gl.getUniformLocation(_progScreenDent.prog, 'uWarpScale');
+  _progScreenDent.uSoft2         = gl.getUniformLocation(_progScreenDent.prog, 'uSoft2');
   _progScreenDent.uCellPx        = gl.getUniformLocation(_progScreenDent.prog, 'uCellPx');
-  _progScreenDent.uOrtho         = gl.getUniformLocation(_progScreenDent.prog, 'uOrtho');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uDepthMax      = gl.getUniformLocation(_progScreenDent.prog, 'uDepthMax');
   _progScreenDent.uContrastFloor = gl.getUniformLocation(_progScreenDent.prog, 'uContrastFloor');
@@ -1421,49 +1421,50 @@ function _sortGridIndicesPainter() {
   return true;
 }
 
-// Punched fly-screen field. Localized radial dimple per body (depth ∝
-// |G·q·m|), on-axis perspective foreshortening + depth→brightness shading.
-// Drawn on the shared grid LINE mesh; see SCREEN_DENT in shaders.js.
-const _SCREEN_DENT_RADIUS_PX = 150;   // dimple half-width R
-const _SCREEN_DENT_PERSP_K   = 1.0;   // perspC = K · maxWeight (smaller = deeper crater)
+// Punched fly-screen field — full-screen FS gravitational-lens warp of a
+// procedural grid. See SCREEN_DENT in shaders.js for the technique. The
+// warp is a per-pixel UV remap (no fold cap) so the bend is dramatic.
+const _SCREEN_DENT_SOFT_PX  = 55;    // funnel core radius (px); larger = softer/wider well
+const _SCREEN_DENT_WARP_PX  = 220;   // peak grid displacement for the heaviest body (px)
 function _drawScreenDent() {
   const gl = _gl;
-  if (!_progScreenDent || !_bufGridVerts || !_bufGridIndices) return;
-  if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
-  if (_fieldEntityCount === 0) return;
+  if (!_progScreenDent) return;
 
-  // Per-frame depth normalizer = heaviest body's weight (its dimple-center
-  // depth). Overlapping dimples sum past this; the FS clamps t to 1.
+  // Heaviest body's |G·q·m| → per-frame scale normalizers so warp depth
+  // and shading adapt to G / mass without a manual gain.
   let maxWeight = 0;
   for (let i = 0; i < _fieldEntityCount; i++) {
     const w = Math.abs(_fieldEntityData[i * 4 + 2]);
     if (w > maxWeight) maxWeight = w;
   }
-  if (maxWeight <= 0) return;
-  // perspC in the SAME depth units as the dimple amplitude, so the
-  // foreshortening factor h/(C+h) is scene-scale invariant.
-  const perspC = maxWeight * _SCREEN_DENT_PERSP_K;
+  const soft = _SCREEN_DENT_SOFT_PX;
+  const soft2 = soft * soft;
+  // Displacement magnitude r·k·w/(r²+soft²) peaks at r=soft with value
+  // k·w/(2·soft). Solve k so the heaviest body's peak shift = WARP_PX:
+  //   k = WARP_PX · 2·soft / maxWeight. maxWeight==0 (empty scene) → 0
+  //   warp → a flat unpunched screen.
+  const warpScale = maxWeight > 0 ? (_SCREEN_DENT_WARP_PX * 2 * soft) / maxWeight : 0;
+  // depth = Σ|w|/(r²+soft²); at the heaviest center (r=0) ≈ maxWeight/soft².
+  const depthMax = maxWeight > 0 ? maxWeight / soft2 : 1;
 
   gl.useProgram(_progScreenDent.prog);
+  gl.uniform2f(_progScreenDent.uViewport, _vpW, _vpH);
   gl.uniform4fv(_progScreenDent.uEntities, _fieldEntityData, 0, _fieldEntityCount * 4);
   gl.uniform1i(_progScreenDent.uEntityCount, _fieldEntityCount);
-  gl.uniform1f(_progScreenDent.uDentRadius, _SCREEN_DENT_RADIUS_PX);
-  gl.uniform1f(_progScreenDent.uPerspC, perspC);
-  gl.uniform1f(_progScreenDent.uCellPx, _gridCellPx);
-  gl.uniformMatrix4fv(_progScreenDent.uOrtho, false, _orthoMat);
+  gl.uniform1f(_progScreenDent.uWarpScale, warpScale);
+  gl.uniform1f(_progScreenDent.uSoft2, soft2);
+  gl.uniform1f(_progScreenDent.uCellPx, Math.max(8, state.fieldLineSpacing));
   gl.uniform4f(_progScreenDent.uColor,
     GRID_WARP_COLOR_2D[0], GRID_WARP_COLOR_2D[1], GRID_WARP_COLOR_2D[2], GRID_WARP_COLOR_2D[3]);
-  gl.uniform1f(_progScreenDent.uDepthMax, maxWeight);
+  gl.uniform1f(_progScreenDent.uDepthMax, depthMax);
   // contrast slider: floor = 1 - contrast = brightness of flat/far lines;
-  // dimple floor ramps up to full → deeper reads brighter. 0 = flat.
+  // the well ramps up to full → deeper reads brighter. 0 = flat.
   gl.uniform1f(_progScreenDent.uContrastFloor, 1 - state.fieldContrast);
 
-  gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
-  gl.enableVertexAttribArray(_progScreenDent.aPos);
-  gl.vertexAttribPointer(_progScreenDent.aPos, 2, gl.FLOAT, false, 0, 0);
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
-  gl.drawElements(gl.LINES, _gridIndexCount, gl.UNSIGNED_INT, 0);
-  gl.disableVertexAttribArray(_progScreenDent.aPos);
+  // Shared fullscreen-quad VAO (VS_FULLSCREEN), same as _drawRubberSheetFS.
+  gl.bindVertexArray(_vaoFsQuad);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.bindVertexArray(null);
 }
 
 function _drawGridWarp() {
@@ -2571,7 +2572,8 @@ export function drawField() {
   // the scene is empty (no bodies = no warp → straight grid lines). The
   // mesh paths (curvilinear/legacy/2d/3d) still early-out because their
   // CPU uniform uploads + N-body inner loops are wasted with no bodies.
-  if (_fieldEntityCount === 0 && state.fieldStyle !== 'rubber-sheet') return;
+  if (_fieldEntityCount === 0 &&
+      state.fieldStyle !== 'rubber-sheet' && state.fieldStyle !== 'screen') return;
 
   // Common GL state for both passes.
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);

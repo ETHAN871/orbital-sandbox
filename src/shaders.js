@@ -762,86 +762,69 @@ void main() {
 };
 
 // ─── Screen-dent field — "纱窗被打了一拳" punched fly-screen ────────
-// A ground-up redesign of the field viz (replaces the rubber-sheet /
-// in-plane / equipotential reuse the user rejected). Mental model: a
-// taut window screen viewed face-on; each body punches a localized,
-// radially-symmetric dimple INTO it, punch depth ∝ |G·q·m| (mass·charge
-// weight — the sim's field strength). Two cues sell the dent, both
-// centered exactly on the body's 2D position (no oblique offset):
+// Full-screen fragment-shader gravitational-lens warp of a procedural
+// grid. Replaces the earlier vertex-mesh dent, whose anti-fold cap
+// (|disp| < 0.45·cell) made the distortion too weak. Technique is the
+// one proven across Shadertoy black-hole / lensing shaders and the
+// `gravy` WebGL lensing repo: per pixel, displace the SAMPLED grid
+// position radially toward each mass, then draw the grid in that warped
+// space. Because it is a per-pixel UV remap (not a moving vertex mesh)
+// there is no fold cap — lines bend hard and pile up into the well, the
+// dramatic "punched screen / spacetime funnel" look.
 //
-//   1. Geometry — on-axis perspective foreshortening. A screen point at
-//      radius r that is pushed back by depth h projects inward toward
-//      the dimple axis by factor h/(C+h): newR = r·C/(C+h). So grid
-//      cells visibly compress as they fall into the crater, exactly
-//      like looking into a punched screen head-on. uPerspC sets how
-//      "deep" the virtual camera sits (smaller = stronger compression).
-//      Capped at 0.45·uCellPx so adjacent vertices can never swap →
-//      the mesh never self-intersects (no fold artifacts).
+// Warp per body: warped += d · uWarpScale·|w| / (r² + soft²), where
+// d = frag − body (points away), w = G·q·m. Magnitude r·k/(r²+soft²)
+// is 0 at the center (no singularity), peaks at r = soft, falls ~k/r
+// far out. Pulling the sampled point AWAY from the frag toward the mass
+// makes grid features converge toward the body → funnel/dent. soft²
+// keeps the core single-valued so the grid never tears.
 //
-//   2. Shading — depth → brightness (NOT the old dim-the-well ramp,
-//      which sank deep lines into the near-black background and DESTROYED
-//      depth legibility). Here far/flat lines sit at uContrastFloor
-//      (= 1 - fieldContrast) and the dimple floor ramps UP to full
-//      brightness, so the well lights up against the dark bg. The
-//      contrast slider is the depth-legibility knob: 0 = flat (no
-//      shading), 1 = far lines black, dimple floor full white = maximum
-//      depth separation.
-//
-// Depth is the SAME localized Lorentzian h_i = |w_i| / (1 + r²/R²) for
-// both cues so geometry and shading agree. uDepthMax (≈ heaviest body's
-// weight, CPU-computed per frame) normalizes the shading ramp so a lone
-// light body still lights its own dimple. Drawn on the shared grid LINE
-// mesh — no equipotential rings, no particle dust.
+// Shading: depth = Σ|w|/(r²+soft²) (peaks at the well) → brightness.
+// Far/flat lines sit at uContrastFloor (= 1 − fieldContrast); the well
+// ramps UP to full so it lights up against the dark bg (the opposite of
+// the old dim-the-well ramp that buried depth). Contrast = the depth-
+// separation knob. uWarpScale / uDepthMax are CPU-normalized per frame
+// against the heaviest body so a lone light body still warps + lights.
 export const SCREEN_DENT = {
-  VS: `#version 300 es
+  VS: VS_FULLSCREEN,                   // vUv ∈ [0,1]² covers the viewport
+  FS: `#version 300 es
+precision highp float;
 #define MAX_ENTITIES 128
-in vec2 aPos;                       // grid vertex, CSS px (untransformed)
+in vec2 vUv;
+uniform vec2 uViewport;
 uniform vec4 uEntities[MAX_ENTITIES];   // (x, y, G·q·m, radius)
 uniform int uEntityCount;
-uniform float uDentRadius;          // dimple half-width R, px
-uniform float uPerspC;              // perspective depth constant (>0)
-uniform float uCellPx;              // grid spacing — anti-fold cap basis
-uniform mat4 uOrtho;                // CSS-px → NDC
-out float vDepth;                   // Σ dimple depth at this vertex (raw)
+uniform float uWarpScale;            // displacement gain (CPU-normalized)
+uniform float uSoft2;                // softening² (px²): funnel core size
+uniform float uCellPx;               // grid spacing (world px)
+uniform vec4 uColor;
+uniform float uDepthMax;             // per-frame depth normalizer (>0)
+uniform float uContrastFloor;        // 1 - fieldContrast
+out vec4 outColor;
 void main() {
-  vec2 p = aPos;
-  vec2 disp = vec2(0.0);
-  float H = 0.0;
-  float R2 = max(uDentRadius * uDentRadius, 1.0);
+  // CSS-px frag position (y down from top) — matches uEntities coords.
+  vec2 fragPx = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
+  vec2 warped = fragPx;
+  float depth = 0.0;
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
-    vec2 dvec = p - e.xy;            // points AWAY from the body
-    float r2 = dot(dvec, dvec);
-    float amp = abs(e.z);            // punch strength ∝ |G·q·m|
-    float h = amp / (1.0 + r2 / R2); // localized Lorentzian dimple
-    H += h;
-    // On-axis perspective: a point pushed back by h pulls toward the
-    // dimple axis by h/(C+h). Coherent (all toward the body) so it
-    // foreshortens the crater without the opposing-vertex fold risk.
-    float f = h / (uPerspC + h);
-    disp -= dvec * f;
+    vec2 d = fragPx - e.xy;          // points AWAY from the body
+    float inv = 1.0 / (dot(d, d) + uSoft2);
+    float w = abs(e.z);              // field strength ∝ |G·q·m|
+    warped += d * (uWarpScale * w * inv);   // pull sampled grid toward mass
+    depth  += w * inv;               // ∝ 1/(r²+soft²): peaks at the well
   }
-  // Anti-fold safety cap: |disp| < 0.45·cellPx → no adjacent-vertex swap.
-  float maxDisp = uCellPx * 0.45;
-  float m = length(disp);
-  if (m > maxDisp) disp *= maxDisp / m;
-  vDepth = H;
-  gl_Position = uOrtho * vec4(p + disp, 0.0, 1.0);
-}`,
-  FS: `#version 300 es
-precision highp float;
-in float vDepth;
-uniform vec4 uColor;
-uniform float uDepthMax;            // per-frame depth normalizer (>0)
-uniform float uContrastFloor;       // 1 - fieldContrast: brightness of flat/far lines
-out vec4 outColor;
-void main() {
-  float t = clamp(vDepth / max(uDepthMax, 1e-3), 0.0, 1.0);
-  // Depth → brightness: far/flat = floor (dim), dimple floor = full.
-  // Lights the well against the dark bg for maximum depth legibility.
+  // Procedural grid in warped space, fwidth-AA (Made-by-Evan / IQ).
+  vec2 uvW = warped / uCellPx;
+  vec2 fw = max(fwidth(uvW), vec2(1e-6));
+  vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
+  float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
+  if (line < 0.01) discard;
+  // Depth → brightness: flat/far at floor, well-center ramps to full.
+  float t = clamp(depth / max(uDepthMax, 1e-6), 0.0, 1.0);
   float brightness = mix(uContrastFloor, 1.0, t);
-  outColor = vec4(uColor.rgb * brightness, uColor.a);
+  outColor = vec4(uColor.rgb * brightness, uColor.a * line);
 }`,
 };
 
