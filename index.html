@@ -79,7 +79,7 @@
         <div class="btn-row">
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
-        <p class="hint">等势线 + 同步脉冲流线（地形图风格）</p>
+        <p class="hint">居中引力阱：等势同心环 + 径向网格（俯视）</p>
         <label>
           <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
           <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
@@ -88,7 +88,9 @@
           <span class="row"><span>场线间距</span><span class="val" id="field-spacing-val">30</span></span>
           <input type="range" id="field-spacing" min="12" max="80" step="2" value="30" />
         </label>
-        <label title="橡皮膜视角倾角：90°=俯视（平面），45°=经典斜视，30°=强斜视。仅 rubber-sheet 模式生效。">
+        <!-- view-tilt is rubber-sheet-only (oblique projection); hidden in the
+             default '2d' centered radial mode. Reachable via ?field=rubber-sheet. -->
+        <label hidden title="橡皮膜视角倾角：90°=俯视（平面），45°=经典斜视，30°=强斜视。仅 rubber-sheet 模式生效。">
           <span class="row"><span>视角倾角</span><span class="val" id="view-tilt-val">45°</span></span>
           <input type="range" id="view-tilt" min="30" max="90" step="1" value="45" />
         </label>
@@ -193,6 +195,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260528-v12-fs-grid-2"></script>
+  <script type="module" src="src/main.js?v=20260601-2d-centered-field"></script>
 </body>
 </html>

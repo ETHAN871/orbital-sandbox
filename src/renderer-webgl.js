@@ -2539,6 +2539,11 @@ export function drawField() {
     // per-vertex φ saturation that made the surface look flat.
     _drawGridWarp();
   } else {
+    // '2d': concentric equipotential rings (centered on each body, tighter
+    // toward deep wells) underlay the radial grid warp to read as a 3D
+    // funnel viewed from directly above — depth + curvature without the
+    // rubber-sheet's oblique offset. '3d' keeps the bare mesh.
+    if (state.fieldStyle === '2d') _drawEquipotential();
     _drawGridWarp();
     if (state.fieldStyle === '2d') _drawParticleFlow();
   }

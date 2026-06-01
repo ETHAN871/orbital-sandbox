@@ -9,7 +9,17 @@
   --track: #2a2a3a;
 }
 
-* { box-sizing: border-box; }
+/* -webkit-touch-callout: none everywhere kills the iOS long-press
+   callout (incl. "Save Image" on the #stage canvas). user-select base
+   is set on `html` below so it inherits to the map + every button. */
+* { box-sizing: border-box; -webkit-touch-callout: none; }
+
+html {
+  /* Deny-all selection base; inherits to #stage map, .btn, .seg-btn,
+     everything. Read-only text opts back in below. */
+  user-select: none;
+  -webkit-user-select: none;
+}
 
 html, body {
   margin: 0;
@@ -81,21 +91,24 @@ html, body {
   gap: 18px;
 }
 
-/* Scope text-selection disable to NON-INTERACTIVE elements only. Putting it
-   on `#panel` directly (the V4 approach) broke `input[type=range]` event
-   delivery on some browsers — `input` events stopped firing during drag,
-   leaving the slider thumb visually correct but state.timeScale frozen.
-   Restricting to text-bearing children fixes that while still suppressing
-   the ctrl-c drag-outline that triggered the original mass-slider bug. */
+/* The `html` base above makes EVERYTHING non-selectable (map, buttons,
+   labels, values). Range inputs must be restored: a `user-select:none`
+   reaching `input[type=range]` broke `input` event delivery on some
+   browsers (the V4 mass-slider bug — thumb moved but state froze). */
+input[type="range"] {
+  user-select: auto;
+  -webkit-user-select: auto;
+}
+
+/* Opt read-only, non-control text back into selection. Deliberately
+   excludes `.val` / `.row` (numeric readouts inside slider labels):
+   selecting those re-opens the mass-slider drag-outline bug. */
 #panel h1,
 #panel h2,
-#panel label,
-#panel .row,
 #panel .hint,
-#panel .panel-footer,
-#panel .seg-btn {
-  user-select: none;
-  -webkit-user-select: none;
+#panel .panel-footer {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .panel-header h1 {

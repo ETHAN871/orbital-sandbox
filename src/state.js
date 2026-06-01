@@ -240,7 +240,7 @@ export const state = {
   //   'legacy'       — equipotential contour rings only.
   //   'curvilinear'  — equipotential + ψ contours (rejected iteration).
   // Set via ?field=rubber-sheet|2d|3d|legacy|curvilinear URL param at boot.
-  fieldStyle: 'rubber-sheet',
+  fieldStyle: '2d',
 
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.

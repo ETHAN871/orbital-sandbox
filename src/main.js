@@ -46,13 +46,16 @@ try {
   }
 } catch {}
 
-// V9.2 (2026-05-26): field-viz style override via URL.
-// ?field=3d (default) — spacetime fabric, 3D oblique projection.
-// ?field=2d           — flat 2D in-plane warp.
-// ?field=legacy       — old equipotential contour rings (A/B compare).
+// Field-viz style override via URL. Default is '2d' (centered radial well).
+// ?field=2d           — centered radial in-plane warp + equipotential rings.
+// ?field=rubber-sheet — oblique rubber-sheet (legacy default, A/B compare).
+// ?field=3d           — bare oblique mesh.
+// ?field=legacy       — equipotential contour rings only.
+// ?field=curvilinear  — rings + radial field lines.
 try {
   const fs = new URLSearchParams(window.location.search).get('field');
-  if (fs === '2d' || fs === 'legacy' || fs === '3d') {
+  if (fs === '2d' || fs === 'legacy' || fs === '3d' ||
+      fs === 'rubber-sheet' || fs === 'curvilinear') {
     state.fieldStyle = fs;
     console.info('[main] field viz style =', fs);
   }
