@@ -808,6 +808,8 @@ out vec4 outColor;
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no subdivision (small bodies)
 const float REFINE_GAIN = 1.5;       // height above threshold → subdivision levels
+const float REFINE_MAX = 2.0;        // hard cap: shader implements 2 dyadic levels (×2, ×4)
+const float MIN_CELL_PX = 7.0;       // finest legible cell; caps levels so lines don't moiré
 
 // fwidth-AA coverage of a grid at the given (already-scaled) UV.
 float gridAt(vec2 uvw) {
@@ -855,7 +857,11 @@ void main() {
   // refine ∝ height field h (heavier/closer body → more levels), continuous
   // so adding a body fades the finer lines in smoothly (no "refresh").
   vec2 uvW = (p + warp) / uCellPx;
-  float refine = max(0.0, h - REFINE_THRESHOLD) * REFINE_GAIN;   // only large bodies subdivide
+  // Subdivision level, clamped: only large bodies subdivide (threshold), and
+  // never below MIN_CELL_PX (so the base spacing slider limits the level) nor
+  // past the 2 levels the shader implements.
+  float maxLevels = clamp(floor(log2(uCellPx / MIN_CELL_PX)), 0.0, REFINE_MAX);
+  float refine = clamp(max(0.0, h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, maxLevels);
   float l0 = gridAt(uvW);
   float l1 = gridAt(uvW * 2.0) * clamp(refine, 0.0, 1.0);
   float l2 = gridAt(uvW * 4.0) * clamp(refine - 1.0, 0.0, 1.0);
