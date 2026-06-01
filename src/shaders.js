@@ -761,6 +761,90 @@ void main() {
 }`,
 };
 
+// ─── Screen-dent field — "纱窗被打了一拳" punched fly-screen ────────
+// A ground-up redesign of the field viz (replaces the rubber-sheet /
+// in-plane / equipotential reuse the user rejected). Mental model: a
+// taut window screen viewed face-on; each body punches a localized,
+// radially-symmetric dimple INTO it, punch depth ∝ |G·q·m| (mass·charge
+// weight — the sim's field strength). Two cues sell the dent, both
+// centered exactly on the body's 2D position (no oblique offset):
+//
+//   1. Geometry — on-axis perspective foreshortening. A screen point at
+//      radius r that is pushed back by depth h projects inward toward
+//      the dimple axis by factor h/(C+h): newR = r·C/(C+h). So grid
+//      cells visibly compress as they fall into the crater, exactly
+//      like looking into a punched screen head-on. uPerspC sets how
+//      "deep" the virtual camera sits (smaller = stronger compression).
+//      Capped at 0.45·uCellPx so adjacent vertices can never swap →
+//      the mesh never self-intersects (no fold artifacts).
+//
+//   2. Shading — depth → brightness (NOT the old dim-the-well ramp,
+//      which sank deep lines into the near-black background and DESTROYED
+//      depth legibility). Here far/flat lines sit at uContrastFloor
+//      (= 1 - fieldContrast) and the dimple floor ramps UP to full
+//      brightness, so the well lights up against the dark bg. The
+//      contrast slider is the depth-legibility knob: 0 = flat (no
+//      shading), 1 = far lines black, dimple floor full white = maximum
+//      depth separation.
+//
+// Depth is the SAME localized Lorentzian h_i = |w_i| / (1 + r²/R²) for
+// both cues so geometry and shading agree. uDepthMax (≈ heaviest body's
+// weight, CPU-computed per frame) normalizes the shading ramp so a lone
+// light body still lights its own dimple. Drawn on the shared grid LINE
+// mesh — no equipotential rings, no particle dust.
+export const SCREEN_DENT = {
+  VS: `#version 300 es
+#define MAX_ENTITIES 128
+in vec2 aPos;                       // grid vertex, CSS px (untransformed)
+uniform vec4 uEntities[MAX_ENTITIES];   // (x, y, G·q·m, radius)
+uniform int uEntityCount;
+uniform float uDentRadius;          // dimple half-width R, px
+uniform float uPerspC;              // perspective depth constant (>0)
+uniform float uCellPx;              // grid spacing — anti-fold cap basis
+uniform mat4 uOrtho;                // CSS-px → NDC
+out float vDepth;                   // Σ dimple depth at this vertex (raw)
+void main() {
+  vec2 p = aPos;
+  vec2 disp = vec2(0.0);
+  float H = 0.0;
+  float R2 = max(uDentRadius * uDentRadius, 1.0);
+  for (int i = 0; i < MAX_ENTITIES; i++) {
+    if (i >= uEntityCount) break;
+    vec4 e = uEntities[i];
+    vec2 dvec = p - e.xy;            // points AWAY from the body
+    float r2 = dot(dvec, dvec);
+    float amp = abs(e.z);            // punch strength ∝ |G·q·m|
+    float h = amp / (1.0 + r2 / R2); // localized Lorentzian dimple
+    H += h;
+    // On-axis perspective: a point pushed back by h pulls toward the
+    // dimple axis by h/(C+h). Coherent (all toward the body) so it
+    // foreshortens the crater without the opposing-vertex fold risk.
+    float f = h / (uPerspC + h);
+    disp -= dvec * f;
+  }
+  // Anti-fold safety cap: |disp| < 0.45·cellPx → no adjacent-vertex swap.
+  float maxDisp = uCellPx * 0.45;
+  float m = length(disp);
+  if (m > maxDisp) disp *= maxDisp / m;
+  vDepth = H;
+  gl_Position = uOrtho * vec4(p + disp, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+in float vDepth;
+uniform vec4 uColor;
+uniform float uDepthMax;            // per-frame depth normalizer (>0)
+uniform float uContrastFloor;       // 1 - fieldContrast: brightness of flat/far lines
+out vec4 outColor;
+void main() {
+  float t = clamp(vDepth / max(uDepthMax, 1e-3), 0.0, 1.0);
+  // Depth → brightness: far/flat = floor (dim), dimple floor = full.
+  // Lights the well against the dark bg for maximum depth legibility.
+  float brightness = mix(uContrastFloor, 1.0, t);
+  outColor = vec4(uColor.rgb * brightness, uColor.a);
+}`,
+};
+
 // ─── V12 rubber-sheet — full-screen fragment-shader pass ──────────
 // User pivoted away from the indexed-LINE mesh approach (V11) because
 // the 15% viewport-expansion "skirt" remained a finite-extent band-aid:

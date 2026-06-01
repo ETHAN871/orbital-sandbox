@@ -230,17 +230,18 @@ export const state = {
   showField: false,
 
   // V10 (2026-05-26 rewrite): field visualization style.
-  //   'rubber-sheet' (default) — oblique-45° projection of 3D sagging
-  //                    potential surface. Mesh + bodies + trails + UI
-  //                    share the same projection (sag texture path)
-  //                    so bodies visually sit at the bottom of their
-  //                    gravity wells. See .claude/rubber-sheet-blueprint.md.
+  //   'screen' (default) — punched fly-screen (纱窗): localized radial
+  //                    dimple per body, depth ∝ |G·q·m|, centered on the
+  //                    body's 2D position; perspective foreshortening +
+  //                    depth→brightness shading. See SCREEN_DENT in shaders.js.
+  //   'rubber-sheet' — oblique-45° projection of a 3D sagging surface
+  //                    (mesh + bodies + trails share the sag texture).
   //   '2d'           — Cartesian grid warped by ∇φ (anti-fold capped).
   //   '3d'           — oblique GRID_WARP (mesh-only oblique).
   //   'legacy'       — equipotential contour rings only.
   //   'curvilinear'  — equipotential + ψ contours (rejected iteration).
-  // Set via ?field=rubber-sheet|2d|3d|legacy|curvilinear URL param at boot.
-  fieldStyle: '2d',
+  // Set via ?field=screen|rubber-sheet|2d|3d|legacy|curvilinear URL param.
+  fieldStyle: 'screen',
 
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.

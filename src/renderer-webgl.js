@@ -67,6 +67,7 @@ import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
+  SCREEN_DENT,
 } from './shaders.js';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
@@ -97,6 +98,8 @@ let _progStreamline = null;
 // V9.2 (2026-05-26): grid-warp field viz. Replaces _progEquipotential
 // as the default; _progEquipotential is kept compiled for ?field=legacy.
 let _progGridWarp = null;
+// Punched fly-screen field — default. Drawn on the shared grid LINE mesh.
+let _progScreenDent = null;
 // V12 (2026-05-28): full-screen fragment-shader rubber-sheet renderer.
 // Replaces the GRID_WARP indexed-LINE mesh for state.fieldStyle ===
 // 'rubber-sheet' specifically. Modes '2d' and '3d' continue to use
@@ -298,6 +301,7 @@ export function initWebGL(canvas) {
     _progCircleFill = _progCircleRing = _progLineSeg = null;
     _progEquipotential = _progStreamline = null;
     _progGridWarp = _progRubberSheetFS = _progParticleFlow = null;
+    _progScreenDent = null;
     _bufFsQuad = _bufUnitQuad = _bufEntityCornerQuad = null;
     _bufInstanceTrail = _bufInstanceEntity = null;
     _bufInstanceCircleFill = _bufInstanceCircleRing = _bufInstanceLineSeg = null;
@@ -442,6 +446,20 @@ function _initPrograms() {
   _progGridWarp.uIntensityMax  = gl.getUniformLocation(_progGridWarp.prog, 'uIntensityMax');
   _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
   _progGridWarp.uCellPx        = gl.getUniformLocation(_progGridWarp.prog, 'uCellPx');
+
+  // Punched fly-screen program (default field viz). Reuses the grid LINE
+  // mesh + ortho; see SCREEN_DENT in shaders.js for the dimple model.
+  _progScreenDent = _makeProgram(SCREEN_DENT.VS, SCREEN_DENT.FS);
+  _progScreenDent.aPos           = gl.getAttribLocation(_progScreenDent.prog, 'aPos');
+  _progScreenDent.uEntities      = gl.getUniformLocation(_progScreenDent.prog, 'uEntities[0]');
+  _progScreenDent.uEntityCount   = gl.getUniformLocation(_progScreenDent.prog, 'uEntityCount');
+  _progScreenDent.uDentRadius    = gl.getUniformLocation(_progScreenDent.prog, 'uDentRadius');
+  _progScreenDent.uPerspC        = gl.getUniformLocation(_progScreenDent.prog, 'uPerspC');
+  _progScreenDent.uCellPx        = gl.getUniformLocation(_progScreenDent.prog, 'uCellPx');
+  _progScreenDent.uOrtho         = gl.getUniformLocation(_progScreenDent.prog, 'uOrtho');
+  _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
+  _progScreenDent.uDepthMax      = gl.getUniformLocation(_progScreenDent.prog, 'uDepthMax');
+  _progScreenDent.uContrastFloor = gl.getUniformLocation(_progScreenDent.prog, 'uContrastFloor');
 
   // V12 (2026-05-28): full-screen FS rubber-sheet renderer. Shares the
   // VS_FULLSCREEN VAO (_vaoFsQuad) with the trail-decay/blit programs.
@@ -1401,6 +1419,51 @@ function _sortGridIndicesPainter() {
     dst[s * 2 + 1] = src[srcSeg * 2 + 1];
   }
   return true;
+}
+
+// Punched fly-screen field. Localized radial dimple per body (depth ∝
+// |G·q·m|), on-axis perspective foreshortening + depth→brightness shading.
+// Drawn on the shared grid LINE mesh; see SCREEN_DENT in shaders.js.
+const _SCREEN_DENT_RADIUS_PX = 150;   // dimple half-width R
+const _SCREEN_DENT_PERSP_K   = 1.0;   // perspC = K · maxWeight (smaller = deeper crater)
+function _drawScreenDent() {
+  const gl = _gl;
+  if (!_progScreenDent || !_bufGridVerts || !_bufGridIndices) return;
+  if (_gridVertexCount === 0 || _gridIndexCount === 0) return;
+  if (_fieldEntityCount === 0) return;
+
+  // Per-frame depth normalizer = heaviest body's weight (its dimple-center
+  // depth). Overlapping dimples sum past this; the FS clamps t to 1.
+  let maxWeight = 0;
+  for (let i = 0; i < _fieldEntityCount; i++) {
+    const w = Math.abs(_fieldEntityData[i * 4 + 2]);
+    if (w > maxWeight) maxWeight = w;
+  }
+  if (maxWeight <= 0) return;
+  // perspC in the SAME depth units as the dimple amplitude, so the
+  // foreshortening factor h/(C+h) is scene-scale invariant.
+  const perspC = maxWeight * _SCREEN_DENT_PERSP_K;
+
+  gl.useProgram(_progScreenDent.prog);
+  gl.uniform4fv(_progScreenDent.uEntities, _fieldEntityData, 0, _fieldEntityCount * 4);
+  gl.uniform1i(_progScreenDent.uEntityCount, _fieldEntityCount);
+  gl.uniform1f(_progScreenDent.uDentRadius, _SCREEN_DENT_RADIUS_PX);
+  gl.uniform1f(_progScreenDent.uPerspC, perspC);
+  gl.uniform1f(_progScreenDent.uCellPx, _gridCellPx);
+  gl.uniformMatrix4fv(_progScreenDent.uOrtho, false, _orthoMat);
+  gl.uniform4f(_progScreenDent.uColor,
+    GRID_WARP_COLOR_2D[0], GRID_WARP_COLOR_2D[1], GRID_WARP_COLOR_2D[2], GRID_WARP_COLOR_2D[3]);
+  gl.uniform1f(_progScreenDent.uDepthMax, maxWeight);
+  // contrast slider: floor = 1 - contrast = brightness of flat/far lines;
+  // dimple floor ramps up to full → deeper reads brighter. 0 = flat.
+  gl.uniform1f(_progScreenDent.uContrastFloor, 1 - state.fieldContrast);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufGridVerts);
+  gl.enableVertexAttribArray(_progScreenDent.aPos);
+  gl.vertexAttribPointer(_progScreenDent.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufGridIndices);
+  gl.drawElements(gl.LINES, _gridIndexCount, gl.UNSIGNED_INT, 0);
+  gl.disableVertexAttribArray(_progScreenDent.aPos);
 }
 
 function _drawGridWarp() {
@@ -2526,7 +2589,10 @@ export function drawField() {
   // V9.9: 'curvilinear' default — equipotential rings + radial
   // geodesic field lines from each body. Fold-free by construction.
   // 'legacy' = rings only (no field lines). '2d'/'3d' = old GRID_WARP.
-  if (state.fieldStyle === 'curvilinear') {
+  if (state.fieldStyle === 'screen') {
+    // Default: punched fly-screen dimples. Clean — no rings / no dust.
+    _drawScreenDent();
+  } else if (state.fieldStyle === 'curvilinear') {
     _drawEquipotential();
     _drawFieldLines();
   } else if (state.fieldStyle === 'legacy') {
@@ -2539,11 +2605,6 @@ export function drawField() {
     // per-vertex φ saturation that made the surface look flat.
     _drawGridWarp();
   } else {
-    // '2d': concentric equipotential rings (centered on each body, tighter
-    // toward deep wells) underlay the radial grid warp to read as a 3D
-    // funnel viewed from directly above — depth + curvature without the
-    // rubber-sheet's oblique offset. '3d' keeps the bare mesh.
-    if (state.fieldStyle === '2d') _drawEquipotential();
     _drawGridWarp();
     if (state.fieldStyle === '2d') _drawParticleFlow();
   }
