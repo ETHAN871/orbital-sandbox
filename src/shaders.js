@@ -806,12 +806,21 @@ uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
+const float REFINE_GAIN = 2.0;       // height→subdivision levels (heavier body → finer)
+
+// fwidth-AA coverage of a grid at the given (already-scaled) UV.
+float gridAt(vec2 uvw) {
+  vec2 fw = max(fwidth(uvw), vec2(1e-6));
+  vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
+  return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
+}
 
 void main() {
   // CSS-px frag position (y down from top) — matches uEntities coords.
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
   vec2 warp = vec2(0.0);             // grid-pinch displacement
+  float h = 0.0;                     // height field (∝ field strength), drives refinement
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
@@ -820,6 +829,7 @@ void main() {
     float w = abs(e.z);             // field strength ∝ |G·q·m|
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
+    h    += (w * uHeightK) * inv;   // normalized height (peak ≈ 1 at heaviest body)
     // Pinch the grid TOWARD the body (lines converge into the well).
     warp += di * min(uWarpGain * w * inv, PMAX);
   }
@@ -834,12 +844,17 @@ void main() {
   float k = clamp(uContrast, 0.0, 1.0);
   float lit = (zAmb + k * dir) / (1.0 + k);          // superpose ambient + 45°
   float gray = mix(uAmbient, 1.0, lit);              // floor so slopes don't crush
-  // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look; lines
-  // read as a darker weave (always visible — nothing brightens over them).
+  // Adaptive refinement by DYADIC SUBDIVISION: keep the base grid fixed and
+  // fade in midpoint lines (×2, ×4 spacing) where the field deepens — i.e.
+  // a heavy body splits existing cells rather than reflowing the whole grid.
+  // refine ∝ height field h (heavier/closer body → more levels), continuous
+  // so adding a body fades the finer lines in smoothly (no "refresh").
   vec2 uvW = (p + warp) / uCellPx;
-  vec2 fw = max(fwidth(uvW), vec2(1e-6));
-  vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
-  float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
+  float refine = h * REFINE_GAIN;
+  float l0 = gridAt(uvW);
+  float l1 = gridAt(uvW * 2.0) * clamp(refine, 0.0, 1.0);
+  float l2 = gridAt(uvW * 4.0) * clamp(refine - 1.0, 0.0, 1.0);
+  float line = max(l0, max(l1, l2));
   vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
   outColor = vec4(rgb, uOpacity);
 }`,
