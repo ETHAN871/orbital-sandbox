@@ -825,12 +825,10 @@ void main() {
   // Surface normal of the dipping sheet (z = -h). Matte Lambert diffuse
   // against a 45°-elevation point light from the upper-left.
   vec3 N = normalize(vec3(grad * uSlope, 1.0));
-  const float C = 0.70710678;
-  vec3 L = normalize(vec3(-C * C, C * C, C));   // azimuth 135°, elevation 45°
-  // Highlight-only relief: slopes facing the light brighten, but back
-  // slopes are clamped to the flat-membrane level (dot(up,L) = L.z = C)
-  // so wells never darken — no "ball shadow" cast on the membrane.
-  float gray = uAmbient + (1.0 - uAmbient) * max(C, dot(N, L));
+  // Ambient light straight down the +z axis: brightness = N·(+z) = N.z.
+  // Flat membrane (N = +z) is brightest; well slopes tilt away → darker,
+  // symmetrically (no directional point light, no cast shadow).
+  float gray = uAmbient + (1.0 - uAmbient) * N.z;
   // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look.
   vec2 uvW = (p + warp) / uCellPx;
   vec2 fw = max(fwidth(uvW), vec2(1e-6));

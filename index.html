@@ -79,7 +79,7 @@
         <div class="btn-row">
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
-        <p class="hint">引力膜：45°打光的灰度哑光膜，网格弯入引力阱（对比度=高光强弱）</p>
+        <p class="hint">引力膜：z轴环境光灰度哑光膜（法线越斜越暗），网格弯入引力阱（对比度=明暗强弱）</p>
         <label>
           <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
           <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
@@ -199,6 +199,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260601-membrane-noshadow"></script>
+  <script type="module" src="src/main.js?v=20260601-membrane-zambient"></script>
 </body>
 </html>
