@@ -823,37 +823,24 @@ void main() {
     // Pinch the grid TOWARD the body (lines converge into the well).
     warp += di * min(uWarpGain * w * inv, PMAX);
   }
-  // Surface normal of the dipping sheet (z = -h). Matte Lambert diffuse
-  // against a 45°-elevation point light from the upper-left.
+  // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
+  // upper-left light. The 45° light's weight is the contrast slider;
+  // half-Lambert keeps its terminator soft and its shadow shallow.
   vec3 N = normalize(vec3(grad * uSlope, 1.0));
-  // Base: z-axis ambient relief. Flat (N=+z) = 1, slopes dip to uAmbient.
-  float base = mix(uAmbient, 1.0, N.z);
-  // 45° point light (upper-left) added on top, its highlight + shadow
-  // strength driven by the contrast slider (uContrast).
   const float C = 0.70710678;
   vec3 L = normalize(vec3(-C * C, C * C, C));        // 45° elev, az 135°
-  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));       // half-vec, top-down view
-  float softDiff = dot(N, L) * 0.5 + 0.5;            // half-Lambert: soft terminator
-  float spec = pow(max(0.0, dot(N, H)), 20.0);       // glossy highlight (not matte)
-  const float SHADOW_DEPTH = 0.5;                    // <1 → shadows stay shallow
-  const float SPEC_STRENGTH = 1.3;                   // highlight pop
+  float zAmb = N.z;                                  // +z ambient light
+  float dir  = dot(N, L) * 0.5 + 0.5;                // 45° half-Lambert (soft)
   float k = clamp(uContrast, 0.0, 1.0);
-  // Diffuse/ambient body keeps the membrane tint; the specular is WHITE
-  // (light colour), added SEPARATELY so the highlight never takes on the
-  // membrane's cast or clips per-channel into coloured fringes.
-  float diffGray = base * (1.0 - k * SHADOW_DEPTH * (1.0 - softDiff));
-  float specWhite = k * spec * SPEC_STRENGTH;
-  // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look.
+  float lit = (zAmb + k * dir) / (1.0 + k);          // superpose ambient + 45°
+  float gray = mix(uAmbient, 1.0, lit);              // floor so slopes don't crush
+  // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look; lines
+  // read as a darker weave (always visible — nothing brightens over them).
   vec2 uvW = (p + warp) / uCellPx;
   vec2 fw = max(fwidth(uvW), vec2(1e-6));
   vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
-  // Membrane fill = diffuse body + white highlight. Grid threads are a
-  // darker, diffuse-ONLY weave composited on top, so the specular
-  // highlight never washes out / covers the lines.
-  vec3 fill   = uColor.rgb * diffGray + vec3(specWhite);
-  vec3 thread = uColor.rgb * diffGray * 0.5;
-  vec3 rgb = mix(fill, thread, line);
+  vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
   outColor = vec4(rgb, uOpacity);
 }`,
 };
