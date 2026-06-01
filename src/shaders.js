@@ -809,6 +809,7 @@ const float PMAX = 0.45;             // per-body max grid pinch (single-valued g
 const float REFINE_THRESHOLD = 1.0;  // height below this → no subdivision (small bodies)
 const float REFINE_GAIN = 0.9;       // height above threshold → levels (lower = sparser)
 const float REFINE_MAX = 2.0;        // hard cap: at most 2 bisections (×2 then ×4)
+const float LINE_DARK = 0.5;         // base per-line darkening (density × dark = const ink)
 const float MIN_CELL_PX = 7.0;       // finest legible cell; caps levels so lines don't moiré
 
 // fwidth-AA coverage of a grid at the given (already-scaled) UV.
@@ -862,11 +863,18 @@ void main() {
   // past the 2 levels the shader implements.
   float maxLevels = clamp(floor(log2(uCellPx / MIN_CELL_PX)), 0.0, REFINE_MAX);
   float refine = clamp(max(0.0, h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, maxLevels);
+  float w1 = clamp(refine, 0.0, 1.0);
+  float w2 = clamp(refine - 1.0, 0.0, 1.0);
   float l0 = gridAt(uvW);
-  float l1 = gridAt(uvW * 2.0) * clamp(refine, 0.0, 1.0);
-  float l2 = gridAt(uvW * 4.0) * clamp(refine - 1.0, 0.0, 1.0);
+  float l1 = gridAt(uvW * 2.0) * w1;
+  float l2 = gridAt(uvW * 4.0) * w2;
   float line = max(l0, max(l1, l2));
-  vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
+  // Couple line darkening to density so total ink/area (density × dark) is
+  // constant: a region doesn't darken just because it's subdivided — its
+  // brightness keeps tracking the shading. density = distinct lines vs base.
+  float density = 1.0 + w1 + 2.0 * w2;       // 1 (base), 2 (×2), 4 (×4)
+  float dark = LINE_DARK / density;
+  vec3 rgb = uColor.rgb * gray * (1.0 - line * dark);
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,
