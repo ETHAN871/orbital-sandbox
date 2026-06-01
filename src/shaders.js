@@ -806,11 +806,10 @@ uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
-const float REFINE_THRESHOLD = 1.0;  // height below this → no subdivision (small bodies)
-const float REFINE_GAIN = 0.9;       // height above threshold → levels (lower = sparser)
-const float REFINE_MAX = 2.0;        // hard cap: at most 2 bisections (×2 then ×4)
-const float LINE_DARK = 0.5;         // base per-line darkening (density × dark = const ink)
-const float MIN_CELL_PX = 7.0;       // finest legible cell; caps levels so lines don't moiré
+const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
+const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
+const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
+const float LINE_DARK = 0.5;         // base per-line darkening (× on-screen density = const ink)
 
 // fwidth-AA coverage of a grid at the given (already-scaled) UV.
 float gridAt(vec2 uvw) {
@@ -857,23 +856,26 @@ void main() {
   // a heavy body splits existing cells rather than reflowing the whole grid.
   // refine ∝ height field h (heavier/closer body → more levels), continuous
   // so adding a body fades the finer lines in smoothly (no "refresh").
-  vec2 uvW = (p + warp) / uCellPx;
-  // Subdivision level, clamped: only large bodies subdivide (threshold), and
-  // never below MIN_CELL_PX (so the base spacing slider limits the level) nor
-  // past the 2 levels the shader implements.
-  float maxLevels = clamp(floor(log2(uCellPx / MIN_CELL_PX)), 0.0, REFINE_MAX);
-  float refine = clamp(max(0.0, h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, maxLevels);
-  float w1 = clamp(refine, 0.0, 1.0);
-  float w2 = clamp(refine - 1.0, 0.0, 1.0);
-  float l0 = gridAt(uvW);
-  float l1 = gridAt(uvW * 2.0) * w1;
-  float l2 = gridAt(uvW * 4.0) * w2;
-  float line = max(l0, max(l1, l2));
-  // Couple line darkening to density so total ink/area (density × dark) is
-  // constant: a region doesn't darken just because it's subdivided — its
-  // brightness keeps tracking the shading. density = distinct lines vs base.
-  float density = 1.0 + w1 + 2.0 * w2;       // 1 (base), 2 (×2), 4 (×4)
-  float dark = LINE_DARK / density;
+  // Screen-adaptive grid LOD. Keep the on-screen line density ~constant: the
+  // warp-compressed well auto-COARSENS ("expands outward") instead of mushing,
+  // while stretched areas subdivide. lodC = octaves of compression (warped vs
+  // flat coord derivatives); a heavy body biases the level finer (bounded) so
+  // masses still get extra detail without over-densifying.
+  vec2 uvW = (p + warp) / uCellPx;            // warped (drawn) grid coord
+  vec2 uvF = p / uCellPx;                      // flat reference (base density)
+  float fwW = max(max(fwidth(uvW.x), fwidth(uvW.y)), 1e-6);
+  float fwF = max(max(fwidth(uvF.x), fwidth(uvF.y)), 1e-6);
+  float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
+  float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
+  float lam = lodC - bias;                     // net octave (− = finer than base)
+  float n0 = floor(lam);
+  float fr = lam - n0;
+  // Blend the two bracketing octaves so coarsening/refining is smooth (no pop);
+  // the finer octave's extra lines fade out as the level coarsens.
+  float line = mix(gridAt(uvW * exp2(-n0)), gridAt(uvW * exp2(-(n0 + 1.0))), fr);
+  // Constant ink: on-screen density = base · 2^bias (LOD cancels compression),
+  // so fade lines by 2^bias → region brightness stays decoupled from density.
+  float dark = LINE_DARK / exp2(bias);
   vec3 rgb = uColor.rgb * gray * (1.0 - line * dark);
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
