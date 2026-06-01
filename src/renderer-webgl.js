@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260601-relax2';
+} from './shaders.js?v=20260601-relax3';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -460,7 +460,7 @@ function _initPrograms() {
   _progScreenDent.uSlope         = gl.getUniformLocation(_progScreenDent.prog, 'uSlope');
   _progScreenDent.uAmbient       = gl.getUniformLocation(_progScreenDent.prog, 'uAmbient');
   _progScreenDent.uContrast      = gl.getUniformLocation(_progScreenDent.prog, 'uContrast');
-  _progScreenDent.uCellPx        = gl.getUniformLocation(_progScreenDent.prog, 'uCellPx');
+  _progScreenDent.uCell          = gl.getUniformLocation(_progScreenDent.prog, 'uCell');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
 
@@ -1461,7 +1461,17 @@ function _drawScreenDent() {
   gl.uniform1f(_progScreenDent.uSlope, core * _MEMBRANE_SLOPE_K);
   gl.uniform1f(_progScreenDent.uAmbient, ambient);
   gl.uniform1f(_progScreenDent.uContrast, contrast);
-  gl.uniform1f(_progScreenDent.uCellPx, Math.max(8, state.fieldLineSpacing));
+  // Toroidal grid in wrap mode: snap the cell so the viewport tiles a whole
+  // number of cells per axis → the grid is seamless across the wrap edges, so
+  // a well crossing the boundary has no grid-phase jump. Bounded mode uses the
+  // slider value directly.
+  const cellBase = Math.max(8, state.fieldLineSpacing);
+  let cellX = cellBase, cellY = cellBase;
+  if (state.boundaryMode === 'wrap' && _vpW > 0 && _vpH > 0) {
+    cellX = _vpW / Math.max(1, Math.round(_vpW / cellBase));
+    cellY = _vpH / Math.max(1, Math.round(_vpH / cellBase));
+  }
+  gl.uniform2f(_progScreenDent.uCell, cellX, cellY);
   gl.uniform4f(_progScreenDent.uColor,
     _MEMBRANE_COLOR[0], _MEMBRANE_COLOR[1], _MEMBRANE_COLOR[2], 1.0);
   gl.uniform1f(_progScreenDent.uOpacity, Math.min(1, Math.max(0, state.membraneOpacity)));

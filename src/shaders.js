@@ -800,7 +800,7 @@ uniform float uWarpGain;             // grid-pinch gain (kept below fold)
 uniform float uSlope;                // ∇h→normal scale (relief strength)
 uniform float uAmbient;              // base z-ambient relief floor (fixed)
 uniform float uContrast;             // 45° highlight/shadow group strength (slider)
-uniform float uCellPx;               // grid spacing (px)
+uniform vec2 uCell;                  // grid spacing per-axis (px); toroidal in wrap mode
 uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
@@ -877,8 +877,8 @@ void main() {
   // while stretched areas subdivide. lodC = octaves of compression (warped vs
   // flat coord derivatives); a heavy body biases the level finer (bounded) so
   // masses still get extra detail without over-densifying.
-  vec2 uvW = (p + warp) / uCellPx;            // warped (drawn) grid coord
-  vec2 uvF = p / uCellPx;                      // flat reference (base density)
+  vec2 uvW = (p + warp) / uCell;              // warped (drawn) grid coord
+  vec2 uvF = p / uCell;                        // flat reference (base density)
   vec2 dW = fwidth(uvW);                       // continuous base derivatives
   vec2 dF = fwidth(uvF);
   float fwW = max(max(dW.x, dW.y), 1e-6);
