@@ -50,6 +50,11 @@ export function createEntity({ type, x, y, vx, vy, mass, radius, charge, pinned 
     //   { blackHoleId, elapsedSim, startRadius, startX, startY }
     // and physics.updateAbsorptions then shrinks + lerps it into the hole.
     absorbing: null,
+    // Field-viz "sink-in": eases 0→1 after creation so the membrane well
+    // grows to steady state over time (a mass settling into a rubber sheet),
+    // instead of the well popping in at full depth. Physics is unaffected —
+    // this only scales the body's weight in the field visualization.
+    embed: 0,
     // Pinned bodies are kinematically frozen — they keep applying gravity
     // and participate in collisions (as infinite-mass anchors), but their
     // position and velocity never change. Settable at creation (panel

@@ -806,7 +806,8 @@ uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
-const float REFINE_GAIN = 2.0;       // height→subdivision levels (heavier body → finer)
+const float REFINE_THRESHOLD = 1.0;  // height below this → no subdivision (small bodies)
+const float REFINE_GAIN = 1.5;       // height above threshold → subdivision levels
 
 // fwidth-AA coverage of a grid at the given (already-scaled) UV.
 float gridAt(vec2 uvw) {
@@ -820,18 +821,22 @@ void main() {
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
   vec2 warp = vec2(0.0);             // grid-pinch displacement
-  float h = 0.0;                     // height field (∝ field strength), drives refinement
+  float h = 0.0;                     // absolute height field (∝ mass), drives refinement
+  float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
     vec2 di = p - e.xy;              // points AWAY from the body
-    float inv = 1.0 / (dot(di, di) + uCore2);
-    float w = abs(e.z);             // field strength ∝ |G·q·m|
+    float r2 = dot(di, di);
+    float inv = 1.0 / (r2 + uCore2);
+    float w = abs(e.z);             // field strength ∝ |G·q·m|·embed
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
-    h    += (w * uHeightK) * inv;   // normalized height (peak ≈ 1 at heaviest body)
+    h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
     // Pinch the grid TOWARD the body (lines converge into the well).
     warp += di * min(uWarpGain * w * inv, PMAX);
+    // Hole: drop the membrane where a body sprite covers it (e.w = radius).
+    bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
@@ -850,13 +855,14 @@ void main() {
   // refine ∝ height field h (heavier/closer body → more levels), continuous
   // so adding a body fades the finer lines in smoothly (no "refresh").
   vec2 uvW = (p + warp) / uCellPx;
-  float refine = h * REFINE_GAIN;
+  float refine = max(0.0, h - REFINE_THRESHOLD) * REFINE_GAIN;   // only large bodies subdivide
   float l0 = gridAt(uvW);
   float l1 = gridAt(uvW * 2.0) * clamp(refine, 0.0, 1.0);
   float l2 = gridAt(uvW * 4.0) * clamp(refine - 1.0, 0.0, 1.0);
   float line = max(l0, max(l1, l2));
   vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
-  outColor = vec4(rgb, uOpacity);
+  // Carve the hole: membrane goes transparent where a body covers it.
+  outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,
 };
 

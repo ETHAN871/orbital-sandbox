@@ -79,7 +79,7 @@
         <div class="btn-row">
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
-        <p class="hint">引力膜：z轴环境光 + 45°方向光；网格在重物处自动细分（从已有线分裂）</p>
+        <p class="hint">引力膜：环境光+45°光；重物处网格自动细分、缓慢陷入；物体处镂空</p>
         <label>
           <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
           <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
@@ -199,6 +199,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260601-membrane-subdiv"></script>
+  <script type="module" src="src/main.js?v=20260601-membrane-sinkin"></script>
 </body>
 </html>

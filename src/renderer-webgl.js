@@ -1431,25 +1431,21 @@ const _MEMBRANE_CORE_FRAC = 0.08;    // well core radius = CORE_FRAC · min(vp);
 const _MEMBRANE_SLOPE_K   = 2.2;     // ∇h→normal scale (× core); larger = stronger relief
 const _MEMBRANE_WARP_K    = 0.8;     // grid-pinch gain (×, kept below fold)
 const _MEMBRANE_AMBIENT   = 0.45;    // base z-ambient relief floor (slope darkening)
+const _MEMBRANE_REF_MASS  = 100;     // reference mass → h=1 at its center (ABSOLUTE scale)
 const _MEMBRANE_COLOR     = [0.85, 0.85, 0.87];   // near-neutral grayscale membrane
 function _drawScreenDent() {
   const gl = _gl;
   if (!_progScreenDent) return;
 
-  // Heaviest body's |G·q·m| → per-frame normalizers so relief + pinch
-  // adapt to G / mass without a manual gain. Core scales with the canvas
-  // (the "按 canvas 距离尺度缩放" request) so wells stay proportionate.
-  let maxWeight = 0;
-  for (let i = 0; i < _fieldEntityCount; i++) {
-    const w = Math.abs(_fieldEntityData[i * 4 + 2]);
-    if (w > maxWeight) maxWeight = w;
-  }
+  // ABSOLUTE field scale (NOT normalized to the heaviest body): a body's
+  // well depth depends only on its own mass, so adding/removing bodies never
+  // rescales the existing wells. Reference weight = G·REF_MASS makes a
+  // REF_MASS body reach h=1 at its center (G cancels since |w|=G·mass).
   const core = Math.max(8, Math.min(_vpW, _vpH) * _MEMBRANE_CORE_FRAC);
   const core2 = core * core;
-  // heightK folds amplitude + per-frame normalization: h_i = |w_i|·heightK
-  //   / (r²+core²) with heightK = core²/maxWeight peaks at 1 per body.
-  const heightK = maxWeight > 0 ? core2 / maxWeight : 0;
-  const warpGain = maxWeight > 0 ? (_MEMBRANE_WARP_K * core2) / maxWeight : 0;
+  const wRef = Math.max(1e-6, state.G * _MEMBRANE_REF_MASS);
+  const heightK = core2 / wRef;                       // h_i = |w_i|·heightK/(r²+core²)
+  const warpGain = (_MEMBRANE_WARP_K * core2) / wRef;
   // Fixed base z-ambient relief floor; the contrast slider now drives the
   // 45° directional highlight/shadow group instead (uContrast in the FS).
   const ambient = _MEMBRANE_AMBIENT;
@@ -2491,6 +2487,11 @@ function _packFieldEntities() {
     if (e.absorbing) continue;
     const Gqm = state.G * e.charge * e.mass;
     if (Gqm === 0) continue;
+    // Sink-in: scale the field weight by the body's embed factor (0→1) so a
+    // freshly-placed body's well grows smoothly. The body is still packed at
+    // embed≈0 (weight ~0) so the membrane hole under it shows from t=0.
+    const embed = e.embed === undefined ? 1 : e.embed;
+    const Gqm_eff = Gqm * embed;
     const nLo = wrap ? -1 : 0;
     const nHi = wrap ? 1 : 0;
     for (let oy = nLo; oy <= nHi; oy++) {
@@ -2499,7 +2500,7 @@ function _packFieldEntities() {
         const o = _fieldEntityCount * 4;
         _fieldEntityData[o]     = e.x + ox * W;
         _fieldEntityData[o + 1] = e.y + oy * H;
-        _fieldEntityData[o + 2] = Gqm;
+        _fieldEntityData[o + 2] = Gqm_eff;
         // V11.2: slot 3 = body collision radius, consumed by
         // _updateSagTexture for inside-radius quadratic interpolation.
         // 0 was unused before; readers that only need (x,y,Gqm) ignore it.

@@ -71,6 +71,7 @@ initPerfMonitor();
 
 const MAX_FRAME_DT = 0.1;      // s — cap to prevent spiral-of-death after a stall
 const MAX_SUBSTEPS = 8;        // safety net: never run more than N physics steps per frame
+const EMBED_TAU = 0.4;         // s — field-viz well sink-in time constant (rubber-sheet settle)
 // Phase C: when last frame was visibly slow (>30 ms = below 33 FPS),
 // throttle this frame to a single substep. Prevents the heavy-frame
 // chain reaction where one expensive dense-cluster frame inflates
@@ -204,6 +205,16 @@ async function runFrame(now) {
 
   perfMarkPhase('post');
   const simDelta = steps * SIM_DT;
+  // Field-viz sink-in: ease each body's `embed` 0→1 (exponential settle) on
+  // simulated time, so its membrane well grows smoothly to steady state.
+  if (simDelta > 0) {
+    const settle = 1 - Math.exp(-simDelta / EMBED_TAU);
+    for (let i = 0; i < state.entities.length; i++) {
+      const e = state.entities[i];
+      if (e.embed === undefined) e.embed = 1;
+      else if (e.embed < 1) e.embed = Math.min(1, e.embed + (1 - e.embed) * settle);
+    }
+  }
   updateTrailCanvas(simDelta);
 
   if (state.selectedId !== null) {
