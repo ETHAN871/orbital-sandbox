@@ -838,8 +838,11 @@ void main() {
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
     h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
-    // Pinch the grid TOWARD the body (lines converge into the well).
-    warp += di * min(uWarpGain * w * inv, PMAX);
+    // Pinch the grid TOWARD the body (lines converge into the well). Soft
+    // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
+    // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
+    float pull = uWarpGain * w * inv;
+    warp += di * (PMAX * pull / (PMAX + pull));
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
