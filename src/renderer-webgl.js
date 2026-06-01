@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260601-parsefix';
+} from './shaders.js?v=20260601-relax';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -2477,6 +2477,41 @@ const UI_STREAMLINE_COLOR = [180 / 255, 210 / 255, 255 / 255, 0.65];
 // 9-ghost PBC copies in wrap mode. Extracted so it can run BEFORE
 // drawSceneGL (needed by V10 sag-texture prep) without coupling to
 // drawField's heavier setup.
+// Smooth well relaxation: when a charged body LEAVES the scene (destroyed off
+// the edge, absorbed by a black hole, deleted, cleared), keep its well in the
+// field and ease its weight 1→0 over _MEMBRANE_FADE_TAU sim-seconds — the
+// membrane springs back like a weight lifted vertically off a rubber sheet,
+// instead of snapping flat ("refresh"). Wrap teleport mutates in place (same
+// id) so it's not a departure and stays continuous.
+const _fadingWells = [];          // {x, y, radius, Gqm, embed} — relaxing toward 0
+let _prevFieldSnap = new Map();    // id → {x, y, radius, Gqm, embed} from last frame
+const _MEMBRANE_FADE_TAU = 0.45;   // s — well spring-back time constant
+
+export function updateFieldFades(simDelta) {
+  const ents = state.entities;
+  const cur = new Map();
+  for (let i = 0; i < ents.length; i++) {
+    const e = ents[i];
+    if (e.absorbing) continue;     // absorbing → treat as departed so its well relaxes
+    const Gqm = state.G * e.charge * e.mass;
+    if (Gqm === 0) continue;
+    const embed = e.embed === undefined ? 1 : e.embed;
+    cur.set(e.id, { x: e.x, y: e.y, radius: e.radius, Gqm, embed });
+  }
+  // Any id present last frame but gone now → started leaving → relax its well.
+  for (const [id, prev] of _prevFieldSnap) {
+    if (!cur.has(id)) _fadingWells.push({ x: prev.x, y: prev.y, radius: prev.radius, Gqm: prev.Gqm, embed: prev.embed });
+  }
+  _prevFieldSnap = cur;
+  if (_fadingWells.length) {
+    const decay = simDelta > 0 ? Math.exp(-simDelta / _MEMBRANE_FADE_TAU) : 1;
+    for (let i = _fadingWells.length - 1; i >= 0; i--) {
+      _fadingWells[i].embed *= decay;
+      if (_fadingWells[i].embed < 0.02) _fadingWells.splice(i, 1);
+    }
+  }
+}
+
 function _packFieldEntities() {
   _fieldEntityCount = 0;
   const wrap = state.boundaryMode === 'wrap';
@@ -2505,6 +2540,24 @@ function _packFieldEntities() {
         // _updateSagTexture for inside-radius quadratic interpolation.
         // 0 was unused before; readers that only need (x,y,Gqm) ignore it.
         _fieldEntityData[o + 3] = e.radius;
+        _fieldEntityCount++;
+      }
+    }
+  }
+  // Relaxing wells (removed bodies springing back). Packed AFTER live bodies so
+  // live ones always win the 128 cap. radius 0 → no hole (the body is gone).
+  const nLo = wrap ? -1 : 0, nHi = wrap ? 1 : 0;
+  for (let f = 0; f < _fadingWells.length; f++) {
+    const fw = _fadingWells[f];
+    const Gqm_eff = fw.Gqm * fw.embed;
+    for (let oy = nLo; oy <= nHi; oy++) {
+      for (let ox = nLo; ox <= nHi; ox++) {
+        if (_fieldEntityCount >= MAX_FIELD_ENTITIES) return;
+        const o = _fieldEntityCount * 4;
+        _fieldEntityData[o]     = fw.x + ox * W;
+        _fieldEntityData[o + 1] = fw.y + oy * H;
+        _fieldEntityData[o + 2] = Gqm_eff;
+        _fieldEntityData[o + 3] = 0;   // no hole — body is gone
         _fieldEntityCount++;
       }
     }

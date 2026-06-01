@@ -848,7 +848,8 @@ void main() {
     float pull = uWarpGain * w * inv;
     warp += di * (PMAX * pull / (PMAX + pull));
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
-    bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
+    // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
+    if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;

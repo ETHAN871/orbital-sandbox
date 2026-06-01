@@ -23,7 +23,8 @@ import {
   updateTrailCanvas,
   resizeRenderer,
   prepareFrameRenderer,
-} from './renderer-webgl.js?v=20260601-parsefix';
+  updateFieldFades,
+} from './renderer-webgl.js?v=20260601-relax';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 import { createBackend } from './physics-backend.js';
@@ -215,6 +216,9 @@ async function runFrame(now) {
       else if (e.embed < 1) e.embed = Math.min(1, e.embed + (1 - e.embed) * settle);
     }
   }
+  // Field-viz spring-back: detect bodies that left this frame and relax their
+  // wells 1→0 (runs unconditionally so UI deletes while paused are caught).
+  updateFieldFades(simDelta);
   updateTrailCanvas(simDelta);
 
   if (state.selectedId !== null) {

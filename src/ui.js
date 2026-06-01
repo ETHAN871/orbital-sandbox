@@ -14,7 +14,7 @@ import {
 } from './state.js';
 import { setStateDumpEnabled } from './state-dump.js';
 import { refreshEntityColor } from './entities.js';
-import { resetTrailCanvas } from './renderer-webgl.js?v=20260601-parsefix';
+import { resetTrailCanvas } from './renderer-webgl.js?v=20260601-relax';
 import { clearContactState } from './physics.js';
 
 const els = {};
