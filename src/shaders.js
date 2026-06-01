@@ -895,7 +895,7 @@ void main() {
   float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
-  // where the lighting `gray` is dark, and the depth bias also packs MORE
+  // where the lighting gray is dark, and the depth bias also packs MORE
   // lines there (denser = darker). On-screen density is constant under the LOD
   // except for the bias, so line count meaningfully encodes depth here. The
   // per-line darkening is clamped (LINE_DARK_MAX) so deep lines never go solid.
