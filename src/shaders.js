@@ -807,8 +807,8 @@ out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no subdivision (small bodies)
-const float REFINE_GAIN = 1.5;       // height above threshold → subdivision levels
-const float REFINE_MAX = 2.0;        // hard cap: shader implements 2 dyadic levels (×2, ×4)
+const float REFINE_GAIN = 0.9;       // height above threshold → levels (lower = sparser)
+const float REFINE_MAX = 2.0;        // hard cap: at most 2 bisections (×2 then ×4)
 const float MIN_CELL_PX = 7.0;       // finest legible cell; caps levels so lines don't moiré
 
 // fwidth-AA coverage of a grid at the given (already-scaled) UV.
