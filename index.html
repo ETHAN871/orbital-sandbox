@@ -79,7 +79,7 @@
         <div class="btn-row">
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
-        <p class="hint">纱窗凹陷：质量越大凹得越深，明暗区分深度（对比度可调）</p>
+        <p class="hint">引力膜：45°打光的灰度哑光膜，网格弯入引力阱（对比度=阴影深浅）</p>
         <label>
           <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
           <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
@@ -87,6 +87,10 @@
         <label>
           <span class="row"><span>场线间距</span><span class="val" id="field-spacing-val">30</span></span>
           <input type="range" id="field-spacing" min="12" max="80" step="2" value="30" />
+        </label>
+        <label>
+          <span class="row"><span>膜透明度</span><span class="val" id="membrane-opacity-val">50%</span></span>
+          <input type="range" id="membrane-opacity" min="0" max="1" step="0.01" value="0.5" />
         </label>
         <!-- view-tilt is rubber-sheet-only (oblique projection); hidden in the
              default '2d' centered radial mode. Reachable via ?field=rubber-sheet. -->
@@ -195,6 +199,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260601-screen-lens-fs"></script>
+  <script type="module" src="src/main.js?v=20260601-membrane"></script>
 </body>
 </html>

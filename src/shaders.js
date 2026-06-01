@@ -761,30 +761,30 @@ void main() {
 }`,
 };
 
-// ─── Screen-dent field — "纱窗被打了一拳" punched fly-screen ────────
-// Full-screen fragment-shader gravitational-lens warp of a procedural
-// grid. Replaces the earlier vertex-mesh dent, whose anti-fold cap
-// (|disp| < 0.45·cell) made the distortion too weak. Technique is the
-// one proven across Shadertoy black-hole / lensing shaders and the
-// `gravy` WebGL lensing repo: per pixel, displace the SAMPLED grid
-// position radially toward each mass, then draw the grid in that warped
-// space. Because it is a per-pixel UV remap (not a moving vertex mesh)
-// there is no fold cap — lines bend hard and pile up into the well, the
-// dramatic "punched screen / spacetime funnel" look.
+// ─── Membrane field — relief-lit grayscale gravity sheet ──────────
+// Full-screen FS that renders the gravity field as the 2D top-down
+// projection of a rubber-sheet membrane (à la the BabylonJS spacetime
+// sandbox), lit by a 45°-elevation point light. Replaces the earlier
+// lens warp, which folded into caustic "flowers" (its UV remap crossed
+// the single-valued threshold near clusters). Three cues, all centered
+// on each body's 2D position (no oblique offset):
 //
-// Warp per body: warped += d · uWarpScale·|w| / (r² + soft²), where
-// d = frag − body (points away), w = G·q·m. Magnitude r·k/(r²+soft²)
-// is 0 at the center (no singularity), peaks at r = soft, falls ~k/r
-// far out. Pulling the sampled point AWAY from the frag toward the mass
-// makes grid features converge toward the body → funnel/dent. soft²
-// keeps the core single-valued so the grid never tears.
+//   1. Height field h(x,y) = Σ |w_i|·core²/(r_i²+core²): the sag depth,
+//      ∝ |G·q·m|, fast 1/r² falloff scaled to the canvas (uCore2). Its
+//      analytic gradient ∇h is summed in the same loop.
+//   2. Relief lighting — surface normal N = normalize(∇h·uSlope, 1) of
+//      the dipping sheet (z = −h); matte Lambert diffuse against a 45°
+//      upper-left point light → grayscale. This is the PRIMARY depth
+//      cue (hillshade): light-facing slope bright, far slope shaded,
+//      flat field uniform mid-gray. uAmbient (from the contrast slider)
+//      sets shadow depth.
+//   3. Grid pinch — lines converge INTO the wells (funnel projected to
+//      2D). Per-body pull is clamped (PMAX) and gain kept modest so the
+//      map stays single-valued: NO caustic folds, far field stays a
+//      straight grid.
 //
-// Shading: depth = Σ|w|/(r²+soft²) (peaks at the well) → brightness.
-// Far/flat lines sit at uContrastFloor (= 1 − fieldContrast); the well
-// ramps UP to full so it lights up against the dark bg (the opposite of
-// the old dim-the-well ramp that buried depth). Contrast = the depth-
-// separation knob. uWarpScale / uDepthMax are CPU-normalized per frame
-// against the heaviest body so a lone light body still warps + lights.
+// The whole membrane is output at alpha = uOpacity (the 膜透明度 slider)
+// so it composites as a semi-transparent sheet over the scene.
 export const SCREEN_DENT = {
   VS: VS_FULLSCREEN,                   // vUv ∈ [0,1]² covers the viewport
   FS: `#version 300 es
@@ -794,37 +794,49 @@ in vec2 vUv;
 uniform vec2 uViewport;
 uniform vec4 uEntities[MAX_ENTITIES];   // (x, y, G·q·m, radius)
 uniform int uEntityCount;
-uniform float uWarpScale;            // displacement gain (CPU-normalized)
-uniform float uSoft2;                // softening² (px²): funnel core size
-uniform float uCellPx;               // grid spacing (world px)
-uniform vec4 uColor;
-uniform float uDepthMax;             // per-frame depth normalizer (>0)
-uniform float uContrastFloor;        // 1 - fieldContrast
+uniform float uHeightK;              // sag amplitude (= core²/maxWeight, normalized)
+uniform float uCore2;                // softening² (px²): well core size
+uniform float uWarpGain;             // grid-pinch gain (kept below fold)
+uniform float uSlope;                // ∇h→normal scale (relief strength)
+uniform float uAmbient;              // ambient floor (shadow depth)
+uniform float uCellPx;               // grid spacing (px)
+uniform vec4 uColor;                 // membrane base tint (rgb)
+uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
+
+const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
+
 void main() {
   // CSS-px frag position (y down from top) — matches uEntities coords.
-  vec2 fragPx = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
-  vec2 warped = fragPx;
-  float depth = 0.0;
+  vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
+  vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
+  vec2 warp = vec2(0.0);             // grid-pinch displacement
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
-    vec2 d = fragPx - e.xy;          // points AWAY from the body
-    float inv = 1.0 / (dot(d, d) + uSoft2);
-    float w = abs(e.z);              // field strength ∝ |G·q·m|
-    warped += d * (uWarpScale * w * inv);   // pull sampled grid toward mass
-    depth  += w * inv;               // ∝ 1/(r²+soft²): peaks at the well
+    vec2 di = p - e.xy;              // points AWAY from the body
+    float inv = 1.0 / (dot(di, di) + uCore2);
+    float w = abs(e.z);             // field strength ∝ |G·q·m|
+    // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
+    grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
+    // Pinch the grid TOWARD the body (lines converge into the well).
+    warp += di * min(uWarpGain * w * inv, PMAX);
   }
-  // Procedural grid in warped space, fwidth-AA (Made-by-Evan / IQ).
-  vec2 uvW = warped / uCellPx;
+  // Surface normal of the dipping sheet (z = -h). Matte Lambert diffuse
+  // against a 45°-elevation point light from the upper-left.
+  vec3 N = normalize(vec3(grad * uSlope, 1.0));
+  const float C = 0.70710678;
+  vec3 L = normalize(vec3(-C * C, C * C, C));   // azimuth 135°, elevation 45°
+  float diff = max(0.0, dot(N, L));
+  float gray = uAmbient + (1.0 - uAmbient) * diff;
+  // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look.
+  vec2 uvW = (p + warp) / uCellPx;
   vec2 fw = max(fwidth(uvW), vec2(1e-6));
   vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
-  if (line < 0.01) discard;
-  // Depth → brightness: flat/far at floor, well-center ramps to full.
-  float t = clamp(depth / max(uDepthMax, 1e-6), 0.0, 1.0);
-  float brightness = mix(uContrastFloor, 1.0, t);
-  outColor = vec4(uColor.rgb * brightness, uColor.a * line);
+  // Threads read as darker weave on the lit grayscale membrane.
+  vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
+  outColor = vec4(rgb, uOpacity);
 }`,
 };
 

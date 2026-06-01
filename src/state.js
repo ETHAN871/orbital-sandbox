@@ -65,6 +65,11 @@ export const DEFAULTS_TUNING = Object.freeze({
   // roughly [10, 80].
   fieldLineSpacing: 30,
 
+  // Membrane field ('screen' style) overall opacity (0..1). The relief-
+  // lit grayscale sheet composites over the scene at this alpha. 0.5 =
+  // semi-transparent default so bodies stay visible through it.
+  membraneOpacity: 0.5,
+
   // V11.1 (2026-05-27): rubber-sheet viewing tilt angle in degrees.
   //   90° = camera looks straight down (top-down); sag projects to
   //         zero screen-Y offset — surface looks flat 2D.
@@ -213,6 +218,7 @@ export const state = {
   contactStiffness:         DEFAULTS_TUNING.contactStiffness,
   fieldContrast:            DEFAULTS_TUNING.fieldContrast,
   fieldLineSpacing:         DEFAULTS_TUNING.fieldLineSpacing,
+  membraneOpacity:          DEFAULTS_TUNING.membraneOpacity,
   viewTilt:                 DEFAULTS_TUNING.viewTilt,
 
   // Canvas background color — toggled by the 深/浅 button.

@@ -447,19 +447,21 @@ function _initPrograms() {
   _progGridWarp.uContrastFloor = gl.getUniformLocation(_progGridWarp.prog, 'uContrastFloor');
   _progGridWarp.uCellPx        = gl.getUniformLocation(_progGridWarp.prog, 'uCellPx');
 
-  // Punched fly-screen program (default field viz). Full-screen FS lens
-  // warp on the shared VS_FULLSCREEN quad (_vaoFsQuad); see SCREEN_DENT
-  // in shaders.js for the technique.
+  // Membrane field program (default field viz). Full-screen relief-lit
+  // gravity sheet on the shared VS_FULLSCREEN quad (_vaoFsQuad); see
+  // SCREEN_DENT in shaders.js for the technique.
   _progScreenDent = _makeProgram(SCREEN_DENT.VS, SCREEN_DENT.FS);
   _progScreenDent.uViewport      = gl.getUniformLocation(_progScreenDent.prog, 'uViewport');
   _progScreenDent.uEntities      = gl.getUniformLocation(_progScreenDent.prog, 'uEntities[0]');
   _progScreenDent.uEntityCount   = gl.getUniformLocation(_progScreenDent.prog, 'uEntityCount');
-  _progScreenDent.uWarpScale     = gl.getUniformLocation(_progScreenDent.prog, 'uWarpScale');
-  _progScreenDent.uSoft2         = gl.getUniformLocation(_progScreenDent.prog, 'uSoft2');
+  _progScreenDent.uHeightK       = gl.getUniformLocation(_progScreenDent.prog, 'uHeightK');
+  _progScreenDent.uCore2         = gl.getUniformLocation(_progScreenDent.prog, 'uCore2');
+  _progScreenDent.uWarpGain      = gl.getUniformLocation(_progScreenDent.prog, 'uWarpGain');
+  _progScreenDent.uSlope         = gl.getUniformLocation(_progScreenDent.prog, 'uSlope');
+  _progScreenDent.uAmbient       = gl.getUniformLocation(_progScreenDent.prog, 'uAmbient');
   _progScreenDent.uCellPx        = gl.getUniformLocation(_progScreenDent.prog, 'uCellPx');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
-  _progScreenDent.uDepthMax      = gl.getUniformLocation(_progScreenDent.prog, 'uDepthMax');
-  _progScreenDent.uContrastFloor = gl.getUniformLocation(_progScreenDent.prog, 'uContrastFloor');
+  _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
 
   // V12 (2026-05-28): full-screen FS rubber-sheet renderer. Shares the
   // VS_FULLSCREEN VAO (_vaoFsQuad) with the trail-decay/blit programs.
@@ -1421,45 +1423,48 @@ function _sortGridIndicesPainter() {
   return true;
 }
 
-// Punched fly-screen field — full-screen FS gravitational-lens warp of a
-// procedural grid. See SCREEN_DENT in shaders.js for the technique. The
-// warp is a per-pixel UV remap (no fold cap) so the bend is dramatic.
-const _SCREEN_DENT_SOFT_PX  = 55;    // funnel core radius (px); larger = softer/wider well
-const _SCREEN_DENT_WARP_PX  = 220;   // peak grid displacement for the heaviest body (px)
+// Membrane field — full-screen relief-lit grayscale gravity sheet. See
+// SCREEN_DENT in shaders.js. Height field + 45° point-light hillshade +
+// single-valued grid pinch, composited at the 膜透明度 alpha.
+const _MEMBRANE_CORE_FRAC = 0.08;    // well core radius = CORE_FRAC · min(vp); larger = wider
+const _MEMBRANE_SLOPE_K   = 2.2;     // ∇h→normal scale (× core); larger = stronger relief
+const _MEMBRANE_WARP_K    = 0.8;     // grid-pinch gain (×, kept below fold)
+const _MEMBRANE_COLOR     = [0.82, 0.86, 0.94];   // cool grayscale membrane tint
 function _drawScreenDent() {
   const gl = _gl;
   if (!_progScreenDent) return;
 
-  // Heaviest body's |G·q·m| → per-frame scale normalizers so warp depth
-  // and shading adapt to G / mass without a manual gain.
+  // Heaviest body's |G·q·m| → per-frame normalizers so relief + pinch
+  // adapt to G / mass without a manual gain. Core scales with the canvas
+  // (the "按 canvas 距离尺度缩放" request) so wells stay proportionate.
   let maxWeight = 0;
   for (let i = 0; i < _fieldEntityCount; i++) {
     const w = Math.abs(_fieldEntityData[i * 4 + 2]);
     if (w > maxWeight) maxWeight = w;
   }
-  const soft = _SCREEN_DENT_SOFT_PX;
-  const soft2 = soft * soft;
-  // Displacement magnitude r·k·w/(r²+soft²) peaks at r=soft with value
-  // k·w/(2·soft). Solve k so the heaviest body's peak shift = WARP_PX:
-  //   k = WARP_PX · 2·soft / maxWeight. maxWeight==0 (empty scene) → 0
-  //   warp → a flat unpunched screen.
-  const warpScale = maxWeight > 0 ? (_SCREEN_DENT_WARP_PX * 2 * soft) / maxWeight : 0;
-  // depth = Σ|w|/(r²+soft²); at the heaviest center (r=0) ≈ maxWeight/soft².
-  const depthMax = maxWeight > 0 ? maxWeight / soft2 : 1;
+  const core = Math.max(8, Math.min(_vpW, _vpH) * _MEMBRANE_CORE_FRAC);
+  const core2 = core * core;
+  // heightK folds amplitude + per-frame normalization: h_i = |w_i|·heightK
+  //   / (r²+core²) with heightK = core²/maxWeight peaks at 1 per body.
+  const heightK = maxWeight > 0 ? core2 / maxWeight : 0;
+  const warpGain = maxWeight > 0 ? (_MEMBRANE_WARP_K * core2) / maxWeight : 0;
+  // contrast slider → ambient floor (shadow depth). High contrast = low
+  // ambient = deep shadows; contrast 0 = flat lighting.
+  const ambient = 0.55 - 0.45 * Math.min(1, Math.max(0, state.fieldContrast));
 
   gl.useProgram(_progScreenDent.prog);
   gl.uniform2f(_progScreenDent.uViewport, _vpW, _vpH);
   gl.uniform4fv(_progScreenDent.uEntities, _fieldEntityData, 0, _fieldEntityCount * 4);
   gl.uniform1i(_progScreenDent.uEntityCount, _fieldEntityCount);
-  gl.uniform1f(_progScreenDent.uWarpScale, warpScale);
-  gl.uniform1f(_progScreenDent.uSoft2, soft2);
+  gl.uniform1f(_progScreenDent.uHeightK, heightK);
+  gl.uniform1f(_progScreenDent.uCore2, core2);
+  gl.uniform1f(_progScreenDent.uWarpGain, warpGain);
+  gl.uniform1f(_progScreenDent.uSlope, core * _MEMBRANE_SLOPE_K);
+  gl.uniform1f(_progScreenDent.uAmbient, ambient);
   gl.uniform1f(_progScreenDent.uCellPx, Math.max(8, state.fieldLineSpacing));
   gl.uniform4f(_progScreenDent.uColor,
-    GRID_WARP_COLOR_2D[0], GRID_WARP_COLOR_2D[1], GRID_WARP_COLOR_2D[2], GRID_WARP_COLOR_2D[3]);
-  gl.uniform1f(_progScreenDent.uDepthMax, depthMax);
-  // contrast slider: floor = 1 - contrast = brightness of flat/far lines;
-  // the well ramps up to full → deeper reads brighter. 0 = flat.
-  gl.uniform1f(_progScreenDent.uContrastFloor, 1 - state.fieldContrast);
+    _MEMBRANE_COLOR[0], _MEMBRANE_COLOR[1], _MEMBRANE_COLOR[2], 1.0);
+  gl.uniform1f(_progScreenDent.uOpacity, Math.min(1, Math.max(0, state.membraneOpacity)));
 
   // Shared fullscreen-quad VAO (VS_FULLSCREEN), same as _drawRubberSheetFS.
   gl.bindVertexArray(_vaoFsQuad);

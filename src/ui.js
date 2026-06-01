@@ -65,6 +65,8 @@ export function bindUI() {
   bindRangeSlider('field-contrast', val => { state.fieldContrast = val; }, 2);
   // V9.9: Jobard-Lefer streamline spacing (CSS-px) for curvilinear grid.
   bindRangeSlider('field-spacing', val => { state.fieldLineSpacing = val | 0; }, 0);
+  // Membrane field opacity (0..1), shown as a percentage.
+  bindRangeSlider('membrane-opacity', val => { state.membraneOpacity = val; }, 2);
   // V11.1: rubber-sheet viewing tilt (degrees). 90°=top-down (flat),
   // 45°=classic oblique, 30°=strong oblique. Renderer reads as
   // cos(viewTilt * π / 180) and binds as uSagYFactor uniform.
@@ -211,6 +213,7 @@ function formatVal(id, raw, decimals) {
   if (id === 'tune-eps')      return `${raw.toFixed(1)} px`;
   if (id === 'tune-predict')  return `${raw.toFixed(1)} 秒`;
   if (id === 'view-tilt')     return `${Math.round(raw)}°`;
+  if (id === 'membrane-opacity') return `${Math.round(raw * 100)}%`;
   return decimals > 0 ? raw.toFixed(decimals) : String(Math.round(raw));
 }
 
