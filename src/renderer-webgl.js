@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260601-relax';
+} from './shaders.js?v=20260601-relax2';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -2545,7 +2545,8 @@ function _packFieldEntities() {
     }
   }
   // Relaxing wells (removed bodies springing back). Packed AFTER live bodies so
-  // live ones always win the 128 cap. radius 0 → no hole (the body is gone).
+  // live ones always win the 128 cap. The hole shrinks with the fade so the
+  // membrane closes over the well gradually (no snap when the body leaves).
   const nLo = wrap ? -1 : 0, nHi = wrap ? 1 : 0;
   for (let f = 0; f < _fadingWells.length; f++) {
     const fw = _fadingWells[f];
@@ -2557,7 +2558,9 @@ function _packFieldEntities() {
         _fieldEntityData[o]     = fw.x + ox * W;
         _fieldEntityData[o + 1] = fw.y + oy * H;
         _fieldEntityData[o + 2] = Gqm_eff;
-        _fieldEntityData[o + 3] = 0;   // no hole — body is gone
+        // Hole shrinks shut as the well relaxes: at removal it matches the live
+        // body's hole (continuous), then closes smoothly with embed.
+        _fieldEntityData[o + 3] = fw.radius * fw.embed;
         _fieldEntityCount++;
       }
     }
@@ -2853,3 +2856,4 @@ function _drawStreamlines() {
   gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, liveCount);
   gl.bindVertexArray(null);
 }
+
