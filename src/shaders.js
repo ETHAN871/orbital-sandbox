@@ -810,6 +810,8 @@ const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refi
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
 const float LINE_DARK = 0.5;         // base per-line darkening (× on-screen density = const ink)
+const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
+const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -852,11 +854,16 @@ void main() {
   vec3 N = normalize(vec3(grad * uSlope, 1.0));
   const float C = 0.70710678;
   vec3 L = normalize(vec3(-C * C, C * C, C));        // 45° elev, az 135°
-  float zAmb = N.z;                                  // +z ambient light
-  float dir  = dot(N, L) * 0.5 + 0.5;                // 45° half-Lambert (soft)
+  float dir = dot(N, L) * 0.5 + 0.5;                 // 45° directional (half-Lambert)
   float k = clamp(uContrast, 0.0, 1.0);
-  float lit = (zAmb + k * dir) / (1.0 + k);          // superpose ambient + 45°
-  float gray = mix(uAmbient, 1.0, lit);              // floor so slopes don't crush
+  float baseLit = (N.z + k * dir) / (1.0 + k);       // z-ambient slope + 45° sun fill
+  // Depth ambient occlusion: a point deeper in a well sees less of the sky /
+  // sun (cavity occlusion) → darker. Rational sky-visibility falloff with a
+  // floor (indirect bounce keeps it off pure black). Unified with the N.z
+  // slope term: slope = which way the surface faces, AO = how buried it is —
+  // both attenuate the incoming light, so AO multiplies the lit result.
+  float ao = AO_FLOOR + (1.0 - AO_FLOOR) / (1.0 + h * AO_STRENGTH);
+  float gray = mix(uAmbient, 1.0, baseLit) * ao;
   // Adaptive refinement by DYADIC SUBDIVISION: keep the base grid fixed and
   // fade in midpoint lines (×2, ×4 spacing) where the field deepens — i.e.
   // a heavy body splits existing cells rather than reflowing the whole grid.

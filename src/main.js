@@ -23,7 +23,7 @@ import {
   updateTrailCanvas,
   resizeRenderer,
   prepareFrameRenderer,
-} from './renderer-webgl.js?v=20260601-softclamp';
+} from './renderer-webgl.js?v=20260601-ao';
 import { attachInput } from './input.js';
 import { bindUI, syncFromSelection, updateEntityCount } from './ui.js';
 import { createBackend } from './physics-backend.js';
