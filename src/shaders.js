@@ -811,9 +811,12 @@ const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
 const float LINE_DARK = 0.5;         // base per-line darkening (× on-screen density = const ink)
 
-// fwidth-AA coverage of a grid at the given (already-scaled) UV.
-float gridAt(vec2 uvw) {
-  vec2 fw = max(fwidth(uvw), vec2(1e-6));
+// AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
+// octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
+// pixels) and prints stray line fragments — so the caller passes the
+// derivative scaled from the continuous base coord instead.
+float gridAt(vec2 uvw, vec2 d) {
+  vec2 fw = max(d, vec2(1e-6));
   vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
   return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
 }
@@ -863,16 +866,21 @@ void main() {
   // masses still get extra detail without over-densifying.
   vec2 uvW = (p + warp) / uCellPx;            // warped (drawn) grid coord
   vec2 uvF = p / uCellPx;                      // flat reference (base density)
-  float fwW = max(max(fwidth(uvW.x), fwidth(uvW.y)), 1e-6);
-  float fwF = max(max(fwidth(uvF.x), fwidth(uvF.y)), 1e-6);
+  vec2 dW = fwidth(uvW);                       // continuous base derivatives
+  vec2 dF = fwidth(uvF);
+  float fwW = max(max(dW.x, dW.y), 1e-6);
+  float fwF = max(max(dF.x, dF.y), 1e-6);
   float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
   float lam = lodC - bias;                     // net octave (− = finer than base)
   float n0 = floor(lam);
   float fr = lam - n0;
-  // Blend the two bracketing octaves so coarsening/refining is smooth (no pop);
-  // the finer octave's extra lines fade out as the level coarsens.
-  float line = mix(gridAt(uvW * exp2(-n0)), gridAt(uvW * exp2(-(n0 + 1.0))), fr);
+  // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
+  // derivative EXPLICITLY (continuous dW × octave scale) — never fwidth() of
+  // the scaled coord, which spikes at seams and prints stray line fragments.
+  float s0 = exp2(-n0);
+  float s1 = exp2(-(n0 + 1.0));
+  float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
   // Constant ink: on-screen density = base · 2^bias (LOD cancels compression),
   // so fade lines by 2^bias → region brightness stays decoupled from density.
   float dark = LINE_DARK / exp2(bias);
