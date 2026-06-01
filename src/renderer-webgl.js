@@ -1431,7 +1431,7 @@ const _MEMBRANE_CORE_FRAC = 0.08;    // well core radius = CORE_FRAC · min(vp);
 const _MEMBRANE_SLOPE_K   = 2.2;     // ∇h→normal scale (× core); larger = stronger relief
 const _MEMBRANE_WARP_K    = 0.8;     // grid-pinch gain (×, kept below fold)
 const _MEMBRANE_AMBIENT   = 0.45;    // base z-ambient relief floor (slope darkening)
-const _MEMBRANE_COLOR     = [0.82, 0.86, 0.94];   // cool grayscale membrane tint
+const _MEMBRANE_COLOR     = [0.85, 0.85, 0.87];   // near-neutral grayscale membrane
 function _drawScreenDent() {
   const gl = _gl;
   if (!_progScreenDent) return;

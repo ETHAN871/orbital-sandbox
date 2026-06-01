@@ -838,16 +838,18 @@ void main() {
   const float SHADOW_DEPTH = 0.5;                    // <1 → shadows stay shallow
   const float SPEC_STRENGTH = 1.3;                   // highlight pop
   float k = clamp(uContrast, 0.0, 1.0);
-  // Soft shallow shadow pulls base down on back slopes; glossy highlight
-  // adds on light-facing slopes. Both scale with the contrast slider.
-  float gray = base * (1.0 - k * SHADOW_DEPTH * (1.0 - softDiff)) + k * spec * SPEC_STRENGTH;
+  // Diffuse/ambient body keeps the membrane tint; the specular is WHITE
+  // (light colour), added SEPARATELY so the highlight never takes on the
+  // membrane's cast or clips per-channel into coloured fringes.
+  float diffGray = base * (1.0 - k * SHADOW_DEPTH * (1.0 - softDiff));
+  float specWhite = k * spec * SPEC_STRENGTH;
   // Grid threads (fwidth-AA) in pinched space → woven "纱窗" look.
   vec2 uvW = (p + warp) / uCellPx;
   vec2 fw = max(fwidth(uvW), vec2(1e-6));
   vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
-  // Threads read as darker weave on the lit grayscale membrane.
-  vec3 rgb = uColor.rgb * gray * mix(1.0, 0.5, line);
+  // Threads read as darker weave on the lit membrane.
+  vec3 rgb = (uColor.rgb * diffGray + vec3(specWhite)) * mix(1.0, 0.5, line);
   outColor = vec4(rgb, uOpacity);
 }`,
 };
