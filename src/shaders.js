@@ -848,8 +848,12 @@ void main() {
   vec2 fw = max(fwidth(uvW), vec2(1e-6));
   vec2 g = abs(fract(uvW - 0.5) - 0.5) / fw;
   float line = 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
-  // Threads read as darker weave on the lit membrane.
-  vec3 rgb = (uColor.rgb * diffGray + vec3(specWhite)) * mix(1.0, 0.5, line);
+  // Membrane fill = diffuse body + white highlight. Grid threads are a
+  // darker, diffuse-ONLY weave composited on top, so the specular
+  // highlight never washes out / covers the lines.
+  vec3 fill   = uColor.rgb * diffGray + vec3(specWhite);
+  vec3 thread = uColor.rgb * diffGray * 0.5;
+  vec3 rgb = mix(fill, thread, line);
   outColor = vec4(rgb, uOpacity);
 }`,
 };
