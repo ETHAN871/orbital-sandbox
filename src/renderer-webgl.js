@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260603-dash';
+} from './shaders.js?v=20260603-warpcap';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -464,6 +464,7 @@ function _initPrograms() {
   _progScreenDent.uCell          = gl.getUniformLocation(_progScreenDent.prog, 'uCell');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
+  _progScreenDent.uCompanionDark = gl.getUniformLocation(_progScreenDent.prog, 'uCompanionDark');
 
   // V12 (2026-05-28): full-screen FS rubber-sheet renderer. Shares the
   // VS_FULLSCREEN VAO (_vaoFsQuad) with the trail-decay/blit programs.
@@ -1509,6 +1510,7 @@ function _drawScreenDent() {
   gl.uniform4f(_progScreenDent.uColor,
     _MEMBRANE_COLOR[0], _MEMBRANE_COLOR[1], _MEMBRANE_COLOR[2], 1.0);
   gl.uniform1f(_progScreenDent.uOpacity, Math.min(1, Math.max(0, state.membraneOpacity)));
+  gl.uniform1f(_progScreenDent.uCompanionDark, Math.min(1, Math.max(0, state.companionDark)));
 
   // Shared fullscreen-quad VAO (VS_FULLSCREEN), same as _drawRubberSheetFS.
   gl.bindVertexArray(_vaoFsQuad);

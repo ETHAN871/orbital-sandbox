@@ -92,6 +92,10 @@
           <span class="row"><span>膜透明度</span><span class="val" id="membrane-opacity-val">50%</span></span>
           <input type="range" id="membrane-opacity" min="0" max="1" step="0.01" value="0.5" />
         </label>
+        <label title="僚翼线：主网格线旁的细分细线，0=隐藏（仅主网格）">
+          <span class="row"><span>僚翼线明度</span><span class="val" id="companion-dark-val">45%</span></span>
+          <input type="range" id="companion-dark" min="0" max="1" step="0.01" value="0.45" />
+        </label>
         <!-- view-tilt is rubber-sheet-only (oblique projection); hidden in the
              default '2d' centered radial mode. Reachable via ?field=rubber-sheet. -->
         <label hidden title="橡皮膜视角倾角：90°=俯视（平面），45°=经典斜视，30°=强斜视。仅 rubber-sheet 模式生效。">
@@ -199,6 +203,6 @@
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260603-dash"></script>
+  <script type="module" src="src/main.js?v=20260603-warpcap"></script>
 </body>
 </html>

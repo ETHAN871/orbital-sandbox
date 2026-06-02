@@ -804,6 +804,7 @@ uniform float uWrap;                 // 1 = wrap: use minimum-image (toroidal, w
 uniform vec2 uCell;                  // grid spacing per-axis (px); toroidal in wrap mode
 uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
+uniform float uCompanionDark;        // companion ("僚翼") line contrast vs main lines (slider, 0=hidden)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
@@ -816,9 +817,7 @@ const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clam
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
 const float LOD_DB = 0.15;           // octave deadband — trims only the worst sub-pixel flicker
-const float COMPANION_DARK = 0.45;   // companion ("僚翼") subdivision-line contrast vs main lines
-const float DASH_PERIOD = 0.55;      // companion dash repeat along a line (in grid cells)
-const float DASH_DUTY = 0.62;        // dash on-fraction (rest is gap) → periodic broken lines
+const float WARP_CAP = 0.10;         // total-warp saturation (× min viewport) — anti grid-fold
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -828,30 +827,6 @@ float gridAt(vec2 uvw, vec2 d) {
   vec2 fw = max(d, vec2(1e-6));
   vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
   return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
-}
-
-float hash11(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
-
-// Periodic dash mask along ONE line's tangent: 1 inside a dash, 0 in the gap,
-// centered per period (symmetric AA on both edges, no hard wrap seam). t is the
-// along-line coordinate in dash-periods; duty is the on-fraction.
-float dashMask(float t, float duty) {
-  float u = abs(fract(t) - 0.5);            // 0 at dash center, 0.5 at period edge
-  return smoothstep(0.5 * duty + 0.10, 0.5 * duty - 0.10, u);
-}
-
-// Like gridAt, but each line is chopped into periodic dashes along its tangent,
-// with a hash-jittered phase per line so the breaks look organic (random mod
-// truncation points) rather than ruled. Used only for the faint companion
-// sub-layer — main lines stay solid.
-float dashedGridAt(vec2 uvw, vec2 d) {
-  vec2 fw = max(d, vec2(1e-6));
-  vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
-  float cx = 1.0 - smoothstep(0.5, 1.5, g.x);   // vertical lines (x ≈ int)
-  float cy = 1.0 - smoothstep(0.5, 1.5, g.y);   // horizontal lines (y ≈ int)
-  float px = uvw.y / DASH_PERIOD + hash11(floor(uvw.x) + 0.5);   // dash along y, phase per column
-  float py = uvw.x / DASH_PERIOD + hash11(floor(uvw.y) + 17.3);  // dash along x, phase per row
-  return max(cx * dashMask(px, DASH_DUTY), cy * dashMask(py, DASH_DUTY));
 }
 
 void main() {
@@ -903,6 +878,15 @@ void main() {
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
+  // Soft-clamp the TOTAL warp. PMAX bounds each body's pinch, but a dense
+  // cluster sums dozens of contributions → the grid map (p+warp) folds back on
+  // itself and lines close into loops (visible in wrap mode under a heavy blob).
+  // Saturate the summed magnitude: sparse scenes (small |warp|) keep full pinch
+  // (factor ≈ 1); dense stacks saturate toward WARP_CAP·min(viewport), too small
+  // to fold. Direction preserved, so the pinch shape is unchanged where gentle.
+  float wmag = length(warp);
+  float wcap = WARP_CAP * min(uViewport.x, uViewport.y);
+  warp *= wcap / (wcap + wmag);
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
   // half-Lambert keeps its terminator soft and its shadow shallow.
@@ -948,14 +932,13 @@ void main() {
   // scale) — never fwidth() of the scaled coord, which spikes at seams.
   float s0 = exp2(-n0);                          // finer octave
   float s1 = exp2(-(n0 + 1.0));                  // coarser octave (persistent main lines)
-  float coarse = gridAt(uvW * s1, dW * s1);          // main grid lines (persist across LOD)
-  float fine   = dashedGridAt(uvW * s0, dW * s0);    // finer "companion" lines, periodically broken
+  float coarse = gridAt(uvW * s1, dW * s1);      // main grid lines (persist across LOD)
+  float fine   = gridAt(uvW * s0, dW * s0);      // main + finer "companion" lines
   // Companion ("僚翼") lines: the finer-octave detail flanking the main lines,
-  // gated in by LOD engagement (1-fr). KEPT for their lively motion, but chopped
-  // into hash-jittered periodic DASHES (dashedGridAt) and drawn at reduced
-  // contrast (COMPANION_DARK) so the extra density does not pile on darkness —
-  // region brightness then tracks line DENSITY, not raw line count (denser ⇒
-  // each companion fainter, matching the regional tone).
+  // gated in by LOD engagement (1-fr). KEPT for their lively motion, as continuous
+  // low-contrast lines whose visibility is the uCompanionDark slider so the extra
+  // density does not pile on darkness — region brightness tracks line DENSITY,
+  // not raw line count (denser ⇒ each companion fainter, matching the tone).
   float companion = (1.0 - fr) * max(0.0, fine - coarse);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block (FILL_SHADE≈0): each line darkens where the lighting gray is dark
@@ -965,7 +948,7 @@ void main() {
   float lineDark = clamp(mix(LINE_DARK_MIN, LINE_DARK_MAX, 1.0 - gray), 0.0, LINE_DARK_MAX);
   vec3 rgb = uColor.rgb * fill;
   rgb *= (1.0 - coarse * lineDark);                       // main grid (full contrast)
-  rgb *= (1.0 - companion * lineDark * COMPANION_DARK);   // faint companion sub-layer
+  rgb *= (1.0 - companion * lineDark * uCompanionDark);   // faint companion sub-layer (slider)
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,
