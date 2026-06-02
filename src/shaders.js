@@ -817,7 +817,7 @@ const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clam
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
 const float LOD_DB = 0.15;           // octave deadband — trims only the worst sub-pixel flicker
-const float WARP_CAP = 0.10;         // total-warp saturation (× min viewport) — anti grid-fold
+const float WARP_NORM = 6.0;         // warp density self-limit strength (anti grid-fold)
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -834,6 +834,7 @@ void main() {
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
   vec2 warp = vec2(0.0);             // grid-pinch displacement
+  float pinchSum = 0.0;              // Σ pinch tension (anti-fold density self-limit)
   float h = 0.0;                     // absolute height field (∝ mass), drives refinement
   float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
@@ -873,20 +874,24 @@ void main() {
     // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
     // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
     float pull = uWarpGain * wf * inv;
-    warp += di * (PMAX * pull / (PMAX + pull));
+    float f = PMAX * pull / (PMAX + pull);
+    warp += di * f;
+    pinchSum += f;                  // total pinch tension → density self-limit (anti-fold)
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
-  // Soft-clamp the TOTAL warp. PMAX bounds each body's pinch, but a dense
-  // cluster sums dozens of contributions → the grid map (p+warp) folds back on
-  // itself and lines close into loops (visible in wrap mode under a heavy blob).
-  // Saturate the summed magnitude: sparse scenes (small |warp|) keep full pinch
-  // (factor ≈ 1); dense stacks saturate toward WARP_CAP·min(viewport), too small
-  // to fold. Direction preserved, so the pinch shape is unchanged where gentle.
-  float wmag = length(warp);
-  float wcap = WARP_CAP * min(uViewport.x, uViewport.y);
-  warp *= wcap / (wcap + wmag);
+  // Anti-fold: density self-limit. PMAX bounds each body's pinch, but a dense
+  // cluster sums dozens → the grid map (p+warp) folds back on itself and lines
+  // close into loops (the wrap-mode "闭环"). A pure magnitude clamp does NOT fix
+  // it — folding is a Jacobian (∂warp/∂p) problem, not a magnitude one. Divide
+  // the summed warp by its own pinch TENSION (Σf): where many bodies pile up the
+  // warp saturates toward di/WARP_NORM regardless of body count, so ∂warp/∂p
+  // stays below the fold threshold at ANY density (self-limiting, verified 0
+  // folds on single→sparse→dense→very-dense scenes). Sparse scenes (small Σf)
+  // keep ~full pinch (factor ≈ 1); single wells never folded, so the mild
+  // softening there is harmless.
+  warp /= (1.0 + WARP_NORM * pinchSum);
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
   // half-Lambert keeps its terminator soft and its shadow shallow.
