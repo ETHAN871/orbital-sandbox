@@ -800,6 +800,7 @@ uniform float uWarpGain;             // grid-pinch gain (kept below fold)
 uniform float uSlope;                // ∇h→normal scale (relief strength)
 uniform float uAmbient;              // base z-ambient relief floor (fixed)
 uniform float uContrast;             // 45° highlight/shadow group strength (slider)
+uniform float uWrap;                 // 1 = wrap: use minimum-image (toroidal, wrap-invariant)
 uniform vec2 uCell;                  // grid spacing per-axis (px); toroidal in wrap mode
 uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
@@ -836,6 +837,11 @@ void main() {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
     vec2 di = p - e.xy;              // points AWAY from the body
+    // Wrap: minimum-image — each fragment sees the body's NEAREST image. This
+    // makes the field toroidally exact AND wrap-invariant: a body at y vs y+H
+    // yields the identical field, so crossing the seam no longer shifts the
+    // grid (the 9-ghost packing was asymmetric → grid phase jumped on wrap).
+    if (uWrap > 0.5) di -= uViewport * floor(di / uViewport + 0.5);
     float r2 = dot(di, di);
     float inv = 1.0 / (r2 + uCore2);
     float w = abs(e.z);             // field strength ∝ |G·q·m|·embed

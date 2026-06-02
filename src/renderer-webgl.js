@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260601-relax3';
+} from './shaders.js?v=20260601-wrapfix';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -460,6 +460,7 @@ function _initPrograms() {
   _progScreenDent.uSlope         = gl.getUniformLocation(_progScreenDent.prog, 'uSlope');
   _progScreenDent.uAmbient       = gl.getUniformLocation(_progScreenDent.prog, 'uAmbient');
   _progScreenDent.uContrast      = gl.getUniformLocation(_progScreenDent.prog, 'uContrast');
+  _progScreenDent.uWrap          = gl.getUniformLocation(_progScreenDent.prog, 'uWrap');
   _progScreenDent.uCell          = gl.getUniformLocation(_progScreenDent.prog, 'uCell');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
@@ -1437,6 +1438,38 @@ function _drawScreenDent() {
   const gl = _gl;
   if (!_progScreenDent) return;
 
+  // Pack ONE entity per body — NO wrap ghosts. The membrane shader uses
+  // minimum-image (uWrap) so a single body already yields a toroidally exact,
+  // WRAP-INVARIANT field (a body at y vs y+H renders identically → no grid
+  // jump on a seam crossing). 1 entity/body also eases the 128 cap. Relaxing
+  // wells are appended likewise.
+  const wrap = state.boundaryMode === 'wrap';
+  _fieldEntityCount = 0;
+  const ents = state.entities;
+  for (let i = 0; i < ents.length; i++) {
+    const e = ents[i];
+    if (e.absorbing) continue;
+    const Gqm = state.G * e.charge * e.mass;
+    if (Gqm === 0) continue;
+    if (_fieldEntityCount >= MAX_FIELD_ENTITIES) break;
+    const embed = e.embed === undefined ? 1 : e.embed;
+    const o = _fieldEntityCount * 4;
+    _fieldEntityData[o]     = e.x;
+    _fieldEntityData[o + 1] = e.y;
+    _fieldEntityData[o + 2] = Gqm * embed;
+    _fieldEntityData[o + 3] = e.radius;
+    _fieldEntityCount++;
+  }
+  for (let f = 0; f < _fadingWells.length && _fieldEntityCount < MAX_FIELD_ENTITIES; f++) {
+    const fw = _fadingWells[f];
+    const o = _fieldEntityCount * 4;
+    _fieldEntityData[o]     = fw.x;
+    _fieldEntityData[o + 1] = fw.y;
+    _fieldEntityData[o + 2] = fw.Gqm * fw.embed;
+    _fieldEntityData[o + 3] = fw.radius * fw.embed;
+    _fieldEntityCount++;
+  }
+
   // ABSOLUTE field scale (NOT normalized to the heaviest body): a body's
   // well depth depends only on its own mass, so adding/removing bodies never
   // rescales the existing wells. Reference weight = G·REF_MASS makes a
@@ -1461,6 +1494,7 @@ function _drawScreenDent() {
   gl.uniform1f(_progScreenDent.uSlope, core * _MEMBRANE_SLOPE_K);
   gl.uniform1f(_progScreenDent.uAmbient, ambient);
   gl.uniform1f(_progScreenDent.uContrast, contrast);
+  gl.uniform1f(_progScreenDent.uWrap, wrap ? 1.0 : 0.0);
   // Toroidal grid in wrap mode: snap the cell so the viewport tiles a whole
   // number of cells per axis → the grid is seamless across the wrap edges, so
   // a well crossing the boundary has no grid-phase jump. Bounded mode uses the
