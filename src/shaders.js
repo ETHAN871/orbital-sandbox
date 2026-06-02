@@ -808,6 +808,7 @@ out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap grid-fold)
+const float FOLD_VEIL_HI = 0.5;      // caustic veil: fade grid where warp map Jacobian det < this
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -909,6 +910,17 @@ void main() {
   float s0 = exp2(-n0);
   float s1 = exp2(-(n0 + 1.0));
   float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
+  // Caustic veil ("虚化"). A deep, mass-proportional in-plane pinch is a strong
+  // lens, and a strong lens unavoidably folds (caustics — Einstein-ring loops)
+  // where the warp map (p+warp) becomes non-injective. Rather than cap the
+  // depth (which kills the mass cue), DETECT the fold from warp's screen-space
+  // Jacobian determinant and FADE the grid lines there, so the caustic blurs
+  // softly into the shaded membrane instead of printing hard crossing rings.
+  // Depth is read from the lighting/AO (gray darkens with mass) — unaffected.
+  // Non-folding deep pinch (jdet > 0) keeps the full grid.
+  vec2 wdx = dFdx(warp), wdy = dFdy(warp);
+  float jdet = (1.0 + wdx.x) * (1.0 + wdy.y) - wdy.x * wdx.y;
+  line *= smoothstep(0.0, FOLD_VEIL_HI, jdet);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
   // where the lighting gray is dark, and the depth bias also packs MORE
