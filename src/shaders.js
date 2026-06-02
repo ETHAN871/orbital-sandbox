@@ -808,7 +808,6 @@ out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap grid-fold)
-const float WARP_NORM = 1.0;         // mass self-limit (anti-overshoot fold); 0 = off
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -833,7 +832,6 @@ void main() {
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
   vec2 warp = vec2(0.0);             // grid-pinch displacement
-  float pinchSum = 0.0;              // Σ pinch tension → mass self-limit (anti-overshoot fold)
   float h = 0.0;                     // absolute height field (∝ mass), drives refinement
   float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
@@ -864,17 +862,10 @@ void main() {
     vec2 wdi = di;
     if (uWrap > 0.5) wdi = (uViewport / TAU) * sin(TAU * di / uViewport);
     warp += wdi * f;
-    pinchSum += f;
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
-  // Mass self-limit (anti-overshoot): a big aggregate sums many pinches → the
-  // radial map overshoots and folds into sac-like loops (mass-driven, both wrap
-  // & destroy). Divide warp by its own pinch tension Σf: normal wells (small Σf)
-  // are barely touched, huge aggregates saturate so the map cannot fold. Self-
-  // limiting at any mass.
-  warp /= (1.0 + WARP_NORM * pinchSum);
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
   // half-Lambert keeps its terminator soft and its shadow shallow.
