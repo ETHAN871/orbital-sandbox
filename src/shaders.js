@@ -804,7 +804,6 @@ uniform float uWrap;                 // 1 = wrap: use minimum-image (toroidal, w
 uniform vec2 uCell;                  // grid spacing per-axis (px); toroidal in wrap mode
 uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
-uniform float uCompanionDark;        // companion ("僚翼") line contrast vs main lines (slider, 0=hidden)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
@@ -816,8 +815,6 @@ const float LINE_DARK_MIN = 0.3;     // line darkening in bright regions (light 
 const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clamp — never solid black)
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
-const float LOD_DB = 0.15;           // octave deadband — trims only the worst sub-pixel flicker
-const float WARP_NORM = 6.0;         // warp density self-limit strength (anti grid-fold)
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -834,7 +831,6 @@ void main() {
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
   vec2 warp = vec2(0.0);             // grid-pinch displacement
-  float pinchSum = 0.0;              // Σ pinch tension (anti-fold density self-limit)
   float h = 0.0;                     // absolute height field (∝ mass), drives refinement
   float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
@@ -849,49 +845,18 @@ void main() {
     float r2 = dot(di, di);
     float inv = 1.0 / (r2 + uCore2);
     float w = abs(e.z);             // field strength ∝ |G·q·m|·embed
-    // Toroidal seam taper. Under min-image the field VALUE is continuous at the
-    // half-way line (di = ±viewport/2: the two equidistant images give equal r²),
-    // but its GRADIENT and the grid warp flip sign there — the nearest image
-    // switches sides. The true infinite periodic sum has no kink because the
-    // outgoing and incoming images cancel that flip; keeping only ONE image
-    // leaves a discontinuity that rides half a viewport from each body and, fed
-    // through fwidth(uvW), prints the faint moving grid streaks. A per-axis C1
-    // window (1 near the body, →0 with ZERO slope at the seam) band-limits the
-    // single image to a smooth periodic continuation: grad/warp now vanish
-    // smoothly into the seam from both sides, so there is nothing to kink.
-    // Inner 60% (|di| < 0.3·span/axis) is untouched → the well look is preserved.
-    float win = 1.0;
-    if (uWrap > 0.5) {
-      vec2 a = abs(di) / uViewport;                    // [0..0.5] under min-image
-      vec2 wxy = smoothstep(vec2(0.5), vec2(0.3), a);  // 1 inside, 0 at seam, C1
-      win = wxy.x * wxy.y;
-    }
-    float wf = w * win;
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
-    grad += (wf * uHeightK) * (-2.0) * di * (inv * inv);
-    h    += (wf * uHeightK) * inv;  // absolute height (h=1 at a REF_MASS body's center)
+    grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
+    h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
     // Pinch the grid TOWARD the body (lines converge into the well). Soft
     // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
     // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
-    float pull = uWarpGain * wf * inv;
-    float f = PMAX * pull / (PMAX + pull);
-    warp += di * f;
-    pinchSum += f;                  // total pinch tension → density self-limit (anti-fold)
+    float pull = uWarpGain * w * inv;
+    warp += di * (PMAX * pull / (PMAX + pull));
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
   }
-  // Anti-fold: density self-limit. PMAX bounds each body's pinch, but a dense
-  // cluster sums dozens → the grid map (p+warp) folds back on itself and lines
-  // close into loops (the wrap-mode "闭环"). A pure magnitude clamp does NOT fix
-  // it — folding is a Jacobian (∂warp/∂p) problem, not a magnitude one. Divide
-  // the summed warp by its own pinch TENSION (Σf): where many bodies pile up the
-  // warp saturates toward di/WARP_NORM regardless of body count, so ∂warp/∂p
-  // stays below the fold threshold at ANY density (self-limiting, verified 0
-  // folds on single→sparse→dense→very-dense scenes). Sparse scenes (small Σf)
-  // keep ~full pinch (factor ≈ 1); single wells never folded, so the mild
-  // softening there is harmless.
-  warp /= (1.0 + WARP_NORM * pinchSum);
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
   // half-Lambert keeps its terminator soft and its shadow shallow.
@@ -927,33 +892,23 @@ void main() {
   float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
   float lam = lodC - bias;                     // net octave (− = finer than base)
-  // Tiny soft deadband: fwidth-derived lodC is per-quad NOISY; a small shrink of
-  // lam toward 0 trims only the worst sub-pixel flicker. The bulk of the
-  // finer-octave detail is KEPT — folded in below as a faint companion sub-layer.
-  lam = lam - clamp(lam, -LOD_DB, LOD_DB);
   float n0 = floor(lam);
   float fr = lam - n0;
-  // Two bracketing octaves. Derivative passed EXPLICITLY (continuous dW × octave
-  // scale) — never fwidth() of the scaled coord, which spikes at seams.
-  float s0 = exp2(-n0);                          // finer octave
-  float s1 = exp2(-(n0 + 1.0));                  // coarser octave (persistent main lines)
-  float coarse = gridAt(uvW * s1, dW * s1);      // main grid lines (persist across LOD)
-  float fine   = gridAt(uvW * s0, dW * s0);      // main + finer "companion" lines
-  // Companion ("僚翼") lines: the finer-octave detail flanking the main lines,
-  // gated in by LOD engagement (1-fr). KEPT for their lively motion, as continuous
-  // low-contrast lines whose visibility is the uCompanionDark slider so the extra
-  // density does not pile on darkness — region brightness tracks line DENSITY,
-  // not raw line count (denser ⇒ each companion fainter, matching the tone).
-  float companion = (1.0 - fr) * max(0.0, fine - coarse);
+  // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
+  // derivative EXPLICITLY (continuous dW × octave scale) — never fwidth() of
+  // the scaled coord, which spikes at seams and prints stray line fragments.
+  float s0 = exp2(-n0);
+  float s1 = exp2(-(n0 + 1.0));
+  float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
   // Region brightness is carried by the LINES (darkness + count), not a filled
-  // color block (FILL_SHADE≈0): each line darkens where the lighting gray is dark
-  // (clamped at LINE_DARK_MAX so deep lines never go solid). Main lines at full
-  // contrast; companions as a faint sub-layer multiplied in separately.
+  // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
+  // where the lighting gray is dark, and the depth bias also packs MORE
+  // lines there (denser = darker). On-screen density is constant under the LOD
+  // except for the bias, so line count meaningfully encodes depth here. The
+  // per-line darkening is clamped (LINE_DARK_MAX) so deep lines never go solid.
   float fill = mix(1.0, gray, FILL_SHADE);
   float lineDark = clamp(mix(LINE_DARK_MIN, LINE_DARK_MAX, 1.0 - gray), 0.0, LINE_DARK_MAX);
-  vec3 rgb = uColor.rgb * fill;
-  rgb *= (1.0 - coarse * lineDark);                       // main grid (full contrast)
-  rgb *= (1.0 - companion * lineDark * uCompanionDark);   // faint companion sub-layer (slider)
+  vec3 rgb = uColor.rgb * fill * (1.0 - line * lineDark);
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,

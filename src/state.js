@@ -70,11 +70,6 @@ export const DEFAULTS_TUNING = Object.freeze({
   // semi-transparent default so bodies stay visible through it.
   membraneOpacity: 0.5,
 
-  // Companion ("僚翼") line contrast vs the main grid lines (0 = hidden, 1 = as
-  // dark as main lines). The faint finer-octave lines flanking the main grid;
-  // kept low so extra density doesn't pile on darkness.
-  companionDark: 0.45,
-
   // V11.1 (2026-05-27): rubber-sheet viewing tilt angle in degrees.
   //   90° = camera looks straight down (top-down); sag projects to
   //         zero screen-Y offset — surface looks flat 2D.
@@ -224,7 +219,6 @@ export const state = {
   fieldContrast:            DEFAULTS_TUNING.fieldContrast,
   fieldLineSpacing:         DEFAULTS_TUNING.fieldLineSpacing,
   membraneOpacity:          DEFAULTS_TUNING.membraneOpacity,
-  companionDark:            DEFAULTS_TUNING.companionDark,
   viewTilt:                 DEFAULTS_TUNING.viewTilt,
 
   // Canvas background color — toggled by the 深/浅 button.
