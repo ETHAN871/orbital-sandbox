@@ -808,7 +808,8 @@ out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap grid-fold)
-const float FOLD_VEIL_HI = 0.5;      // caustic veil: fade grid where warp map Jacobian det < this
+const float FOLD_VEIL_LO = 0.25;     // caustic veil: jdet ≤ this → grid fully faded (fold + the ring boundary)
+const float FOLD_VEIL_HI = 0.95;     // caustic veil: jdet ≥ this → full grid (only true compression fades)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -920,7 +921,7 @@ void main() {
   // Non-folding deep pinch (jdet > 0) keeps the full grid.
   vec2 wdx = dFdx(warp), wdy = dFdy(warp);
   float jdet = (1.0 + wdx.x) * (1.0 + wdy.y) - wdy.x * wdx.y;
-  line *= smoothstep(0.0, FOLD_VEIL_HI, jdet);
+  line *= smoothstep(FOLD_VEIL_LO, FOLD_VEIL_HI, jdet);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
   // where the lighting gray is dark, and the depth bias also packs MORE
