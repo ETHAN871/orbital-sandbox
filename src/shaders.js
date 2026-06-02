@@ -823,10 +823,26 @@ const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bou
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
 // pixels) and prints stray line fragments — so the caller passes the
 // derivative scaled from the continuous base coord instead.
-float gridAt(vec2 uvw, vec2 d) {
-  vec2 fw = max(d, vec2(1e-6));
-  vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
-  return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
+// Single-axis grid-line intensity, anti-aliased by THIS axis's screen-space
+// derivative (line is 1 on the integer line, 0 between).
+float lineAxis1D(float u, float du) {
+  float fw = max(du, 1e-6);
+  float g = abs(fract(u - 0.5) - 0.5) / fw;
+  return 1.0 - smoothstep(0.5, 1.5, g);
+}
+// Anisotropic octave LOD for ONE axis: pick the dyadic refinement level from
+// this axis's own warp-vs-flat derivative ratio, then blend the two bracketing
+// octaves. A stretched axis (du < df) gets a NEGATIVE level → REFINES (re-adds
+// lines); a compressed axis coarsens — each independently of the perpendicular
+// axis. Pass the derivative explicitly (du × octave scale), never fwidth() of
+// the scaled coord (spikes at seams → stray fragments).
+float gridAxisLOD(float u, float dw, float df, float bias) {
+  float lod = log2(max(dw, 1e-6) / max(df, 1e-6)) - bias;
+  float n0 = floor(lod);
+  float fr = lod - n0;
+  float s0 = exp2(-n0);
+  float s1 = exp2(-(n0 + 1.0));
+  return mix(lineAxis1D(u * s0, dw * s0), lineAxis1D(u * s1, dw * s1), fr);
 }
 
 void main() {
@@ -898,19 +914,17 @@ void main() {
   vec2 uvF = p / uCell;                        // flat reference (base density)
   vec2 dW = fwidth(uvW);                       // continuous base derivatives
   vec2 dF = fwidth(uvF);
-  float fwW = max(max(dW.x, dW.y), 1e-6);
-  float fwF = max(max(dF.x, dF.y), 1e-6);
-  float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
-  float lam = lodC - bias;                     // net octave (− = finer than base)
-  float n0 = floor(lam);
-  float fr = lam - n0;
-  // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
-  // derivative EXPLICITLY (continuous dW × octave scale) — never fwidth() of
-  // the scaled coord, which spikes at seams and prints stray line fragments.
-  float s0 = exp2(-n0);
-  float s1 = exp2(-(n0 + 1.0));
-  float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
+  // ANISOTROPIC LOD: choose each axis's octave from its OWN derivative ratio.
+  // A funnel/saddle between two wells STRETCHES one axis (lines spread sparse)
+  // while COMPRESSING the other (lines pack dense). A single max-axis level
+  // would coarsen BOTH by the dense axis → the stretched axis loses its lines
+  // entirely (the "only vertical lines, no horizontal" gap). Per-axis, the
+  // stretched axis refines back IN and the compressed axis coarsens, so the
+  // mesh keeps grid lines in BOTH directions following the warp everywhere.
+  float lineX = gridAxisLOD(uvW.x, dW.x, dF.x, bias);   // vertical lines   (const uvW.x)
+  float lineY = gridAxisLOD(uvW.y, dW.y, dF.y, bias);   // horizontal lines (const uvW.y)
+  float line = max(lineX, lineY);
   // Caustic veil ("虚化"). A deep, mass-proportional in-plane pinch is a strong
   // lens, and a strong lens unavoidably folds (caustics — Einstein-ring loops)
   // where the warp map (p+warp) becomes non-injective. Rather than cap the
