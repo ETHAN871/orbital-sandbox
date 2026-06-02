@@ -24,9 +24,9 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260602-seamtaper';
+} from './renderer-webgl.js?v=20260602-loddeadband';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260602-seamtaper';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260602-loddeadband';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {

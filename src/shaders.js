@@ -815,6 +815,7 @@ const float LINE_DARK_MIN = 0.3;     // line darkening in bright regions (light 
 const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clamp — never solid black)
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
+const float LOD_DB = 0.5;            // octave deadband — suppress mid-field LOD flicker
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -910,6 +911,12 @@ void main() {
   float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
   float lam = lodC - bias;                     // net octave (− = finer than base)
+  // Soft deadband: fwidth-derived lodC is per-quad NOISY; in the flat mid-field
+  // it jitters across octave boundaries → spurious half-faded subdivision lines
+  // that read as short broken ticks (the 断线). Shrink lam toward 0 by LOD_DB so
+  // |lam|<LOD_DB renders the pure base grid (no flicker), while strong LOD near
+  // wells (|lam|>LOD_DB) still engages. C0, transition sits at fr=0.5.
+  lam = lam - clamp(lam, -LOD_DB, LOD_DB);
   float n0 = floor(lam);
   float fr = lam - n0;
   // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
