@@ -24,9 +24,9 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260602-loddeadband';
+} from './renderer-webgl.js?v=20260602-companion';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260602-loddeadband';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260602-companion';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {

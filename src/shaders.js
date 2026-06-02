@@ -815,7 +815,8 @@ const float LINE_DARK_MIN = 0.3;     // line darkening in bright regions (light 
 const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clamp — never solid black)
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
-const float LOD_DB = 0.5;            // octave deadband — suppress mid-field LOD flicker
+const float LOD_DB = 0.15;           // octave deadband — trims only the worst sub-pixel flicker
+const float COMPANION_DARK = 0.45;   // companion ("僚翼") subdivision-line contrast vs main lines
 
 // AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
@@ -911,29 +912,33 @@ void main() {
   float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
   float lam = lodC - bias;                     // net octave (− = finer than base)
-  // Soft deadband: fwidth-derived lodC is per-quad NOISY; in the flat mid-field
-  // it jitters across octave boundaries → spurious half-faded subdivision lines
-  // that read as short broken ticks (the 断线). Shrink lam toward 0 by LOD_DB so
-  // |lam|<LOD_DB renders the pure base grid (no flicker), while strong LOD near
-  // wells (|lam|>LOD_DB) still engages. C0, transition sits at fr=0.5.
+  // Tiny soft deadband: fwidth-derived lodC is per-quad NOISY; a small shrink of
+  // lam toward 0 trims only the worst sub-pixel flicker. The bulk of the
+  // finer-octave detail is KEPT — folded in below as a faint companion sub-layer.
   lam = lam - clamp(lam, -LOD_DB, LOD_DB);
   float n0 = floor(lam);
   float fr = lam - n0;
-  // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
-  // derivative EXPLICITLY (continuous dW × octave scale) — never fwidth() of
-  // the scaled coord, which spikes at seams and prints stray line fragments.
-  float s0 = exp2(-n0);
-  float s1 = exp2(-(n0 + 1.0));
-  float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
+  // Two bracketing octaves. Derivative passed EXPLICITLY (continuous dW × octave
+  // scale) — never fwidth() of the scaled coord, which spikes at seams.
+  float s0 = exp2(-n0);                          // finer octave
+  float s1 = exp2(-(n0 + 1.0));                  // coarser octave (persistent main lines)
+  float coarse = gridAt(uvW * s1, dW * s1);      // main grid lines (persist across LOD)
+  float fine   = gridAt(uvW * s0, dW * s0);      // main + finer "companion" lines
+  // Companion ("僚翼") lines: the finer-octave detail flanking the main lines,
+  // gated in by LOD engagement (1-fr). KEPT for their lively motion, but drawn at
+  // reduced contrast (COMPANION_DARK) so the extra density does not pile on
+  // darkness — region brightness then tracks line DENSITY, not raw line count
+  // (denser ⇒ each companion fainter, matching the regional tone).
+  float companion = (1.0 - fr) * max(0.0, fine - coarse);
   // Region brightness is carried by the LINES (darkness + count), not a filled
-  // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
-  // where the lighting gray is dark, and the depth bias also packs MORE
-  // lines there (denser = darker). On-screen density is constant under the LOD
-  // except for the bias, so line count meaningfully encodes depth here. The
-  // per-line darkening is clamped (LINE_DARK_MAX) so deep lines never go solid.
+  // color block (FILL_SHADE≈0): each line darkens where the lighting gray is dark
+  // (clamped at LINE_DARK_MAX so deep lines never go solid). Main lines at full
+  // contrast; companions as a faint sub-layer multiplied in separately.
   float fill = mix(1.0, gray, FILL_SHADE);
   float lineDark = clamp(mix(LINE_DARK_MIN, LINE_DARK_MAX, 1.0 - gray), 0.0, LINE_DARK_MAX);
-  vec3 rgb = uColor.rgb * fill * (1.0 - line * lineDark);
+  vec3 rgb = uColor.rgb * fill;
+  rgb *= (1.0 - coarse * lineDark);                       // main grid (full contrast)
+  rgb *= (1.0 - companion * lineDark * COMPANION_DARK);   // faint companion sub-layer
   // Carve the hole: membrane goes transparent where a body covers it.
   outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
 }`,
