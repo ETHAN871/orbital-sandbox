@@ -845,13 +845,31 @@ void main() {
     float r2 = dot(di, di);
     float inv = 1.0 / (r2 + uCore2);
     float w = abs(e.z);             // field strength ∝ |G·q·m|·embed
+    // Toroidal seam taper. Under min-image the field VALUE is continuous at the
+    // half-way line (di = ±viewport/2: the two equidistant images give equal r²),
+    // but its GRADIENT and the grid warp flip sign there — the nearest image
+    // switches sides. The true infinite periodic sum has no kink because the
+    // outgoing and incoming images cancel that flip; keeping only ONE image
+    // leaves a discontinuity that rides half a viewport from each body and, fed
+    // through fwidth(uvW), prints the faint moving grid streaks. A per-axis C1
+    // window (1 near the body, →0 with ZERO slope at the seam) band-limits the
+    // single image to a smooth periodic continuation: grad/warp now vanish
+    // smoothly into the seam from both sides, so there is nothing to kink.
+    // Inner 60% (|di| < 0.3·span/axis) is untouched → the well look is preserved.
+    float win = 1.0;
+    if (uWrap > 0.5) {
+      vec2 a = abs(di) / uViewport;                    // [0..0.5] under min-image
+      vec2 wxy = smoothstep(vec2(0.5), vec2(0.3), a);  // 1 inside, 0 at seam, C1
+      win = wxy.x * wxy.y;
+    }
+    float wf = w * win;
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
-    grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
-    h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
+    grad += (wf * uHeightK) * (-2.0) * di * (inv * inv);
+    h    += (wf * uHeightK) * inv;  // absolute height (h=1 at a REF_MASS body's center)
     // Pinch the grid TOWARD the body (lines converge into the well). Soft
     // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
     // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
-    float pull = uWarpGain * w * inv;
+    float pull = uWarpGain * wf * inv;
     warp += di * (PMAX * pull / (PMAX + pull));
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
