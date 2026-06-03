@@ -24,9 +24,9 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260603-radial';
+} from './renderer-webgl.js?v=20260603-elastic';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-radial';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-elastic';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {
