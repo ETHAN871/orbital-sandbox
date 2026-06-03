@@ -807,12 +807,6 @@ uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
-const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap grid-fold)
-// Caustic veil thresholds on the warp's full Jacobian determinant jdet
-// (1 = undistorted, ≤0 = folded — lines crossing → caustic ring).
-const float FOLD_VEIL_LO = 0.0;      // jdet ≤ this (at/over the fold) → grid at the floor
-const float FOLD_VEIL_HI = 0.3;      // jdet ≥ this → full grid (compression that stays injective is kept)
-const float FOLD_VEIL_FLOOR = 0.12;  // faded caustic lines never fully vanish — keep at least this fraction
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -826,26 +820,10 @@ const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bou
 // octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
 // pixels) and prints stray line fragments — so the caller passes the
 // derivative scaled from the continuous base coord instead.
-// Single-axis grid-line intensity, anti-aliased by THIS axis's screen-space
-// derivative (line is 1 on the integer line, 0 between).
-float lineAxis1D(float u, float du) {
-  float fw = max(du, 1e-6);
-  float g = abs(fract(u - 0.5) - 0.5) / fw;
-  return 1.0 - smoothstep(0.5, 1.5, g);
-}
-// Anisotropic octave LOD for ONE axis: pick the dyadic refinement level from
-// this axis's own warp-vs-flat derivative ratio, then blend the two bracketing
-// octaves. A stretched axis (du < df) gets a NEGATIVE level → REFINES (re-adds
-// lines); a compressed axis coarsens — each independently of the perpendicular
-// axis. Pass the derivative explicitly (du × octave scale), never fwidth() of
-// the scaled coord (spikes at seams → stray fragments).
-float gridAxisLOD(float u, float dw, float df, float bias) {
-  float lod = log2(max(dw, 1e-6) / max(df, 1e-6)) - bias;
-  float n0 = floor(lod);
-  float fr = lod - n0;
-  float s0 = exp2(-n0);
-  float s1 = exp2(-(n0 + 1.0));
-  return mix(lineAxis1D(u * s0, dw * s0), lineAxis1D(u * s1, dw * s1), fr);
+float gridAt(vec2 uvw, vec2 d) {
+  vec2 fw = max(d, vec2(1e-6));
+  vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
+  return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
 }
 
 void main() {
@@ -870,19 +848,11 @@ void main() {
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
     h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
+    // Pinch the grid TOWARD the body (lines converge into the well). Soft
+    // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
+    // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
     float pull = uWarpGain * w * inv;
-    float f = PMAX * pull / (PMAX + pull);
-    // Pinch the grid TOWARD the body (lines converge into the well). The
-    // DISPLACEMENT vector must be wrap-CONTINUOUS: a raw min-image di flips
-    // direction at the half-way boundary (di jumps from +½span to −½span) →
-    // the warp value jumps → the grid skips and draws closed loops overlapping
-    // the regular grid (the wrap "闭环"). Replace di with its continuous
-    // periodic form (½span/π)·sin(π·di/(½span)): ≈ di near the body (full
-    // pinch preserved), smoothly → 0 at the boundary (no flip, no jump, no
-    // separate taper band). Field/normal above still use the true min-image di.
-    vec2 wdi = di;
-    if (uWrap > 0.5) wdi = (uViewport / TAU) * sin(TAU * di / uViewport);
-    warp += wdi * f;
+    warp += di * (PMAX * pull / (PMAX + pull));
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
@@ -917,37 +887,19 @@ void main() {
   vec2 uvF = p / uCell;                        // flat reference (base density)
   vec2 dW = fwidth(uvW);                       // continuous base derivatives
   vec2 dF = fwidth(uvF);
+  float fwW = max(max(dW.x, dW.y), 1e-6);
+  float fwF = max(max(dF.x, dF.y), 1e-6);
+  float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
-  // ANISOTROPIC LOD: choose each axis's octave from its OWN derivative ratio.
-  // A funnel/saddle between two wells STRETCHES one axis (lines spread sparse)
-  // while COMPRESSING the other (lines pack dense). A single max-axis level
-  // would coarsen BOTH by the dense axis → the stretched axis loses its lines
-  // entirely (the "only vertical lines, no horizontal" gap). Per-axis, the
-  // stretched axis refines back IN and the compressed axis coarsens, so the
-  // mesh keeps grid lines in BOTH directions following the warp everywhere.
-  float lineX = gridAxisLOD(uvW.x, dW.x, dF.x, bias);   // vertical lines   (const uvW.x)
-  float lineY = gridAxisLOD(uvW.y, dW.y, dF.y, bias);   // horizontal lines (const uvW.y)
-  // Caustic veil ("虚化"). A deep, mass-proportional in-plane pinch is a strong
-  // lens that FOLDS (caustics — Einstein-ring loops) where the warp map
-  // (p+warp) stops being injective and grid lines cross. The correct fold test
-  // is the FULL screen-space Jacobian DETERMINANT (with cross terms): det ≤ 0
-  // is where the local area flips and lines actually cross. A per-axis diagonal
-  // factor is NOT enough — one factor can go negative under pure SHEAR while
-  // the map stays injective (no caustic), so veiling on it over-fades whole
-  // patches in one direction (the reported "fades a band where there's no
-  // loop"). Normalize by the flat map's own screen derivative (dFdx(p)/dFdy(p))
-  // so jdet is resolution-independent: ≈1 undistorted, ≤0 folded — unaffected
-  // by the half-res field FBO (raw dFdx(warp) would otherwise scale with it).
-  // Fade ONLY at/near the fold (jdet → 0); compression that stays injective
-  // (jdet ≥ FOLD_VEIL_HI) keeps the full grid. Fade bottoms out at a non-zero
-  // FLOOR so caustic lines blur to faint rather than vanishing completely.
-  float sx = max(abs(dFdx(p).x), 1e-6);
-  float sy = max(abs(dFdy(p).y), 1e-6);
-  vec2 wdx = dFdx(warp), wdy = dFdy(warp);
-  float jdet = (1.0 + wdx.x / sx) * (1.0 + wdy.y / sy)
-             - (wdy.x / sx) * (wdx.y / sy);
-  float veil = mix(FOLD_VEIL_FLOOR, 1.0, smoothstep(FOLD_VEIL_LO, FOLD_VEIL_HI, jdet));
-  float line = max(lineX, lineY) * veil;
+  float lam = lodC - bias;                     // net octave (− = finer than base)
+  float n0 = floor(lam);
+  float fr = lam - n0;
+  // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
+  // derivative EXPLICITLY (continuous dW × octave scale) — never fwidth() of
+  // the scaled coord, which spikes at seams and prints stray line fragments.
+  float s0 = exp2(-n0);
+  float s1 = exp2(-(n0 + 1.0));
+  float line = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
   // where the lighting gray is dark, and the depth bias also packs MORE
