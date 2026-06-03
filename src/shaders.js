@@ -869,15 +869,20 @@ void main() {
     float pull = uWarpGain * w * inv;
     float f = PMAX * pull / (PMAX + pull);
     // Pinch the grid TOWARD the body (lines converge into the well). The
-    // DISPLACEMENT must be wrap-CONTINUOUS: a raw min-image di flips direction
-    // at the half-way boundary (di jumps +½span → −½span) → the warp value
-    // jumps → the grid skips and tears (broken streaks across the seam). Use
-    // di's continuous periodic form (span/2π)·sin(2π·di/span): ≈ di near the
-    // body (full pinch kept), smoothly → 0 at the boundary (no flip, no jump).
-    // Field/normal above still use the true min-image di. Soft clamp f (C∞:
-    // PMAX·x/(PMAX+x)) keeps each body single-valued (no fold).
+    // displacement must be wrap-CONTINUOUS: a raw min-image di flips direction
+    // at the half-way seam (di: +½span → −½span) → the warp value jumps → the
+    // grid tears. Make it continuous by scaling di's MAGNITUDE with a separable
+    // taper that → 0 at the seam, while KEEPING the direction exactly radial
+    // (= di). A per-component sin(2π·di/span) was wrong: it tapers each axis
+    // independently, so far from the body the displacement skews OFF the radial
+    // (e.g. di=(½W,¼H) → (0,·)), pushing the grid sideways instead of toward the
+    // mass — visible as misaligned grid near heavy bodies. taper=(1+cos)/2 is 1
+    // at the body, 0 (with 0 slope → C¹) at the seam. Field/normal use true di.
     vec2 wdi = di;
-    if (uWrap > 0.5) wdi = (uViewport / TAU) * sin(TAU * di / uViewport);
+    if (uWrap > 0.5) {
+      vec2 t = 0.5 + 0.5 * cos(TAU * di / uViewport);   // 1 at body → 0 at ±½span
+      wdi = di * (t.x * t.y);
+    }
     warp += wdi * f;
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
