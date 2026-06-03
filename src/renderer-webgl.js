@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT,
-} from './shaders.js?v=20260603-aniso';
+} from './shaders.js?v=20260603-fbo';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -185,6 +185,15 @@ let _fboA = null, _fboB = null;
 let _texA = null, _texB = null;
 let _fboW = 0, _fboH = 0;       // FBO size in CSS px
 let _trailReadIdx = 0;          // 0 → A is read, B is write; 1 → B is read, A is write
+
+// Half-resolution field FBO. The membrane shader is a heavy fullscreen
+// per-pixel N-body loop; rendering it at FIELD_RES_SCALE × the DPR backing
+// store (¼ the pixels) and upscaling cuts that cost ~4×. The membrane is
+// smooth/low-frequency so the downscale is near-invisible; entities/UI/text
+// stay full-res in their own passes.
+const _FIELD_RES_SCALE = 0.5;
+let _fieldFbo = null, _fieldTex = null;
+let _fieldFboW = 0, _fieldFboH = 0;
 
 // Sprite canvas (HTMLCanvasElement) → { tex, w, h, ox, oy }
 const _spriteTexMap = new Map();
@@ -310,6 +319,7 @@ export function initWebGL(canvas) {
     _vaoCircleFill = _vaoCircleRing = _vaoLineSeg = null;
     _vaoStreamline = null;
     _fboA = _fboB = _texA = _texB = null;
+    _fieldFbo = _fieldTex = null;
     try {
       _initPrograms();
       _initBuffers();
@@ -758,6 +768,28 @@ function _initFbos(w, h) {
   _fboA = _fboB = _texA = _texB = null;
   _fboW = Math.max(1, w | 0);
   _fboH = Math.max(1, h | 0);
+
+  // Half-res field FBO, sized off the DPR backing store (not CSS px) so the
+  // downscale factor is uniform across displays: full-DPR pixels → ¼.
+  if (_fieldFbo) gl.deleteFramebuffer(_fieldFbo);
+  if (_fieldTex) gl.deleteTexture(_fieldTex);
+  _fieldFbo = _fieldTex = null;
+  _fieldFboW = Math.max(1, Math.round(_fboW * _dpr * _FIELD_RES_SCALE));
+  _fieldFboH = Math.max(1, Math.round(_fboH * _dpr * _FIELD_RES_SCALE));
+  _fieldTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, _fieldTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, _fieldFboW, _fieldFboH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  _fieldFbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, _fieldFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, _fieldTex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    console.error('[renderer-webgl] field FBO incomplete');
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
   for (let i = 0; i < 2; i++) {
     const tex = gl.createTexture();
@@ -2685,12 +2717,31 @@ export function drawField() {
   if (_fieldEntityCount === 0 &&
       state.fieldStyle !== 'rubber-sheet' && state.fieldStyle !== 'screen') return;
 
-  // Common GL state for both passes.
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, Math.round(_vpW * _dpr), Math.round(_vpH * _dpr));
-  gl.enable(gl.BLEND);
-  gl.blendEquation(gl.FUNC_ADD);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  // PERF: the field is a heavy fullscreen per-pixel N-body shader. Render the
+  // whole field group into a half-res offscreen FBO (¼ the fragments → ~4×
+  // cheaper), then upscale-composite once over the scene. The membrane is
+  // smooth, so the downscale is near-invisible; sprites/UI stay full-res.
+  // Render passes blend with premultiplied-alpha accumulation into a cleared
+  // (transparent) target so the group composites correctly as ONE layer.
+  const usesFieldFbo = !!_fieldFbo;
+  if (usesFieldFbo) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, _fieldFbo);
+    gl.viewport(0, 0, _fieldFboW, _fieldFboH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    // Straight-alpha over for RGB, coverage accumulate for A → result holds
+    // premultiplied color, composited below with (ONE, 1-SRC_ALPHA).
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  } else {
+    // Fallback (FBO unavailable): legacy direct-to-screen full-res path.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, Math.round(_vpW * _dpr), Math.round(_vpH * _dpr));
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  }
 
   // V9.2 rewrite (2026-05-26): default field viz is now grid warp.
   // Legacy equipotential rings are kept gated behind state.fieldStyle
@@ -2721,6 +2772,21 @@ export function drawField() {
     if (state.fieldStyle === '2d') _drawParticleFlow();
   }
   _drawStreamlines();
+
+  if (usesFieldFbo) {
+    // Upscale-composite the half-res field over the scene. Source is
+    // premultiplied (see accumulation blend above), so use (ONE, 1-SRC_ALPHA).
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, Math.round(_vpW * _dpr), Math.round(_vpH * _dpr));
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(_progTrailBlit.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, _fieldTex);
+    gl.uniform1i(_progTrailBlit.uTex, 0);
+    gl.bindVertexArray(_vaoFsQuad);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(null);
+  }
 
   gl.disable(gl.BLEND);
 }
