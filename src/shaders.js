@@ -932,9 +932,19 @@ void main() {
   // Jacobian determinant and FADE the grid lines there, so the caustic blurs
   // softly into the shaded membrane instead of printing hard crossing rings.
   // Depth is read from the lighting/AO (gray darkens with mass) — unaffected.
-  // Non-folding deep pinch (jdet > 0) keeps the full grid.
+  // Non-folding deep pinch (jdet > 0) keeps the full grid. RESOLUTION-
+  // INDEPENDENT: normalize the warp's screen-space Jacobian by the FLAT map's
+  // screen derivative (dFdx(p), dFdy(p)) so jdet is the true relative-area
+  // Jacobian — ≈1 on an undistorted grid, →0 at a fold — regardless of the
+  // render scale. (The field renders to a half-res FBO; without this, raw
+  // dFdx(warp) doubles and mis-places the veil: it fades the funnel mesh and
+  // leaves the actual caustic rings sharp.) p maps linearly to the screen, so
+  // the off-axis derivatives dFdx(p).y / dFdy(p).x are ~0 and dropped.
   vec2 wdx = dFdx(warp), wdy = dFdy(warp);
-  float jdet = (1.0 + wdx.x) * (1.0 + wdy.y) - wdy.x * wdx.y;
+  float sx = max(abs(dFdx(p).x), 1e-6);
+  float sy = max(abs(dFdy(p).y), 1e-6);
+  float jdet = (1.0 + wdx.x / sx) * (1.0 + wdy.y / sy)
+             - (wdy.x / sx) * (wdx.y / sy);
   line *= smoothstep(FOLD_VEIL_LO, FOLD_VEIL_HI, jdet);
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
