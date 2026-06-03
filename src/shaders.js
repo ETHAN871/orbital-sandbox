@@ -807,6 +807,8 @@ uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
+const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap seam-tear)
+const float LOD_DB = 0.5;            // octave deadband — suppress mid-field LOD flicker (断线)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -864,11 +866,19 @@ void main() {
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
     h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
-    // Pinch the grid TOWARD the body (lines converge into the well). Soft
-    // clamp (C∞: PMAX·x/(PMAX+x)) instead of min() — a hard min kinks the
-    // warp, spiking fwidth(uvW) along the clamp ring → LOD dashes.
     float pull = uWarpGain * w * inv;
-    warp += di * (PMAX * pull / (PMAX + pull));
+    float f = PMAX * pull / (PMAX + pull);
+    // Pinch the grid TOWARD the body (lines converge into the well). The
+    // DISPLACEMENT must be wrap-CONTINUOUS: a raw min-image di flips direction
+    // at the half-way boundary (di jumps +½span → −½span) → the warp value
+    // jumps → the grid skips and tears (broken streaks across the seam). Use
+    // di's continuous periodic form (span/2π)·sin(2π·di/span): ≈ di near the
+    // body (full pinch kept), smoothly → 0 at the boundary (no flip, no jump).
+    // Field/normal above still use the true min-image di. Soft clamp f (C∞:
+    // PMAX·x/(PMAX+x)) keeps each body single-valued (no fold).
+    vec2 wdi = di;
+    if (uWrap > 0.5) wdi = (uViewport / TAU) * sin(TAU * di / uViewport);
+    warp += wdi * f;
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
@@ -908,6 +918,12 @@ void main() {
   float lodC = log2(fwW / fwF);                // ≥0 where the warp compresses
   float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
   float lam = lodC - bias;                     // net octave (− = finer than base)
+  // Soft deadband: fwidth-derived lodC is per-quad NOISY; in the flat mid-field
+  // it jitters across octave boundaries → spurious half-faded subdivision lines
+  // that read as short broken ticks / tearing (断线). Shrink lam toward 0 so
+  // |lam| < LOD_DB renders the pure base grid (no flicker), while strong LOD
+  // near wells (|lam| > LOD_DB) still engages.
+  lam = lam - clamp(lam, -LOD_DB, LOD_DB);
   float n0 = floor(lam);
   float fr = lam - n0;
   // Blend the two bracketing octaves (smooth coarsen/refine, no pop). Pass the
