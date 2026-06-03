@@ -247,7 +247,7 @@ export const state = {
   //   'legacy'       — equipotential contour rings only.
   //   'curvilinear'  — equipotential + ψ contours (rejected iteration).
   // Set via ?field=screen|rubber-sheet|2d|3d|legacy|curvilinear URL param.
-  fieldStyle: 'screen',
+  fieldStyle: 'mesh',     // true 3D-membrane triangle mesh (deep + fold-free + edge-pinned)
 
   // Active physics backend name — set by physics-backend.js after init.
   // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.

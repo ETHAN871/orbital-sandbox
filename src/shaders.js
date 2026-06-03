@@ -950,6 +950,150 @@ void main() {
 }`,
 };
 
+// ─── Membrane MESH (true 3D-membrane grid as a displaced triangle lattice) ──
+// Replaces the per-pixel SCREEN_DENT warp. Vertices sit at flat MATERIAL
+// positions; the VS pushes each to its warped SCREEN position with the deep
+// inextensible inward pinch (monotone |d| ⇒ fold-free), and emits two varyings:
+//   vScreen — the deformed screen position → body-field lighting / hole, exactly
+//             like SCREEN_DENT (the dimple/normal/hole stay locked on the bodies)
+//   vMat    — the flat material coord → the grid LINES are drawn here with the
+//             same analytic gridAt; interpolated across the DEFORMED triangle it
+//             yields the true inverse-warp (curved lines), deep AND fold-free
+//             because the triangles don't invert (vertex connectivity escapes the
+//             per-pixel deep/periodic/fold-free trilemma).
+// aPin locks the four screen borders (no skirt) in bounded mode; freed in wrap.
+export const MEMBRANE_MESH = {
+  VS: `#version 300 es
+#define MAX_ENTITIES 128
+in vec2 aPos;                // flat (material) grid vertex, CSS px
+in float aPin;               // 1 at the pinned border, 0 interior (ramped)
+uniform mat4 uOrtho;
+uniform vec2 uViewport;
+uniform vec4 uEntities[MAX_ENTITIES];
+uniform int uEntityCount;
+uniform float uWarpGain;
+uniform float uCore2;
+uniform float uWrap;
+uniform float uPinEnable;    // 1 = pin border (bounded), 0 = free (wrap toroidal)
+out vec2 vScreen;
+out vec2 vMat;
+const float WARP_DEPTH = 3.0;
+void main() {
+  vec2 warp = vec2(0.0);
+  for (int i = 0; i < MAX_ENTITIES; i++) {
+    if (i >= uEntityCount) break;
+    vec4 e = uEntities[i];
+    float w = abs(e.z);
+    vec2 base = aPos - e.xy;
+    if (uWrap > 0.5) base -= uViewport * floor(base / uViewport + 0.5);
+    float pull0 = uWarpGain * w / uCore2;
+    float D = WARP_DEPTH * sqrt(uCore2) * pull0 / (1.0 + pull0);
+    int lo = (uWrap > 0.5) ? -1 : 0;
+    int hi = (uWrap > 0.5) ?  1 : 0;
+    for (int oy = -1; oy <= 1; oy++) {
+      if (oy < lo || oy > hi) continue;
+      for (int ox = -1; ox <= 1; ox++) {
+        if (ox < lo || ox > hi) continue;
+        vec2 di = base + vec2(float(ox), float(oy)) * uViewport;
+        float r2 = dot(di, di);
+        float inv = 1.0 / (r2 + uCore2);
+        float dmag = D * (1.0 - uCore2 * inv);     // 0 → D, monotone (fold-free)
+        warp += (di / max(sqrt(r2), 1e-3)) * dmag;
+      }
+    }
+  }
+  vec2 scr = aPos + warp * (1.0 - aPin * uPinEnable);
+  vScreen = scr;
+  vMat = aPos;
+  gl_Position = uOrtho * vec4(scr, 0.0, 1.0);
+}`,
+  FS: `#version 300 es
+precision highp float;
+precision highp int;
+#define MAX_ENTITIES 128
+in vec2 vScreen;
+in vec2 vMat;
+uniform vec2 uViewport;
+uniform vec4 uEntities[MAX_ENTITIES];
+uniform int uEntityCount;
+uniform float uHeightK;
+uniform float uCore2;
+uniform float uSlope;
+uniform float uAmbient;
+uniform float uContrast;
+uniform float uWrap;
+uniform vec2 uCell;
+uniform vec4 uColor;
+uniform float uOpacity;
+out vec4 outColor;
+const float LOD_DB = 0.5; const float REFINE_THRESHOLD = 1.0;
+const float REFINE_GAIN = 0.9; const float MAX_BIAS_OCT = 1.5;
+const float FILL_SHADE = 0.2; const float LINE_DARK_MIN = 0.3; const float LINE_DARK_MAX = 0.85;
+const float AO_STRENGTH = 1.3; const float AO_FLOOR = 0.12;
+float gridAt(vec2 uvw, vec2 d) {
+  const float LW = 0.06; const float WIDEN = 2.0;
+  vec2 w = max(d * WIDEN, vec2(1e-6));
+  vec2 a = uvw + 0.5 * w; vec2 b = uvw - 0.5 * w;
+  vec2 cov = (floor(a) * LW + min(fract(a), vec2(LW))
+            - floor(b) * LW - min(fract(b), vec2(LW))) / w;
+  return 1.0 - (1.0 - cov.x) * (1.0 - cov.y);
+}
+void main() {
+  vec2 p = vScreen;                       // body field evaluated at the screen pos
+  vec2 grad = vec2(0.0);
+  float h = 0.0;
+  float bodyMask = 0.0;
+  for (int i = 0; i < MAX_ENTITIES; i++) {
+    if (i >= uEntityCount) break;
+    vec4 e = uEntities[i];
+    float w = abs(e.z);
+    vec2 base = p - e.xy;
+    if (uWrap > 0.5) base -= uViewport * floor(base / uViewport + 0.5);
+    float r2n = dot(base, base);
+    h += (w * uHeightK) / (r2n + uCore2);
+    if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2n)));
+    int lo = (uWrap > 0.5) ? -1 : 0;
+    int hi = (uWrap > 0.5) ?  1 : 0;
+    for (int oy = -1; oy <= 1; oy++) {
+      if (oy < lo || oy > hi) continue;
+      for (int ox = -1; ox <= 1; ox++) {
+        if (ox < lo || ox > hi) continue;
+        vec2 di = base + vec2(float(ox), float(oy)) * uViewport;
+        float inv = 1.0 / (dot(di, di) + uCore2);
+        grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
+      }
+    }
+  }
+  vec3 N = normalize(vec3(grad * uSlope, 1.0));
+  const float C = 0.70710678;
+  vec3 L = normalize(vec3(-C * C, C * C, C));
+  float dir = dot(N, L) * 0.5 + 0.5;
+  float k = clamp(uContrast, 0.0, 1.0);
+  float baseLit = (N.z + k * dir) / (1.0 + k);
+  float ao = AO_FLOOR + (1.0 - AO_FLOOR) / (1.0 + h * AO_STRENGTH);
+  float gray = mix(uAmbient, 1.0, baseLit) * ao;
+  // grid lines on the MATERIAL coord (interpolated across the deformed triangle
+  // → the warped grid). LOD keeps on-screen density ~constant: dW = material
+  // change per fragment; dF = screen change per fragment (the flat reference).
+  vec2 uvW = vMat / uCell;
+  vec2 dW = fwidth(uvW);
+  vec2 dF = fwidth(vScreen / uCell);
+  float fwW = max(max(dW.x, dW.y), 1e-6);
+  float fwF = max(max(dF.x, dF.y), 1e-6);
+  float lodC = log2(fwW / fwF);
+  float bias = clamp((h - REFINE_THRESHOLD) * REFINE_GAIN, 0.0, MAX_BIAS_OCT);
+  float lam = lodC - bias;
+  lam = lam - clamp(lam, -LOD_DB, LOD_DB);
+  float n0 = floor(lam); float fr = lam - n0;
+  float s0 = exp2(-n0); float s1 = exp2(-(n0 + 1.0));
+  float lineV = mix(gridAt(uvW * s0, dW * s0), gridAt(uvW * s1, dW * s1), fr);
+  float fill = mix(1.0, gray, FILL_SHADE);
+  float lineDark = clamp(mix(LINE_DARK_MIN, LINE_DARK_MAX, 1.0 - gray), 0.0, LINE_DARK_MAX);
+  vec3 rgb = uColor.rgb * fill * (1.0 - lineV * lineDark);
+  outColor = vec4(rgb, uOpacity * (1.0 - bodyMask));
+}`,
+};
+
 // ─── V12 rubber-sheet — full-screen fragment-shader pass ──────────
 // User pivoted away from the indexed-LINE mesh approach (V11) because
 // the 15% viewport-expansion "skirt" remained a finite-extent band-aid:

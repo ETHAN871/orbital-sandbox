@@ -67,8 +67,8 @@ import {
   TRAIL_DECAY, TRAIL_BLIT, TRAIL_DOT, ENTITY,
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
-  SCREEN_DENT,
-} from './shaders.js?v=20260603-ghostsum';
+  SCREEN_DENT, MEMBRANE_MESH,
+} from './shaders.js?v=20260603-mesh';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -100,6 +100,11 @@ let _progStreamline = null;
 let _progGridWarp = null;
 // Punched fly-screen field — default. Drawn on the shared grid LINE mesh.
 let _progScreenDent = null;
+let _progMembraneMesh = null;
+let _vaoMembrane = null;
+let _bufMembraneVerts = null, _bufMembranePin = null, _bufMembraneIndices = null;
+let _membraneIndexCount = 0;
+let _membraneCellPx = 0;
 // V12 (2026-05-28): full-screen fragment-shader rubber-sheet renderer.
 // Replaces the GRID_WARP indexed-LINE mesh for state.fieldStyle ===
 // 'rubber-sheet' specifically. Modes '2d' and '3d' continue to use
@@ -311,6 +316,9 @@ export function initWebGL(canvas) {
     _progEquipotential = _progStreamline = null;
     _progGridWarp = _progRubberSheetFS = _progParticleFlow = null;
     _progScreenDent = null;
+    _progMembraneMesh = null;
+    _vaoMembrane = null;
+    _bufMembraneVerts = _bufMembranePin = _bufMembraneIndices = null;
     _bufFsQuad = _bufUnitQuad = _bufEntityCornerQuad = null;
     _bufInstanceTrail = _bufInstanceEntity = null;
     _bufInstanceCircleFill = _bufInstanceCircleRing = _bufInstanceLineSeg = null;
@@ -474,6 +482,19 @@ function _initPrograms() {
   _progScreenDent.uCell          = gl.getUniformLocation(_progScreenDent.prog, 'uCell');
   _progScreenDent.uColor         = gl.getUniformLocation(_progScreenDent.prog, 'uColor');
   _progScreenDent.uOpacity       = gl.getUniformLocation(_progScreenDent.prog, 'uOpacity');
+
+  // Membrane MESH (fieldStyle 'mesh'): displaced triangle lattice + analytic-line FS.
+  _progMembraneMesh = _makeProgram(MEMBRANE_MESH.VS, MEMBRANE_MESH.FS);
+  {
+    const P = _progMembraneMesh, pr = P.prog;
+    P.aPos = gl.getAttribLocation(pr, 'aPos');
+    P.aPin = gl.getAttribLocation(pr, 'aPin');
+    for (const u of ['uOrtho','uViewport','uEntities','uEntityCount','uHeightK','uCore2',
+                     'uWarpGain','uSlope','uAmbient','uContrast','uWrap','uCell','uColor',
+                     'uOpacity','uPinEnable']) {
+      P[u] = gl.getUniformLocation(pr, u === 'uEntities' ? 'uEntities[0]' : u);
+    }
+  }
 
   // V12 (2026-05-28): full-screen FS rubber-sheet renderer. Shares the
   // VS_FULLSCREEN VAO (_vaoFsQuad) with the trail-decay/blit programs.
@@ -980,6 +1001,66 @@ export function resizeRenderer(w, h, dpr) {
   _initSagTexture();
   _rebuildStreamlineSeeds();
   _rebuildGridWarpVerts();
+  _rebuildMembraneMesh();
+}
+
+// Membrane mesh: a dense TRIANGLE lattice spanning the viewport exactly (no
+// skirt), with a per-vertex `aPin` (1 at the four borders, ramped to 0 over the
+// outermost ~5%) so the VS can lock the borders to the screen edge in bounded
+// mode. Dense enough that the per-vertex inextensible warp looks smoothly
+// curved (faceting invisible) and deep (cumulative inward flow). Lines are NOT
+// the mesh edges — they're drawn analytically in the FS on the material coord.
+function _rebuildMembraneMesh() {
+  if (!_gl || _vpW <= 0 || _vpH <= 0 || !_progMembraneMesh) return;
+  const gl = _gl;
+  const TARGET_COLS = 140;
+  const cellPx = Math.max(4, _vpW / TARGET_COLS);
+  _membraneCellPx = cellPx;
+  const cols = Math.max(8, Math.round(_vpW / cellPx) + 1);
+  const rows = Math.max(8, Math.round(_vpH / cellPx) + 1);
+  const vcount = cols * rows;
+  const verts = new Float32Array(vcount * 2);
+  const pin = new Float32Array(vcount);
+  const rampX = Math.max(1, Math.round(cols * 0.05));
+  const rampY = Math.max(1, Math.round(rows * 0.05));
+  let vi = 0;
+  for (let r = 0; r < rows; r++) {
+    const y = (r / (rows - 1)) * _vpH;
+    for (let c = 0; c < cols; c++) {
+      const x = (c / (cols - 1)) * _vpW;
+      verts[vi * 2] = x; verts[vi * 2 + 1] = y;
+      const px = 1 - Math.min(1, Math.min(c, cols - 1 - c) / rampX);
+      const py = 1 - Math.min(1, Math.min(r, rows - 1 - r) / rampY);
+      pin[vi] = Math.max(px, py);
+      vi++;
+    }
+  }
+  const idx = new Uint32Array((cols - 1) * (rows - 1) * 6);
+  let ii = 0;
+  for (let r = 0; r < rows - 1; r++) {
+    for (let c = 0; c < cols - 1; c++) {
+      const v = r * cols + c, vr = v + 1, vd = v + cols, vrd = v + cols + 1;
+      idx[ii++] = v;  idx[ii++] = vr;  idx[ii++] = vd;
+      idx[ii++] = vr; idx[ii++] = vrd; idx[ii++] = vd;
+    }
+  }
+  _membraneIndexCount = idx.length;
+  if (!_vaoMembrane) _vaoMembrane = gl.createVertexArray();
+  if (!_bufMembraneVerts) _bufMembraneVerts = gl.createBuffer();
+  if (!_bufMembranePin) _bufMembranePin = gl.createBuffer();
+  if (!_bufMembraneIndices) _bufMembraneIndices = gl.createBuffer();
+  gl.bindVertexArray(_vaoMembrane);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufMembraneVerts);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(_progMembraneMesh.aPos);
+  gl.vertexAttribPointer(_progMembraneMesh.aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, _bufMembranePin);
+  gl.bufferData(gl.ARRAY_BUFFER, pin, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(_progMembraneMesh.aPin);
+  gl.vertexAttribPointer(_progMembraneMesh.aPin, 1, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _bufMembraneIndices);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
 }
 
 // V9.2: build a regular grid of vertices covering the viewport, plus an
@@ -1466,6 +1547,75 @@ const _MEMBRANE_WARP_K    = 0.8;     // grid-pinch gain (×, kept below fold)
 const _MEMBRANE_AMBIENT   = 0.45;    // base z-ambient relief floor (slope darkening)
 const _MEMBRANE_REF_MASS  = 100;     // reference mass → h=1 at its center (ABSOLUTE scale)
 const _MEMBRANE_COLOR     = [0.85, 0.85, 0.87];   // near-neutral grayscale membrane
+
+// Pack one entity per body (+ relaxing wells) into _fieldEntityData; shared by
+// the membrane field draws. Returns the count.
+function _packMembraneEntities() {
+  _fieldEntityCount = 0;
+  const ents = state.entities;
+  for (let i = 0; i < ents.length; i++) {
+    const e = ents[i];
+    if (e.absorbing) continue;
+    const Gqm = state.G * e.charge * e.mass;
+    if (Gqm === 0) continue;
+    if (_fieldEntityCount >= MAX_FIELD_ENTITIES) break;
+    const embed = e.embed === undefined ? 1 : e.embed;
+    const o = _fieldEntityCount * 4;
+    _fieldEntityData[o] = e.x; _fieldEntityData[o + 1] = e.y;
+    _fieldEntityData[o + 2] = Gqm * embed; _fieldEntityData[o + 3] = e.radius;
+    _fieldEntityCount++;
+  }
+  for (let f = 0; f < _fadingWells.length && _fieldEntityCount < MAX_FIELD_ENTITIES; f++) {
+    const fw = _fadingWells[f]; const o = _fieldEntityCount * 4;
+    _fieldEntityData[o] = fw.x; _fieldEntityData[o + 1] = fw.y;
+    _fieldEntityData[o + 2] = fw.Gqm * fw.embed; _fieldEntityData[o + 3] = fw.radius * fw.embed;
+    _fieldEntityCount++;
+  }
+  return _fieldEntityCount;
+}
+
+// Membrane MESH draw (fieldStyle 'mesh'): displaced triangle lattice, lines
+// drawn analytically in the FS. Reuses the same field-strength uniforms as
+// _drawScreenDent so depth scales identically with mass·charge·G·embed.
+function _drawMembraneMesh() {
+  const gl = _gl;
+  if (!_progMembraneMesh || !_vaoMembrane || _membraneIndexCount === 0) return;
+  const wrap = state.boundaryMode === 'wrap';
+  _packMembraneEntities();
+  const core = Math.max(8, Math.min(_vpW, _vpH) * _MEMBRANE_CORE_FRAC);
+  const core2 = core * core;
+  const wRef = Math.max(1e-6, state.G * _MEMBRANE_REF_MASS);
+  const heightK = core2 / wRef;
+  const warpGain = (_MEMBRANE_WARP_K * core2) / wRef;
+  const contrast = Math.min(1, Math.max(0, state.fieldContrast));
+  const cellBase = Math.max(8, state.fieldLineSpacing);
+  let cellX = cellBase, cellY = cellBase;
+  if (wrap && _vpW > 0 && _vpH > 0) {
+    cellX = _vpW / Math.max(1, Math.round(_vpW / cellBase));
+    cellY = _vpH / Math.max(1, Math.round(_vpH / cellBase));
+  }
+  const P = _progMembraneMesh;
+  gl.useProgram(P.prog);
+  gl.uniformMatrix4fv(P.uOrtho, false, _orthoMat);
+  gl.uniform2f(P.uViewport, _vpW, _vpH);
+  gl.uniform4fv(P.uEntities, _fieldEntityData, 0, _fieldEntityCount * 4);
+  gl.uniform1i(P.uEntityCount, _fieldEntityCount);
+  gl.uniform1f(P.uHeightK, heightK);
+  gl.uniform1f(P.uCore2, core2);
+  gl.uniform1f(P.uWarpGain, warpGain);
+  gl.uniform1f(P.uSlope, core * _MEMBRANE_SLOPE_K);
+  gl.uniform1f(P.uAmbient, _MEMBRANE_AMBIENT);
+  gl.uniform1f(P.uContrast, contrast);
+  gl.uniform1f(P.uWrap, wrap ? 1.0 : 0.0);
+  gl.uniform1f(P.uPinEnable, wrap ? 0.0 : 1.0);
+  gl.uniform2f(P.uCell, cellX, cellY);
+  gl.uniform4f(P.uColor, _MEMBRANE_COLOR[0], _MEMBRANE_COLOR[1], _MEMBRANE_COLOR[2], 1.0);
+  gl.uniform1f(P.uOpacity, Math.min(1, Math.max(0, state.membraneOpacity)));
+  gl.bindVertexArray(_vaoMembrane);
+  gl.drawElements(gl.TRIANGLES, _membraneIndexCount, gl.UNSIGNED_INT, 0);
+  gl.bindVertexArray(null);
+}
+
 function _drawScreenDent() {
   const gl = _gl;
   if (!_progScreenDent) return;
@@ -2715,7 +2865,8 @@ export function drawField() {
   // mesh paths (curvilinear/legacy/2d/3d) still early-out because their
   // CPU uniform uploads + N-body inner loops are wasted with no bodies.
   if (_fieldEntityCount === 0 &&
-      state.fieldStyle !== 'rubber-sheet' && state.fieldStyle !== 'screen') return;
+      state.fieldStyle !== 'rubber-sheet' && state.fieldStyle !== 'screen' &&
+      state.fieldStyle !== 'mesh') return;
 
   // PERF: the field is a heavy fullscreen per-pixel N-body shader. Render the
   // whole field group into a half-res offscreen FBO (¼ the fragments → ~4×
@@ -2752,7 +2903,10 @@ export function drawField() {
   // V9.9: 'curvilinear' default — equipotential rings + radial
   // geodesic field lines from each body. Fold-free by construction.
   // 'legacy' = rings only (no field lines). '2d'/'3d' = old GRID_WARP.
-  if (state.fieldStyle === 'screen') {
+  if (state.fieldStyle === 'mesh') {
+    // True 3D-membrane triangle mesh (deep + fold-free + edge-pinned).
+    _drawMembraneMesh();
+  } else if (state.fieldStyle === 'screen') {
     // Default: punched fly-screen dimples. Clean — no rings / no dust.
     _drawScreenDent();
   } else if (state.fieldStyle === 'curvilinear') {
