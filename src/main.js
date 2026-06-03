@@ -24,9 +24,9 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260603-membrane';
+} from './renderer-webgl.js?v=20260603-iqgrid';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-membrane';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-iqgrid';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {

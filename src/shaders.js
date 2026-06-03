@@ -816,14 +816,30 @@ const float LINE_DARK_MAX = 0.85;    // line darkening cap in deep regions (clam
 const float AO_STRENGTH = 1.3;       // depth→ambient-occlusion rate (deeper well = darker)
 const float AO_FLOOR = 0.12;         // min ambient at great depth (indirect bounce, not black)
 
-// AA grid coverage with an EXPLICIT derivative. Taking fwidth() of an
-// octave-scaled coord spikes at LOD seams (where the scale jumps ×2 between
-// pixels) and prints stray line fragments — so the caller passes the
-// derivative scaled from the continuous base coord instead.
+// Analytically box-filtered grid (Inigo Quilez, "filterable procedurals").
+// Instead of POINT-sampling the line pattern and smoothing by the derivative
+// (which ALIASES — moiré — once the warped grid is finer than the footprint,
+// e.g. the high-curvature pinch near a deep well, made worse at half-res), it
+// INTEGRATES the line indicator analytically over the pixel footprint w = the
+// explicit derivative. An over-dense grid then converges to its average tone
+// (≈2·LW) — a smooth grey — instead of aliasing into false closed loops.
+// Returns line coverage: 1 on a grid line, 0 in the cell interior. LW = line
+// width as a fraction of the cell. Derivative passed explicitly (continuous
+// base coord × octave scale): fwidth() of the scaled coord spikes at LOD seams.
 float gridAt(vec2 uvw, vec2 d) {
-  vec2 fw = max(d, vec2(1e-6));
-  vec2 g = abs(fract(uvw - 0.5) - 0.5) / fw;
-  return 1.0 - smoothstep(0.5, 1.5, min(g.x, g.y));
+  const float LW = 0.06;
+  const float WIDEN = 2.0;                        // footprint safety factor: fwidth
+  // underestimates the true screen pixel span (linear est. in curved regions +
+  // half-res FBO upscaled 2× to screen) → widen so the box filter never
+  // under-integrates and aliases. Over-filtering just fades to grey (clean).
+  vec2 w = max(d * WIDEN, vec2(1e-6));            // footprint, cell units / fragment
+  vec2 a = uvw + 0.5 * w;
+  vec2 b = uvw - 0.5 * w;
+  // ∫ of the line indicator (ink on the first LW of each cell) over [b, a]:
+  // box-averaged coverage per axis → LW (the mean) when finer than the footprint.
+  vec2 cov = (floor(a) * LW + min(fract(a), vec2(LW))
+            - floor(b) * LW - min(fract(b), vec2(LW))) / w;
+  return 1.0 - (1.0 - cov.x) * (1.0 - cov.y);     // union: on an x-line OR a y-line
 }
 
 void main() {
