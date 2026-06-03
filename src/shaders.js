@@ -806,9 +806,7 @@ uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
-const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
-const float FOLD_DETMIN = 0.06;     // det(I+Jw) <= this -> warp fully suppressed (no fold)
-const float FOLD_SAFE = 0.45;        // det(I+Jw) >= this -> full warp; smooth ramp between
+const float WARP_DEPTH = 3.0;        // inextensible pinch saturation (× core) — deep but fold-free
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap seam-tear)
 const float LOD_DB = 0.5;            // octave deadband — suppress mid-field LOD flicker (断线)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
@@ -850,8 +848,7 @@ void main() {
   // CSS-px frag position (y down from top) — matches uEntities coords.
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
   vec2 grad = vec2(0.0);             // ∇h (height-field gradient)
-  vec2 warp = vec2(0.0);             // grid-pinch displacement
-  float jxx = 0.0, jxy = 0.0, jyx = 0.0, jyy = 0.0;  // ∂warp/∂p (analytic)
+  vec2 warp = vec2(0.0);             // grid-pinch displacement (inextensible-style)
   float h = 0.0;                     // absolute height field (∝ mass), drives refinement
   float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
@@ -869,47 +866,24 @@ void main() {
     // ∂/∂p [ |w|·core²/(r²+core²) ] = |w|·core²·(-2·di)/(r²+core²)².
     grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
     h    += (w * uHeightK) * inv;   // absolute height (h=1 at a REF_MASS body's center)
-    float pull = uWarpGain * w * inv;
-    float A = PMAX / (PMAX + pull);
-    float f = A * pull;                 // = PMAX·pull/(PMAX+pull), per-body pinch
-    // Wrap-continuous radial taper (magnitude → 0 at the ½-span seam, direction
-    // stays radial). t = (1+cos)/2 per axis; dt = ∂t/∂coord for the Jacobian.
-    vec2 t  = vec2(1.0);
-    vec2 dt = vec2(0.0);
+    // INEXTENSIBLE-STYLE inward pull. Magnitude |d| = D·(1 − c²/(r²+c²)): 0 at
+    // the body, rising MONOTONICALLY (dd/dr ≥ 0 ⇒ the radial map r→r+d has slope
+    // ≥ 1, NEVER inverts ⇒ no fold per body) and saturating at D far out. The
+    // grid gets DENSER through the well wall (deep pinch, bottom not flat) yet
+    // can't fold — the property di·f lacked (its |d|=r·f decreases outward ⇒
+    // slope < 0 ⇒ fold). D saturates with mass (a heavy body dents only so far),
+    // so summing many monotone inward pulls stays fold-resistant.
+    float pull0 = uWarpGain * w / uCore2;                 // core pull (mass strength)
+    float D = WARP_DEPTH * sqrt(uCore2) * pull0 / (1.0 + pull0);
+    float dmag = D * (1.0 - uCore2 * inv);                // 0 → D, monotone
     if (uWrap > 0.5) {
-      t  = 0.5 + 0.5 * cos(TAU * di / uViewport);
-      dt = -0.5 * (TAU / uViewport) * sin(TAU * di / uViewport);
+      vec2 t = 0.5 + 0.5 * cos(TAU * di / uViewport);     // seam taper (C¹)
+      dmag *= t.x * t.y;
     }
-    float tau = t.x * t.y;
-    float g = tau * f;                  // radial displacement magnitude factor
-    warp += di * g;                     // wdi·f, kept radial
-    // Accumulate the ANALYTIC screen-space Jacobian ∂warp/∂p of THIS body so we
-    // can enforce a diffeomorphism (det > 0) below — no fold by construction,
-    // not by hiding it. ∂(di·g)/∂p = g·I + di⊗∇g, ∇g = f·∇τ + τ·∇f,
-    // ∇f = (f'/r)·di with f'/r = -2·inv·pull·A², ∇τ = (t.y·dt.x, t.x·dt.y).
-    float fpr = -2.0 * inv * pull * A * A;          // f'(r)/r
-    vec2 gradg = f * vec2(t.y * dt.x, t.x * dt.y) + tau * fpr * di;
-    jxx += g + di.x * gradg.x;
-    jxy += di.x * gradg.y;
-    jyx += di.y * gradg.x;
-    jyy += g + di.y * gradg.y;
+    warp += (di / max(sqrt(r2), 1e-3)) * dmag;            // unit-radial × magnitude
     // Hole: drop the membrane where a body sprite covers it (e.w = radius).
     // Relaxing wells (a removed body springing back) pack radius 0 → no hole.
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2)));
-  }
-  // FOLD GUARD — keep the in-plane deformation a diffeomorphism (no fold). The
-  // drawn map is uvW = (p + warp); its screen Jacobian is J = I + ∂warp/∂p, with
-  // ∂warp/∂p = Jw accumulated analytically above. A fold = det J ≤ 0 (a grid
-  // cell turns inside-out → same-family lines cross → the caustic rings). Our
-  // summed pinch overshoots into a fold over a broad region for dense clusters.
-  // SMOOTHLY fade the warp out where det(I+Jw) drops toward 0: a hard per-pixel
-  // scale kinks at its boundary and the neglected ∂s/∂p term re-folds the grid
-  // into a ring there, so use a C¹ ramp (∇s continuous → no boundary ring).
-  // det ≥ FOLD_SAFE → full warp; ≤ FOLD_DETMIN → warp killed (grid relaxes flat;
-  // depth still read from shading/AO).
-  {
-    float at1 = 1.0 + (jxx + jyy) + (jxx * jyy - jxy * jyx);   // det(I+Jw)
-    warp *= smoothstep(FOLD_DETMIN, FOLD_SAFE, at1);
   }
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
