@@ -808,8 +808,11 @@ out vec4 outColor;
 
 const float PMAX = 0.45;             // per-body max grid pinch (single-valued guard)
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap grid-fold)
-const float FOLD_VEIL_LO = 0.25;     // caustic veil: jdet ≤ this → grid fully faded (fold + the ring boundary)
-const float FOLD_VEIL_HI = 0.95;     // caustic veil: jdet ≥ this → full grid (only true compression fades)
+// Caustic veil thresholds on the warp's full Jacobian determinant jdet
+// (1 = undistorted, ≤0 = folded — lines crossing → caustic ring).
+const float FOLD_VEIL_LO = 0.0;      // jdet ≤ this (at/over the fold) → grid at the floor
+const float FOLD_VEIL_HI = 0.3;      // jdet ≥ this → full grid (compression that stays injective is kept)
+const float FOLD_VEIL_FLOOR = 0.12;  // faded caustic lines never fully vanish — keep at least this fraction
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
 const float REFINE_GAIN = 0.9;       // height above threshold → finer octaves (bias)
 const float MAX_BIAS_OCT = 1.5;      // cap on heavy-body refine bias (≤ ~2.8× base density)
@@ -924,28 +927,27 @@ void main() {
   // mesh keeps grid lines in BOTH directions following the warp everywhere.
   float lineX = gridAxisLOD(uvW.x, dW.x, dF.x, bias);   // vertical lines   (const uvW.x)
   float lineY = gridAxisLOD(uvW.y, dW.y, dF.y, bias);   // horizontal lines (const uvW.y)
-  float line = max(lineX, lineY);
   // Caustic veil ("虚化"). A deep, mass-proportional in-plane pinch is a strong
-  // lens, and a strong lens unavoidably folds (caustics — Einstein-ring loops)
-  // where the warp map (p+warp) becomes non-injective. Rather than cap the
-  // depth (which kills the mass cue), DETECT the fold from warp's screen-space
-  // Jacobian determinant and FADE the grid lines there, so the caustic blurs
-  // softly into the shaded membrane instead of printing hard crossing rings.
-  // Depth is read from the lighting/AO (gray darkens with mass) — unaffected.
-  // Non-folding deep pinch (jdet > 0) keeps the full grid. RESOLUTION-
-  // INDEPENDENT: normalize the warp's screen-space Jacobian by the FLAT map's
-  // screen derivative (dFdx(p), dFdy(p)) so jdet is the true relative-area
-  // Jacobian — ≈1 on an undistorted grid, →0 at a fold — regardless of the
-  // render scale. (The field renders to a half-res FBO; without this, raw
-  // dFdx(warp) doubles and mis-places the veil: it fades the funnel mesh and
-  // leaves the actual caustic rings sharp.) p maps linearly to the screen, so
-  // the off-axis derivatives dFdx(p).y / dFdy(p).x are ~0 and dropped.
-  vec2 wdx = dFdx(warp), wdy = dFdy(warp);
+  // lens that FOLDS (caustics — Einstein-ring loops) where the warp map
+  // (p+warp) stops being injective and grid lines cross. The correct fold test
+  // is the FULL screen-space Jacobian DETERMINANT (with cross terms): det ≤ 0
+  // is where the local area flips and lines actually cross. A per-axis diagonal
+  // factor is NOT enough — one factor can go negative under pure SHEAR while
+  // the map stays injective (no caustic), so veiling on it over-fades whole
+  // patches in one direction (the reported "fades a band where there's no
+  // loop"). Normalize by the flat map's own screen derivative (dFdx(p)/dFdy(p))
+  // so jdet is resolution-independent: ≈1 undistorted, ≤0 folded — unaffected
+  // by the half-res field FBO (raw dFdx(warp) would otherwise scale with it).
+  // Fade ONLY at/near the fold (jdet → 0); compression that stays injective
+  // (jdet ≥ FOLD_VEIL_HI) keeps the full grid. Fade bottoms out at a non-zero
+  // FLOOR so caustic lines blur to faint rather than vanishing completely.
   float sx = max(abs(dFdx(p).x), 1e-6);
   float sy = max(abs(dFdy(p).y), 1e-6);
+  vec2 wdx = dFdx(warp), wdy = dFdy(warp);
   float jdet = (1.0 + wdx.x / sx) * (1.0 + wdy.y / sy)
              - (wdy.x / sx) * (wdx.y / sy);
-  line *= smoothstep(FOLD_VEIL_LO, FOLD_VEIL_HI, jdet);
+  float veil = mix(FOLD_VEIL_FLOOR, 1.0, smoothstep(FOLD_VEIL_LO, FOLD_VEIL_HI, jdet));
+  float line = max(lineX, lineY) * veil;
   // Region brightness is carried by the LINES (darkness + count), not a filled
   // color block: the fill is near-uniform (FILL_SHADE≈0); each line darkens
   // where the lighting gray is dark, and the depth bias also packs MORE
