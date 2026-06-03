@@ -24,9 +24,9 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260603-inext';
+} from './renderer-webgl.js?v=20260603-ghostgrad';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-inext';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-ghostgrad';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {
