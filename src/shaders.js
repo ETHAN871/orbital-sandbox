@@ -806,8 +806,7 @@ uniform vec4 uColor;                 // membrane base tint (rgb)
 uniform float uOpacity;              // whole-membrane alpha (0..1)
 out vec4 outColor;
 
-const float WARP_DEPTH = 120.0;     // warp = WARP_DEPTH·∇h (periodic gradient pinch gain)
-const float WMAX_CORE = 1.2;         // max warp displacement = WMAX_CORE × core (soft-clamp, anti-fold)
+const float WARP_DEPTH = 3.0;        // inextensible pinch saturation (× core) — deep but fold-free
 const float TAU = 6.28318530718;     // 2π — continuous periodic warp (anti wrap seam-tear)
 const float LOD_DB = 0.5;            // octave deadband — suppress mid-field LOD flicker (断线)
 const float REFINE_THRESHOLD = 1.0;  // height below this → no heavy-body refine bias
@@ -848,27 +847,31 @@ float gridAt(vec2 uvw, vec2 d) {
 void main() {
   // CSS-px frag position (y down from top) — matches uEntities coords.
   vec2 p = vec2(vUv.x * uViewport.x, (1.0 - vUv.y) * uViewport.y);
-  vec2 grad = vec2(0.0);             // ∇h over the periodic image lattice (drives the warp)
+  vec2 grad = vec2(0.0);             // ∇h over the periodic image lattice (lighting normal)
+  vec2 warp = vec2(0.0);             // grid-pinch displacement (inextensible-style)
   float h = 0.0;                     // absolute height field (∝ mass), drives shading/AO
   float bodyMask = 0.0;              // 1 where a body covers this fragment (hole)
   for (int i = 0; i < MAX_ENTITIES; i++) {
     if (i >= uEntityCount) break;
     vec4 e = uEntities[i];
     float w = abs(e.z);             // field strength ∝ |G·q·m|·embed
-    // Min-image offset of this body (its nearest periodic copy). h / bodyMask
-    // read the nearest copy; the WARP reads the full 3×3 image lattice so the
-    // toroidal field is the smooth SUM of the body's evenly-spaced copies —
-    // exactly "destroy mode with a regular grid of bodies". The old min-image +
-    // per-body square taper instead CONFINED each body to its own cell, so many
-    // bodies' cells abutted and interfered → the swirl. A ghost SUM overlaps
-    // smoothly (neighbouring pulls cancel into clean saddles) with NO taper and
-    // NO seam (crossing the boundary just relabels the same set of copies).
+    // Nearest periodic copy (min-image) drives h / bodyMask. The displacement is
+    // summed over the body's 3×3 image LATTICE (identity copy only in destroy
+    // mode) so the toroidal field is the smooth SUM of its evenly-spaced copies
+    // — "destroy mode with a regular grid of bodies". (The old per-body SQUARE
+    // taper instead confined each body to its own cell, so many cells abutted
+    // and interfered → the swirl; a ghost SUM overlaps into clean saddles.)
     vec2 base = p - e.xy;
     if (uWrap > 0.5) base -= uViewport * floor(base / uViewport + 0.5);
     float r2n = dot(base, base);
     h += (w * uHeightK) / (r2n + uCore2);                  // nearest-copy depth
     if (e.w > 0.5) bodyMask = max(bodyMask, 1.0 - smoothstep(e.w * 0.8, e.w * 1.1, sqrt(r2n)));
-    // 3×3 image lattice (wrap) or just the body (destroy) → periodic ∇h.
+    // INEXTENSIBLE-STYLE inward pull, per copy. |d| = D·(1 − c²/(r²+c²)): 0 at
+    // the body, rising MONOTONICALLY (dd/dr ≥ 0 ⇒ radial map slope ≥ 1 ⇒ never
+    // inverts) and saturating at D. Dense at the wall (deep pinch, not flat) but
+    // fold-free. D saturates with mass. Summed over the 3×3 lattice for wrap.
+    float pull0 = uWarpGain * w / uCore2;
+    float D = WARP_DEPTH * sqrt(uCore2) * pull0 / (1.0 + pull0);
     int lo = (uWrap > 0.5) ? -1 : 0;
     int hi = (uWrap > 0.5) ?  1 : 0;
     for (int oy = -1; oy <= 1; oy++) {
@@ -876,23 +879,14 @@ void main() {
       for (int ox = -1; ox <= 1; ox++) {
         if (ox < lo || ox > hi) continue;
         vec2 di = base + vec2(float(ox), float(oy)) * uViewport;
-        float inv = 1.0 / (dot(di, di) + uCore2);
-        // ∂/∂p [ w·core²/(r²+core²) ] = w·core²·(-2·di)·inv² ; toward the body.
+        float r2 = dot(di, di);
+        float inv = 1.0 / (r2 + uCore2);
         grad += (w * uHeightK) * (-2.0) * di * (inv * inv);
+        float dmag = D * (1.0 - uCore2 * inv);            // 0 → D, monotone
+        warp += (di / max(sqrt(r2), 1e-3)) * dmag;        // unit-radial × magnitude
       }
     }
   }
-  // Grid-pinch displacement = the (periodic) height-field gradient. ∇h is the
-  // gradient of a smooth periodic potential → the warp is smooth and toroidal
-  // by construction (no taper, no seam, no swirl), and between bodies it relaxes
-  // into clean saddles. grad points TOWARD bodies; warp +grad pulls the grid in.
-  vec2 warp = WARP_DEPTH * grad;
-  // Soft-clamp the displacement magnitude: far field stays linear in ∇h (clean
-  // saddles), but a very dense cluster's steep core gradient is saturated to
-  // ~WMAX so the warp can't pile up fast enough to fold. Smooth scalar (no
-  // spatial boundary → no ring), magnitude → WMAX as |warp| → ∞.
-  float wmax = WMAX_CORE * sqrt(uCore2);
-  warp *= wmax / (wmax + length(warp));
   // Two DIFFUSE lights superimposed (no specular): a +z ambient and a 45°
   // upper-left light. The 45° light's weight is the contrast slider;
   // half-Lambert keeps its terminator soft and its shadow shallow.
