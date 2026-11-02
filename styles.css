@@ -1,3 +1,5 @@
+[hidden] { display: none !important; }
+
 :root {
   --bg: #0a0a0f;
   --panel-bg: #14141c;

@@ -1,3 +1,4 @@
+import { minImageDelta, wrapCoordinate } from './boundary.js';
 // physics-spatial-hash.js — Wrap-aware uniform-grid broadphase.
 //
 // V8.2: replaces handleCollisions' O(N²) all-pairs scan with a cell-based
@@ -83,8 +84,9 @@ export function buildSpatialHash(entities) {
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i];
     if (e.absorbing) continue;
-    const cx = Math.floor(e.x / _cellSizeX);
-    const cy = Math.floor(e.y / _cellSizeY);
+    const wrap = state.boundaryMode === 'wrap';
+    const cx = Math.floor((wrap ? wrapCoordinate(e.x, W) : e.x) / _cellSizeX);
+    const cy = Math.floor((wrap ? wrapCoordinate(e.y, H) : e.y) / _cellSizeY);
     const key = cellKey(cx, cy);
     let bucket = _cells.get(key);
     if (!bucket) _cells.set(key, bucket = []);
@@ -112,6 +114,7 @@ export function forEachCollisionPair(entities, cb) {
     const acx = Math.floor(a.x / _cellSizeX);
     const acy = Math.floor(a.y / _cellSizeY);
 
+    const visited = new Set();
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         let qcx = acx + dx;
@@ -120,7 +123,10 @@ export function forEachCollisionPair(entities, cb) {
           if (_ncx > 0) qcx = ((qcx % _ncx) + _ncx) % _ncx;
           if (_ncy > 0) qcy = ((qcy % _ncy) + _ncy) % _ncy;
         }
-        const bucket = _cells.get(cellKey(qcx, qcy));
+        const key = cellKey(qcx, qcy);
+        if (visited.has(key)) continue;
+        visited.add(key);
+        const bucket = _cells.get(key);
         if (!bucket) continue;
         for (let k = 0; k < bucket.length; k++) {
           const b = bucket[k];
@@ -130,8 +136,8 @@ export function forEachCollisionPair(entities, cb) {
           let pdx = b.x - a.x;
           let pdy = b.y - a.y;
           if (wrap) {
-            if (pdx >  halfW) pdx -= W; else if (pdx < -halfW) pdx += W;
-            if (pdy >  halfH) pdy -= H; else if (pdy < -halfH) pdy += H;
+            pdx = minImageDelta(pdx, W);
+            pdy = minImageDelta(pdy, H);
           }
           cb(a, b, pdx, pdy);
         }

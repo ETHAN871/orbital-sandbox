@@ -1,3 +1,4 @@
+import { minImageDelta } from './boundary.js';
 // input.js — Pointer interaction.
 //
 // Two distinct interaction modes, gated by `state.isEditMode`:
@@ -23,6 +24,8 @@ const HIT_TEST_BUFFER_PX = 8;           // px — expands tap zone past visible 
 
 let canvasRef = null;
 let onSelectionChangeCb = () => {};
+let activePointer = null;
+let gestureEditMode = false;
 let clickStart = null;                  // { x, y } for edit-mode click detection
 let predictionRafToken = 0;             // RAF id, 0 when no prediction recompute is pending
 
@@ -34,6 +37,8 @@ export function attachInput(canvas, onSelectionChange) {
   canvas.addEventListener('pointermove', handlePointerMove);
   canvas.addEventListener('pointerup', handlePointerUp);
   canvas.addEventListener('pointerleave', handlePointerLeave);
+  canvas.addEventListener('pointercancel', cancelInteraction);
+  canvas.addEventListener('lostpointercapture', cancelInteraction);
   canvas.addEventListener('contextmenu', e => e.preventDefault());
 }
 
@@ -51,7 +56,9 @@ function eventToCanvasCoords(ev) {
 // ─── Event handlers ────────────────────────────────────────────────
 function handlePointerDown(ev) {
   // Only respond to primary button (touch / pen also report button=0).
-  if (ev.button !== 0) return;
+  if (ev.button !== 0 || activePointer !== null) return;
+  activePointer = ev.pointerId;
+  gestureEditMode = state.isEditMode;
   canvasRef.setPointerCapture(ev.pointerId);
   const { x, y } = eventToCanvasCoords(ev);
 
@@ -73,6 +80,7 @@ function handlePointerDown(ev) {
 }
 
 function handlePointerMove(ev) {
+  if (activePointer !== null && ev.pointerId !== activePointer) return;
   const { x, y } = eventToCanvasCoords(ev);
   // Always track hover for the placement-mode ghost outline. Renderer
   // gates on `!isEditMode && !drag` itself.
@@ -87,6 +95,9 @@ function handlePointerMove(ev) {
 }
 
 function handlePointerUp(ev) {
+  if (ev.pointerId !== activePointer) return;
+  activePointer = null;
+  if (gestureEditMode !== state.isEditMode) { cancelInteraction(); return; }
   const { x, y } = eventToCanvasCoords(ev);
   if (canvasRef.hasPointerCapture(ev.pointerId)) {
     canvasRef.releasePointerCapture(ev.pointerId);
@@ -115,8 +126,8 @@ function handlePointerUp(ev) {
   // Placement commit — slingshot semantics: drag *back* to launch *forward*.
   // The initial velocity is the *negative* of the drag vector.
   if (!state.drag) return;
-  const dragVecX = state.drag.currentX - state.drag.startX;
-  const dragVecY = state.drag.currentY - state.drag.startY;
+  const dragVecX = x - state.drag.startX;
+  const dragVecY = y - state.drag.startY;
   const ent = createEntity({
     type: state.pending.type,
     x: state.drag.startX,
@@ -133,7 +144,15 @@ function handlePointerUp(ev) {
   cancelPendingPrediction();
 }
 
+function cancelInteraction() {
+  activePointer = null;
+  state.drag = null;
+  clickStart = null;
+  cancelPendingPrediction();
+}
+
 function handlePointerLeave() {
+  if (activePointer !== null) return;
   // Cancel any in-flight drag if the pointer leaves the canvas; commit nothing.
   if (state.drag) state.drag = null;
   clickStart = null;
@@ -183,8 +202,9 @@ function hitTestEntity(x, y) {
   for (let i = state.entities.length - 1; i >= 0; i--) {
     const e = state.entities[i];
     if (e.absorbing) continue;
-    const dx = x - e.x;
-    const dy = y - e.y;
+    const wrap = state.boundaryMode === 'wrap';
+    const dx = wrap ? minImageDelta(x - e.x, state.viewport.width) : x - e.x;
+    const dy = wrap ? minImageDelta(y - e.y, state.viewport.height) : y - e.y;
     const hitR = e.radius + HIT_TEST_BUFFER_PX;
     if (dx * dx + dy * dy <= hitR * hitR) return e;
   }

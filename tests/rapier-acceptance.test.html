@@ -36,9 +36,6 @@
   <script type="importmap">
   {
     "imports": {
-      "d3-quadtree": "https://esm.sh/d3-quadtree@3",
-      "planck":      "https://esm.sh/planck@1.5.0",
-      "stats.js":    "https://esm.sh/stats.js@0.17.0",
       "@dimforge/rapier2d-compat": "https://esm.sh/@dimforge/rapier2d-compat@0.19.3"
     }
   }
@@ -76,6 +73,7 @@
       // engine (default is CPU before init runs).
       backend = await createBackend(state.entities);
       await backend.init(state.entities);
+      if (state.backendName !== "rapier") throw new Error(`Expected Rapier, got ${state.backendName}`);
       return backend;
     }
 
@@ -304,12 +302,6 @@
     // post-destroy invariant is: subsequent step() throws, doesn't hang.
     async function testR1_StepAfterDestroyThrows() {
       group('R1 — step() after destroy() throws immediately (no hang)');
-      const params = new URLSearchParams(location.search);
-      const isWorker = params.get('engine') === 'rapier-worker';
-      if (!isWorker) {
-        skip('R1', 'only applies to worker backend; reload with ?engine=rapier-worker');
-        return;
-      }
       await freshBackend();
       state.entities.push(makeEntity({ x: 400, y: 300 }));
       // Take down the backend.
@@ -351,19 +343,6 @@
     // both backends exercise the same lifecycle path.
     async function testR2_AbsorbingNotSpliced() {
       group('R2 — mid-absorbing entity stays alive during animation');
-      const params = new URLSearchParams(location.search);
-      const isWorker = params.get('engine') === 'rapier-worker';
-      if (isWorker) {
-        // Worker v1 limitation: absorbing flag is set on the worker-side
-        // entity copy, never propagated back to main. Worker's stepDone
-        // only includes x/y/vx/vy via Float32Array. From main's view, an
-        // absorbed body just disappears (entity in sentSet but not in
-        // returnedSet → spliced). No mid-animation flag is observable.
-        // Worker v2 will need to surface absorption state in stepDone
-        // for animation to work cross-thread.
-        skip('R2', 'worker mode does not surface absorbing flag to main (v1 limitation)');
-        return;
-      }
       await freshBackend();
       // Reuse B6's proven geometry: planet OUTSIDE BH sensor with inward
       // velocity. Must ENTER the BH's sensor to trigger absorption (BHs

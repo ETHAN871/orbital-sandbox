@@ -9,12 +9,12 @@
 
 import {
   state, DEFAULTS, DEFAULTS_TUNING,
-  BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO,
+  BASE_TIME_SCALE, effectiveTimeRatio,
   clearEntities, findEntityById, removeEntityById,
 } from './state.js';
 import { setStateDumpEnabled } from './state-dump.js';
 import { refreshEntityColor } from './entities.js';
-import { resetTrailCanvas } from './renderer-webgl.js?v=20260603-mesh';
+import { resetTrailCanvas } from './renderer-webgl.js?v=20261102-maintenance';
 import { clearContactState } from './physics.js';
 
 const els = {};
@@ -245,10 +245,10 @@ function applyTimeScale(value) {
 // constant override when in edit mode, otherwise the user's slider value.
 function updateHeaderTime() {
   if (!els.headerTime) return;
-  const ratio = state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale;
+  const ratio = effectiveTimeRatio();
   const effective = ratio * BASE_TIME_SCALE;
   const editTag = state.isEditMode ? ' · 编辑慢动作' : '';
-  els.headerTime.textContent = `流速 ${ratio.toFixed(2)}× · 真实 ${effective.toFixed(2)}×${editTag}`;
+  els.headerTime.textContent = `流速 ${ratio.toFixed(2)}× · 目标 ${effective.toFixed(2)}×${editTag}`;
 }
 
 function togglePause() {

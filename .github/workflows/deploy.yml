@@ -1,40 +1,69 @@
-name: Deploy to GitHub Pages
+name: Test and deploy GitHub Pages
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
-# Allow only one concurrent deployment; cancel in-progress runs.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-
-      # No build step needed — pure static HTML + ESM JS.
-      # Upload the repo root because index.html and src/ both live there.
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          path: .
+          node-version: 24
+      - name: Numerical regressions
+        run: node --test tests/core.test.mjs
+      - name: Install isolated browser test tools
+        run: npm install --prefix "$RUNNER_TEMP/orbital-test-tools" playwright@1.64.1
+      - name: Install Chromium
+        run: '"$RUNNER_TEMP/orbital-test-tools/node_modules/.bin/playwright" install --with-deps chromium'
+      - name: Browser and physics regressions
+        env:
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/orbital-test-tools/node_modules/playwright/index.mjs
+        run: node tests/browser.mjs
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-evidence
+          path: artifacts/
+
+  build:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Stage runtime assets and release identity
+        run: |
+          mkdir _site
+          cp index.html styles.css _site/
+          cp -R src _site/
+          python3 -c 'import json, os; json.dump({"commit": os.environ["GITHUB_SHA"]}, open("_site/version.json", "w"))'
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

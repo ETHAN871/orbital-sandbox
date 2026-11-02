@@ -68,7 +68,7 @@ import {
   CIRCLE_FILL, CIRCLE_RING, LINE_SEG,
   EQUIPOTENTIAL, STREAMLINE, GRID_WARP, RUBBER_SHEET_FS, PARTICLE_FLOW,
   SCREEN_DENT, MEMBRANE_MESH,
-} from './shaders.js?v=20260603-mesh';
+} from './shaders.js?v=20261102-maintenance';
 import { computePotentialAt, computeForceDirAt } from './potential.js';
 import { computeFieldLines } from './field-lines.js';
 
@@ -303,6 +303,7 @@ export function initWebGL(canvas) {
   });
   canvas.addEventListener('webglcontextrestored', () => {
     console.info('[renderer-webgl] context restored — rebuilding GL resources');
+    _gl = gl;
     _disabled = false;
     _spriteTexMap.clear();
     // After context loss, every GL handle (program, buffer, VAO, FBO,
@@ -328,11 +329,15 @@ export function initWebGL(canvas) {
     _vaoStreamline = null;
     _fboA = _fboB = _texA = _texB = null;
     _fieldFbo = _fieldTex = null;
+    _sagTexture = null;
+    _bufGridVerts = _bufGridIndices = _bufParticles = null;
+    _membraneCellPx = 0;
     try {
       _initPrograms();
       _initBuffers();
-      _initFbos(_vpW, _vpH);
-      _rebuildStreamlineSeeds();
+      resizeRenderer(_vpW, _vpH, _dpr);
+      const error = document.getElementById('webgl-error');
+      if (error) error.hidden = true;
     } catch (err) {
       _showError('WebGL 上下文恢复失败：' + (err && err.message ? err.message : err));
       console.error('[renderer-webgl] restore failed', err);
@@ -849,7 +854,7 @@ function _initSagTexture() {
   // Without it the sampler silently clamps to NEAREST — visible as
   // blocky body positions when sag wells are narrow. Universal on
   // desktop WebGL 2 but worth the explicit getExtension call.
-  gl.getExtension('OES_texture_float_linear');
+  const floatLinear = gl.getExtension('OES_texture_float_linear');
   _sagTexture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, _sagTexture);
   // R32F: single-channel float. WebGL 2 core supports R32F as a sampled
@@ -857,8 +862,8 @@ function _initSagTexture() {
   // if we wanted to RENDER to it). We only sample, so no extension guard.
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, _SAG_TEX_W, _SAG_TEX_H, 0, gl.RED, gl.FLOAT, null);
   // Linear filtering — gives smooth sag values between texels.
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, floatLinear ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, floatLinear ? gl.LINEAR : gl.NEAREST);
   // V11: REPEAT (not CLAMP_TO_EDGE) so wrap-mode ghost copies at world
   // X > vpW or Y > vpH sample the correct tile of the sag field. The
   // CPU pass already includes 9-ghost contributions when boundary mode
@@ -992,10 +997,10 @@ function _updateSagTexture() {
 }
 
 export function resizeRenderer(w, h, dpr) {
-  if (_disabled || !_gl) return;
   _vpW = Math.max(1, w | 0);
   _vpH = Math.max(1, h | 0);
   _dpr = dpr || 1;
+  if (_disabled || !_gl) return;
   _updateOrthoMat();
   _initFbos(_vpW, _vpH);
   _initSagTexture();
@@ -2905,7 +2910,10 @@ export function drawField() {
   // 'legacy' = rings only (no field lines). '2d'/'3d' = old GRID_WARP.
   if (state.fieldStyle === 'mesh') {
     // True 3D-membrane triangle mesh (deep + fold-free + edge-pinned).
-    _drawMembraneMesh();
+    // The finite displaced mesh tears at minimum-image discontinuities on
+    // a torus. The full-screen membrane preserves coverage across the seam.
+    if (state.boundaryMode === 'wrap') _drawScreenDent();
+    else _drawMembraneMesh();
   } else if (state.fieldStyle === 'screen') {
     // Default: punched fly-screen dimples. Clean — no rings / no dust.
     _drawScreenDent();
