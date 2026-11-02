@@ -4,7 +4,7 @@
 
 // ─── Physics timing constants (fixed, not user-tunable) ──────────
 // SIM_DT and PREDICT_DT are integration step sizes; changing them would
-// break Verlet stability and animation timing. Other "constants" that
+// change integration accuracy and animation timing. Other "constants" that
 // USED to live here (G, EPSILON, PREDICT_HORIZON, LAUNCH_SPEED_K,
 // ABSORPTION_DURATION, ELASTIC_RESTITUTION, BH_THRESHOLD) are now
 // runtime-mutable state fields (see `state.xxx` below), driven by the
@@ -250,7 +250,7 @@ export const state = {
   fieldStyle: 'mesh',     // true 3D-membrane triangle mesh (deep + fold-free + edge-pinned)
 
   // Active physics backend name — set by physics-backend.js after init.
-  // 'cpu' (default + force-cpu URL param + no-WebGPU fallback) or 'webgpu'.
+  // 'rapier' (default) or 'cpu' (local fallback / explicit force-cpu).
   // Read-only outside physics-backend.js; useful for HUD/debug displays.
   backendName: null,
 
@@ -287,4 +287,9 @@ export function removeEntityById(id) {
 export function clearEntities() {
   state.entities.length = 0;
   state.selectedId = null;
+}
+
+// Pausing takes precedence over the edit-mode slow-motion override.
+export function effectiveTimeRatio() {
+  return state.timeScale === 0 ? 0 : (state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale);
 }

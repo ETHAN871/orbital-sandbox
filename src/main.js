@@ -14,7 +14,7 @@
 //   - Pointer events go straight to #stage (no separate overlay canvas to
 //     intercept them).
 
-import { state, SIM_DT, BASE_TIME_SCALE, EDIT_MODE_TIME_RATIO, computeRadiusBase } from './state.js';
+import { state, SIM_DT, BASE_TIME_SCALE, effectiveTimeRatio, computeRadiusBase } from './state.js';
 import {
   initWebGL,
   drawScene as drawSceneGL,
@@ -24,9 +24,10 @@ import {
   resizeRenderer,
   prepareFrameRenderer,
   updateFieldFades,
-} from './renderer-webgl.js?v=20260603-mesh';
+} from './renderer-webgl.js?v=20261102-maintenance';
+import { advanceClock } from './simulation-clock.js';
 import { attachInput } from './input.js';
-import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20260603-mesh';
+import { bindUI, syncFromSelection, updateEntityCount } from './ui.js?v=20261102-maintenance';
 import { createBackend } from './physics-backend.js';
 import { createFpsMeter } from './fps-meter.js';
 import {
@@ -56,7 +57,7 @@ try {
 // ?field=curvilinear  — rings + radial field lines.
 try {
   const fs = new URLSearchParams(window.location.search).get('field');
-  if (fs === 'screen' || fs === '2d' || fs === 'legacy' || fs === '3d' ||
+  if (fs === 'mesh' || fs === 'screen' || fs === '2d' || fs === 'legacy' || fs === '3d' ||
       fs === 'rubber-sheet' || fs === 'curvilinear') {
     state.fieldStyle = fs;
     console.info('[main] field viz style =', fs);
@@ -141,10 +142,12 @@ scheduleFrame(frame);
 // rather than a silently frozen canvas).
 function frame(now) {
   fpsMeter.begin();
+  let completed = false;
   runFrame(now)
+    .then(() => { completed = true; })
     .catch(err => console.error('[main] frame failed:', err))
     .finally(() => {
-      fpsMeter.end();
+      fpsMeter.end(completed);
       scheduleFrame(frame);
     });
 }
@@ -180,29 +183,15 @@ async function runFrame(now) {
   perfMarkPhase('prepareFrame');
   backend.prepareFrame(state.entities);
 
-  const effectiveRatio = state.isEditMode ? EDIT_MODE_TIME_RATIO : state.timeScale;
-  accumulator += realDt * effectiveRatio * BASE_TIME_SCALE;
-  // Substep cap is the floor of three signals:
-  //   (1) MAX_SUBSTEPS (8) — hard safety net
-  //   (2) _lastFrameWasSlow → 1 (binary spiral-of-death guard)
-  //   (3) AQM substepBudget → 1-2 (smooth quality knob: at quality=0
-  //       we cap at 1 substep, at quality=1 we allow up to 2)
-  // AQM gives finer-grained control than the binary (2) guard; both
-  // can fire simultaneously, the tighter wins.
   const aqmKnobs = getQualityKnobs();
-  const aqmSubstepCap = Math.max(1, Math.round(aqmKnobs.substepBudget));
-  const maxSubstepsThisFrame = _lastFrameWasSlow
-    ? 1
-    : Math.min(MAX_SUBSTEPS, aqmSubstepCap);
-  let steps = 0;
-  while (accumulator >= SIM_DT && steps < maxSubstepsThisFrame) {
-    const isLast = (accumulator - SIM_DT < SIM_DT) || (steps + 1 >= maxSubstepsThisFrame);
+  const budget = _lastFrameWasSlow ? 1 : Math.min(MAX_SUBSTEPS, aqmKnobs.substepBudget);
+  const tick = advanceClock(accumulator, realDt, effectiveTimeRatio() * BASE_TIME_SCALE, budget);
+  accumulator = tick.remainder;
+  const steps = tick.steps;
+  for (let step = 0; step < steps; step++) {
     perfMarkPhase('worldStep');
-    await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode, isLast);
-    accumulator -= SIM_DT;
-    steps++;
+    await backend.step(state.entities, SIM_DT, state.viewport, state.boundaryMode, step === steps - 1);
   }
-  if (steps >= maxSubstepsThisFrame) accumulator = 0;
 
   perfMarkPhase('post');
   const simDelta = steps * SIM_DT;

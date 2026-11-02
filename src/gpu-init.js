@@ -18,21 +18,15 @@
 //                          (F1 acceptance: bit-identical to main branch)
 //   ?backend=verbose     → console.info each stage of detection
 
-// Required limits per blueprint §6.1. The 64MB storage buffer ceiling
-// covers Phase 2's biggest buffer (pairImpulseTable at N=10⁵). Phase 1
-// only needs ~2MB but we keep the same limits so the device validates
-// against the eventual target.
+// Only the retained K1 gravity kernel: 256 threads, 6 KiB shared memory,
+// three storage buffers. Retired contact kernels required much higher limits
+// and unnecessarily disabled acceleration on otherwise capable adapters.
 const REQUIRED_LIMITS = {
   maxStorageBufferBindingSize: 64 * 1024 * 1024,
-  maxComputeWorkgroupStorageSize: 16 * 1024,    // K1 uses 6 KB; K3b block_scan uses 4 KB shared
-  // Phase 2b: K3b's block_scan + apply_spine declare workgroup_size(1024).
-  // Default device limit is 256; we must explicitly request 1024.
-  maxComputeInvocationsPerWorkgroup: 1024,
-  maxComputeWorkgroupSizeX: 1024,
-  // Phase 2c: K4 (contact_detect) binds 13 storage buffers (3 read-only +
-  // input metas + cellCounts/cellOffsets/cellContents + 6 read-write). Default
-  // limit is 8; adapter on RTX-class hardware reports 16.
-  maxStorageBuffersPerShaderStage: 13,
+  maxComputeWorkgroupStorageSize: 16 * 1024,
+  maxComputeInvocationsPerWorkgroup: 256,
+  maxComputeWorkgroupSizeX: 256,
+  maxStorageBuffersPerShaderStage: 3,
 };
 
 function queryParam(name) {
@@ -153,6 +147,7 @@ const _wgslCache = new Map();
 export async function loadKernel(relativePath) {
   if (_wgslCache.has(relativePath)) return _wgslCache.get(relativePath);
   const url = new URL(relativePath, import.meta.url);
+  url.search = new URL(import.meta.url).search;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`loadKernel(${relativePath}): HTTP ${res.status}`);
   const src = await res.text();

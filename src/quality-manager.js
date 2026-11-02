@@ -14,10 +14,10 @@
 // A single dial trades quality for FPS smoothly across both axes.
 //
 // Quality level semantics:
-//   1.0 = full quality (iter cap 8/4, 2 substeps/frame, contactSample 3)
-//   0.5 = mid     (iter cap 6/3, ~1.5 effective substeps, contactSample 7)
+//   1.0 = full quality (iter cap 8/4, up to 8 substeps/frame, contactSample 3)
+//   0.5 = mid     (iter cap 6/3, up to 4 substeps, contactSample 7)
 //   0.0 = minimum (iter cap 4/2, 1 substep, contactSample 10)
-// Substep budget is fractional — at budget 1.6 we get 2 substeps when
+// Substep budget is rounded down — at budget 4.5 we get 4 substeps when
 // accumulator allows, but the substep-throttle in main.js also gates
 // on previous-frame slowness.
 //
@@ -40,7 +40,7 @@ const ADJUST_COOLDOWN_FRAMES = 15;
 const KNOB_BOUNDS = {
   velIterCap:           { lo: 4, hi: 8 },
   posIterCap:           { lo: 2, hi: 4 },
-  substepBudget:        { lo: 1.0, hi: 2.0 },
+  substepBudget:        { lo: 1.0, hi: 8.0 },
   contactSampleEveryN:  { lo: 10, hi: 3 },   // higher Q → more frequent
   sleepLinearThreshold: { lo: 8.0, hi: 5.0 }, // higher Q → tighter
 };

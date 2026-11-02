@@ -1,0 +1,37 @@
+<!doctype html><meta charset="utf-8"><title>Physics audit</title>
+<pre id="output"></pre><div class="summary">Running…</div>
+<script type="importmap">{"imports":{"@dimforge/rapier2d-compat":"https://esm.sh/@dimforge/rapier2d-compat@0.19.3"}}</script>
+<script type="module">
+import {state,DEFAULTS_TUNING} from '../src/state.js';
+import {createBackend} from '../src/physics-backend.js';
+const out=document.querySelector('#output'),summary=document.querySelector('.summary');
+let backend,passed=0;
+const check=(ok,name,data)=>{out.textContent+=`${ok?'PASS':'FAIL'} ${name}: ${JSON.stringify(data)}\n`;if(!ok)throw new Error(name);passed++};
+const body=(id,x,y,vx=0,vy=0,extra={})=>({id,type:'planet',x,y,vx,vy,mass:100,radius:14,charge:1,pinned:false,absorbing:false,...extra});
+async function fresh(es,mode='destroy'){
+ backend?.destroy();Object.assign(state,DEFAULTS_TUNING);state.entities=es;state.viewport={width:1200,height:900};state.boundaryMode=mode;
+ backend=await createBackend();await backend.init(es);if(state.backendName!=='rapier')throw new Error('Rapier required');
+}
+async function step(n){for(let i=0;i<n;i++){backend.prepareFrame(state.entities);await backend.step(state.entities,1/60,state.viewport,state.boundaryMode,true)}}
+try{
+ const d=200,soft=28,v=Math.sqrt(80*100*d/(d*d+soft*soft)**1.5*d/2);
+ await fresh([body(1,500,450,0,v),body(2,700,450,0,-v)]);
+ const energy=()=>{const[a,b]=state.entities;return 0.5*a.mass*(a.vx*a.vx+a.vy*a.vy)+0.5*b.mass*(b.vx*b.vx+b.vy*b.vy)-state.G*a.mass*b.mass/Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2+soft*soft)};
+ const e0=energy();let maxDrift=0,maxCom=0;
+ for(let i=0;i<36000;i++){await step(1);maxDrift=Math.max(maxDrift,Math.abs((energy()-e0)/e0));const[a,b]=state.entities;maxCom=Math.max(maxCom,Math.hypot((a.x+b.x)/2-600,(a.y+b.y)/2-450));}
+ check(maxDrift<0.005&&maxCom<0.1,'600 simulated seconds of a softened circular orbit',{maxRelativeEnergyDrift:maxDrift,maxComDriftPx:maxCom,periodSeconds:2*Math.PI*100/v});
+ async function collision(wrap){await fresh(wrap?[body(1,30,450,-30,0,{charge:0}),body(2,1170,450,30,0,{charge:0})]:[body(1,570,450,30,0,{charge:0}),body(2,630,450,-30,0,{charge:0})],wrap?'wrap':'destroy');state.G=0;state.elasticRestitution=1;await step(120);return state.entities.map(e=>e.vx)}
+ const interior=await collision(false),seam=await collision(true);
+ check(Math.abs(interior[0]+30)<0.1&&Math.abs(seam[0]-30)<0.1&&Math.abs(interior[0]+seam[0])<0.1,'restitution edit and equivalent interior/seam collisions',{interior,seam});
+ check(Math.abs(seam[0]+seam[1])<0.1,'wrap collision total momentum',{sumV:seam[0]+seam[1]});
+ await fresh([body(1,400,450,0,0,{radius:1.4,charge:0,pinned:true}),body(2,395,450,300,0,{radius:1.4,charge:0})]);state.G=0;state.elasticRestitution=1;await step(5);
+ check(state.entities[1].x<400,'small fast body cannot tunnel through pinned body',{x:state.entities[1].x,vx:state.entities[1].vx});
+ for(const pinnedId of [1,2]) {
+  const mover=body(pinnedId===1?2:1,1170,450,30,0,{charge:0});
+  const wall=body(pinnedId,5,450,0,0,{charge:0,pinned:true});
+  await fresh([wall,mover],'wrap');state.G=0;state.elasticRestitution=1;await step(90);
+  check(Math.abs(wall.x-5)<1e-6&&mover.vx<-29.9,'pinned wrap collider mirrors infinite mass',{pinnedId,vx:mover.vx});
+ }
+ summary.textContent=`${passed} physics audits passed`;summary.classList.add('ok');
+}catch(e){summary.textContent=e.stack;summary.classList.add('bad');console.error(e)}finally{backend?.destroy()}
+</script>

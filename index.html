@@ -22,7 +22,7 @@
       <header class="panel-header">
         <h1>Orbital Sandbox</h1>
         <p class="hint" id="mode-hint">放置模式 · 按住拖拽放置星体</p>
-        <p class="hint header-time" id="header-time">流速 1.00× · 真实 2.00×</p>
+        <p class="hint header-time" id="header-time">流速 1.00× · 目标 2.00×</p>
       </header>
 
       <section class="group">
@@ -79,7 +79,7 @@
         <div class="btn-row">
           <button id="field-btn" class="btn" type="button">显示场</button>
         </div>
-        <p class="hint">引力膜：环境光+45°光；重物处网格自动细分、缓慢陷入；物体处镂空</p>
+        <p class="hint">引力膜是定性示意，不是时空曲率或精确势能图。</p>
         <label>
           <span class="row"><span>对比度</span><span class="val" id="field-contrast-val">0.75</span></span>
           <input type="range" id="field-contrast" min="0" max="1" step="0.05" value="0.75" />
@@ -172,7 +172,7 @@
           <span class="row"><span>过穿自适应阈值</span><span class="val" id="tune-overlap-val">4</span></span>
           <input type="range" id="tune-overlap" min="0" max="20" step="1" value="4" />
         </label>
-        <label title="接触弹簧自然频率 ω₀（rad/s）。F = k·x 中 k = m·ω₀²。越高→接触越脆响、收敛越快、感觉越刚；越低→越软、收敛慢、可见渗透增加。此设置仅作用于"已存在 或 spawn 时未重叠 或 已修正出重叠"的物体；任何 spawn-重叠仍在解算中的物体期间，世界刚度自动钳位到安全值（6），从根本上杜绝 spawn explosion。">
+        <label title="接触弹簧自然频率 ω₀（rad/s）。F = k·x 中 k = m·ω₀²。越高→接触越脆响、收敛越快、感觉越刚；越低→越软、收敛慢、可见渗透增加。此设置仅作用于已存在、创建时未重叠或已分离的物体；任何 spawn-重叠仍在解算中的物体期间，世界刚度自动钳位到安全值（6），减少创建重叠时的剧烈弹开。">
           <span class="row"><span>接触刚度 ω₀</span><span class="val" id="tune-stiffness-val">6</span></span>
           <input type="range" id="tune-stiffness" min="2" max="60" step="1" value="6" />
         </label>
@@ -190,15 +190,12 @@
   <script type="importmap">
   {
     "imports": {
-      "d3-quadtree": "https://esm.sh/d3-quadtree@3",
-      "planck": "https://esm.sh/planck@1.5.0",
-      "stats.js": "https://esm.sh/stats.js@0.17.0",
       "@dimforge/rapier2d-compat": "https://esm.sh/@dimforge/rapier2d-compat@0.19.3"
     }
   }
   </script>
   <!-- Cache-buster: bump this when shipping changes that need a fresh module
        load (Chrome holds onto module bytes aggressively across reloads). -->
-  <script type="module" src="src/main.js?v=20260603-mesh"></script>
+  <script type="module" src="src/main.js?v=20261102-maintenance"></script>
 </body>
 </html>

@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>GPU mutation regression</title><pre id="output"></pre><div class="summary">Running…</div>
+<script type="importmap">{"imports":{"@dimforge/rapier2d-compat":"https://esm.sh/@dimforge/rapier2d-compat@0.19.3"}}</script>
+<script type="module">
+import {state} from '../src/state.js';
+import {createBackend} from '../src/physics-backend.js';
+import {computeAccelerations} from '../src/physics.js';
+const summary=document.querySelector('.summary'),output=document.querySelector('#output');let backend;
+try{
+ if(!navigator.gpu||!(await navigator.gpu.requestAdapter())){summary.textContent='SKIP: WebGPU adapter unavailable';summary.classList.add('ok');}
+ else {
+  state.viewport={width:6000,height:6000};state.boundaryMode='destroy';
+  const body=(id)=>({id,type:'planet',x:100+(id%20)*200,y:100+Math.floor(id/20)*200,vx:0,vy:0,radius:1,mass:10+id,charge:1,pinned:false,absorbing:false});
+  state.entities=Array.from({length:300},(_,i)=>body(i));backend=await createBackend();await backend.init(state.entities);backend.prepareFrame(state.entities);
+  let maps=0;const original=GPUBuffer.prototype.mapAsync;GPUBuffer.prototype.mapAsync=function(...args){maps++;return original.apply(this,args)};
+  let maxError=0;
+  try{
+   const pending=backend.step(state.entities,1/60,state.viewport,'destroy',true);
+   // Same-sized array with different identities defeats count-only guards.
+   state.entities.shift();state.entities.push(body(300));state.entities[0].mass=1000;
+   const expected=state.entities.map(()=>({}));computeAccelerations(state.entities,expected);
+   await pending;
+   if(!maps)throw new Error('GPU path did not execute');
+   for(let i=0;i<state.entities.length;i++)for(const [v,a] of [['vx','ax'],['vy','ay']])maxError=Math.max(maxError,Math.abs(state.entities[i][v]-expected[i][a]/60));
+   if(!(maxError<1e-5))throw new Error(`Stale GPU array applied: error=${maxError}`);
+  }finally{GPUBuffer.prototype.mapAsync=original}
+  output.textContent=JSON.stringify({maps,maxVelocityError:maxError});summary.textContent='GPU scene-mutation regression passed';summary.classList.add('ok');
+ }
+}catch(e){summary.textContent=e.stack;summary.classList.add('bad');console.error(e)}finally{backend?.destroy()}
+</script>

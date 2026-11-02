@@ -1,70 +1,69 @@
 # Orbital Sandbox
 
-一个 2D 重力场沙盒小游戏，灵感来自 App Store 上的 *Orbital*。在浏览器里放置行星和黑洞，调整质量、半径和电荷，观察轨道演化。
+浏览器里的二维重力沙盒：拖拽发射行星、放置吞噬体、编辑质量与半径、观察运动和轨迹。
 
-**纯静态网页**——没有后端，没有构建步骤，直接用 GitHub Pages 部署。
+**在线入口：[ethan871.github.io/orbital-sandbox](https://ethan871.github.io/orbital-sandbox/)**
 
-## 在线游玩
+这是交互玩具，不是天体力学或广义相对论计算工具。模型、误差和本次维护证据见 [维护与物理审计](docs/maintenance.md)。
 
-把仓库 push 到 GitHub 并启用 Pages（见下文），就可以在 `https://<your-username>.github.io/<repo>/` 玩。
+## 运行与操作
 
-## 本地预览
-
-随便一个静态服务器都能跑（ES modules 需要 HTTP，不能 file://）：
-
-```bash
-# 任选其一
-python -m http.server 8000
-npx serve .
+```sh
+python3 -m http.server 8000
 ```
 
-然后浏览器打开 `http://localhost:8000`。
+打开 `http://localhost:8000`。必须通过 HTTP；ES modules 不能用 `file://` 直接运行。
 
-## 玩法
+- 在画布上按住并向后拖拽，松开后向反方向发射；虚线是冻结其他物体后的近似预测。
+- 编辑模式可选中星体，修改属性、固定或删除；暂停在编辑模式中也生效。
+- `+1` 是吸引源，`−1` 是排斥源，`0` 不施力但仍受力。这不是电磁电荷。
+- “黑洞”是接触吞噬规则；不会增加吞噬者质量，不模拟事件视界。
+- 时间滑条 `1×` 对应目标 `2` 模拟秒／真实秒，`3×` 对应 `6`；编辑时目标 `0.4×`。重负载时会减速以保持响应。
+- 循环边界连接画布两端。膜是定性示意，不能据其斜率读取真实加速度。
+- 页面刷新会清空场景；状态录制用于诊断，不是可导入的存档。
 
-- **放置星体**：在画布上按住鼠标 → 拖出方向和速度 → 释放。拖动时显示弹弓线 + 5 秒预测虚线。
-- **类型**：行星（不消除碰撞物）或黑洞（吞噬碰到的所有物体）。
-- **电荷**：`+1` 引力 / `0` 中性（不施力但仍受力）/ `-1` 斥力。
-- **质量 / 半径**：滑条调整。
-- **轨迹长度**：滑条调整历史轨迹保留的点数（0 = 不显示）。
-- **时间流速**：0 = 暂停，最高 3x。
-- **暂停按钮**：在 0 和上次非零流速之间切换。
-- **编辑模式**：开启后时间自动放慢，点击实体即可调整它的属性而非放置新实体。
-- **清空沙盘**：一键移除全部实体。
+## 实现
 
-颜色规则：行星 = 随机色；黑洞引力/中性 = 黑色；黑洞斥力（−1）= 白色。
+纯静态 HTML/CSS/ES modules，无打包编译。WebGL 2 绘图；默认 [Rapier 2D 0.19.3](https://rapier.rs/) 处理接触，通过固定 `1/60 s` 步长的引力冲量推进。引力是带半径相关 Plummer 软化的直接全对计算。具备 WebGPU 时可使用 K1 引力内核，失败时回退 CPU。Rapier 从固定版本 CDN 加载；CDN 不可用时使用仓库内的 JS 求解器，碰撞响应与 Rapier 不完全相同。
 
-## 部署到 GitHub Pages
+- `src/main.js`、`simulation-clock.js`：固定步长循环及过载保护。
+- `src/physics-rapier.js`：默认物理、镜像接触、吞噬和 CCD。
+- `src/physics.js`、`physics-spatial-hash.js`：本地后备、预测、边界。
+- `src/renderer-webgl.js`、`shaders.js`：渲染、轨迹和场图。
+- `src/input.js`、`ui.js`、`state.js`：交互和状态。
+- `src/physics-gpu-gravity.js`、`kernels/gravity_accel.wgsl`：可选 GPU 引力。
 
-1. 将本目录推送到 GitHub 仓库（默认分支 `main`）。
-2. 进入仓库 **Settings → Pages**。
-3. **Source** 选 **GitHub Actions**。
-4. 推送任意提交到 `main`，Actions 会自动部署。完成后页面 URL 会显示在 workflow 摘要里。
+诊断参数：`?engine=cpu` 强制本地 JS；`?engine=rapier&backend=force-cpu` 保留 Rapier 并禁用 GPU 引力；`?aqm=off` 禁用自适应质量；`?fps=off` 隐藏帧率。
 
-workflow 已包含在 `.github/workflows/deploy.yml`。
+## 验证与发布
 
-## 技术栈
+Node 24 可运行无依赖数值回归：
 
-- WebGL 2 (single `#stage` canvas — background, trail FBO, entity sprites, and all UI layers)
-- 原生 ES Modules（无构建工具，无依赖）
-- Velocity Verlet 数值积分（轨道稳定性优于显式 Euler）
-
-## 项目结构
-
+```sh
+node --test tests/core.test.mjs
 ```
-orbital-sandbox/
-├── index.html
-├── styles.css
-├── src/
-│   ├── main.js                  # RAF 主循环 + 启动
-│   ├── state.js                 # 全局状态 + 物理/UI 常量
-│   ├── entities.js              # 实体工厂、颜色规则
-│   ├── physics.js               # 力计算、Verlet 积分、碰撞、预测
-│   ├── physics-barneshut.js     # Barnes-Hut 引力（大 N 路径）
-│   ├── physics-spatial-hash.js  # 碰撞宽相空间哈希
-│   ├── sprite-cache.js          # 实体 sprite 离屏 canvas 缓存（→ GPU 纹理）
-│   ├── renderer-webgl.js        # WebGL 2 渲染全栈（背景/轨迹/实体/UI）
-│   ├── input.js                 # 鼠标交互（放置 / 编辑）
-│   └── ui.js                    # 滑条 + 按钮绑定
-└── .github/workflows/deploy.yml
+
+浏览器手动检查：通过同一个 HTTP 服务打开 `tests/potential.test.html`、`tests/rapier-acceptance.test.html?engine=rapier&backend=force-cpu` 和 `tests/physics-audit.test.html?engine=rapier&backend=force-cpu`。
+
+完整浏览器测试用临时安装的 Playwright，不给项目加入运行时 npm 依赖：
+
+```sh
+npm install --prefix /tmp/orbital-test-tools playwright@1.64.1
+/tmp/orbital-test-tools/node_modules/.bin/playwright install chromium
+PLAYWRIGHT_MODULE=/tmp/orbital-test-tools/node_modules/playwright/index.mjs node tests/browser.mjs
 ```
+
+可设 `BROWSER_PATH` 使用本机 Chrome；截图和结果写到忽略的 `artifacts/`。GPU 不可用时 GPU 专项会明确标记跳过，不能将其视为硬件测试通过。
+
+GitHub Actions 在 PR 和 main 推送时执行测试。main 测试成功后，仅将 `index.html`、`styles.css`、`src/` 和版本标识部署到原有 GitHub Pages；发布 import map 按 commit 统一刷新全部模块缓存；文档、实验记录与测试不会进入网站目录。
+
+## 历史恢复
+
+2026-11 维护移除了非默认的 Planck、Worker、K2–K8 GPU 碰撞试验、28 张效果图及生成脚本，删除两份过时蓝图，重写陈旧的项目指引。未删除远端分支或改写历史。原始内容仍在维护前提交 `9c6b894` 中，例如：
+
+```sh
+git show 9c6b894:docs/webgpu-blueprint.md
+git show 9c6b894:src/physics-planck.js
+```
+
+默认 Rapier、CPU 后备、GPU 引力及诊断录制继续保留。

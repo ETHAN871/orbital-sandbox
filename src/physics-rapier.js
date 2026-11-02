@@ -1,72 +1,17 @@
-// physics-rapier.js — Default physics backend (Rapier2D via WASM).
-//
-// Replaces planck.js. Rapier is Rust → WASM, ~5-10× faster than planck
-// at typical scene sizes, and exposes `lengthUnit` directly on the world
-// so the unit-scale wrangling we did for planck (Settings.linearSlop=0.5,
-// Settings.maxTranslation=50, etc.) becomes a single-knob configuration
-// here.
-//
-// Closure-interface contract — identical to physics-planck.js:
-//   init(entities)               build world + bodies
-//   prepareFrame(entities)       per-frame sync (currently same as
-//                                inside step; kept for parity)
-//   step(entities, dt,           one substep
-//        viewport,
-//        boundaryMode,
-//        isLastSubstep)
-//   onEntityMetaMaybeChanged()   slider edits (no-op for now, matches
-//                                planck behavior)
-//   destroy()                    teardown
-//
-// What WE still own:
-//   - Charge-asymmetric Plummer-softened gravity (computeGravity here)
-//   - BH absorption animation lifecycle (entity.absorbing object)
-//   - applyBoundary destroy/wrap handling
-//   - Entity-array lifecycle
-//
-// Wrap-boundary handling — IMPORTANT:
-//   Rapier (like Box2D / planck) uses a Euclidean broadphase (BVH-based)
-//   that knows nothing about wrap. Pre-Rapier we hit a bug where a body
-//   wrapping from x=W+ε to x=ε would instantly appear next to a cluster
-//   at x=2, planck would register a fake high-velocity contact and apply
-//   a catastrophic impulse → oscillation.
-//
-//   Rapier fix in step(): after applyBoundary teleports a body across the
-//   wrap edge, we DESTROY the Rapier rigid body and RECREATE it at the
-//   wrapped position. This atomically clears all contact pairs that
-//   reference the pre-wrap collider, so the new body starts with zero
-//   contact history. Re-creation cost ~µs per wrap event; only a tiny
-//   fraction of bodies wrap per frame in typical scenes.
-//
-// Unit scale:
-//   world.lengthUnit = 30 (1 meter ≈ 30 px). All Rapier tolerances
-//   (allowedLinearError, contact_erp, sleep thresholds, etc.) are
-//   normalized by lengthUnit internally, so this single setting brings
-//   everything into pixel-sane defaults.
-//
-// Sleep:
-//   Bodies have setCanSleep(true). Mirror of physics-planck.js logic:
-//   the gravity-apply loop checks isSleeping() and computes
-//   |accel|*dt — if that would push velocity above sleep tolerance,
-//   the force is applied (Rapier's addForce wakes by default).
-//   Otherwise the body stays asleep.
-
-// RAPIER is injected by the caller — see setRapier() below. Two contexts:
-//   - Main thread (physics-backend.js → makeRapierBackend): imports RAPIER
-//     via the bare specifier `@dimforge/rapier2d-compat` resolved through
-//     index.html's import map, then calls setRapier() before invoking
-//     makeRapierBackend().init().
-//   - Worker thread (physics-rapier-worker.js): cannot use import maps
-//     (workers don't inherit them), so imports via the full CDN URL and
-//     calls setRapier() the same way.
-// Calling makeRapierBackend().init() without setRapier() will throw.
+// Default Rapier contact engine with an externally sampled gravity impulse.
+// Pair force is softened by max(radiusA + radiusB, epsilon); wrap gravity
+// uses a minimum image. K1 can accelerate gravity; contacts remain in Rapier.
+// Cross-edge contacts use one real/ghost pair with impulse forwarding.
+// This is an approximation to a toroidal solver, especially for many-body
+// simultaneous contacts. See docs/maintenance.md for measured limits.
+import { wrapCoordinate, minImageDelta } from './boundary.js';
 let RAPIER = null;
 export function setRapier(rapierModule) { RAPIER = rapierModule; }
-import { state } from './state.js';
+import { state, SIM_DT } from './state.js';
 import { updateAbsorptions, applyBoundary } from './physics.js';
 import { detectBackend, loadKernel, isVerbose } from './gpu-init.js';
 import { createGravityGPU } from './physics-gpu-gravity.js';
-import { AdaptiveOverlapManager } from './physics-planck-overlap.js';
+import { AdaptiveOverlapManager } from './physics-overlap.js';
 import { recordSubstep } from './state-dump.js';
 import { setContext as perfSetContext, isEnabled as perfEnabled, markPhase as perfMark } from './perf-monitor.js';
 import { getQualityKnobs, resetQuality } from './quality-manager.js';
@@ -287,23 +232,29 @@ let _lastSyncedViewportH = 0;
 const COLLISION_GROUP_REAL  = (0x0001 << 16) | 0x0003;
 const COLLISION_GROUP_GHOST = (0x0002 << 16) | 0x0001;
 
+// A-real/B-ghost and B-real/A-ghost represent the same physical contact.
+// Solve only the copy with the smaller real ID, then forward the ghost's
+// impulse once. Solving both injects energy (30 px/s became 69 px/s).
+const wrapContactHooks = {
+  filterContactPair(_c1, _c2, b1, b2) {
+    const a = world.getRigidBody(b1), b = world.getRigidBody(b2);
+    if (!a || !b) return null;
+    const aGhost = a._realId !== undefined, bGhost = b._realId !== undefined;
+    if (aGhost === bGhost) return aGhost ? null : RAPIER.SolverFlags.COMPUTE_IMPULSE;
+    const real = aGhost ? b : a, ghost = aGhost ? a : b;
+    return real.userData < ghost._realId ? RAPIER.SolverFlags.COMPUTE_IMPULSE : null;
+  },
+  filterIntersectionPair() { return true; },
+};
+let lastRestitution = NaN;
+
+
 // Floor for the dynamic ghost-creation margin. The effective margin
 // used per-substep is `max(GHOST_MARGIN_PX_FLOOR, maxRadiusInScene + 30)`
 // so even with very-large-radius bodies (UI radius slider up to 10×
 // base), any cross-wrap contact pair always has both ghosts spawned
 // before they could physically contact. See _effectiveGhostMargin.
 const GHOST_MARGIN_PX_FLOOR = 120;
-
-// Stage 5 skip-sync thresholds. When the real body's cumulative drift
-// since the last ghost sync stays under these, we skip the per-ghost
-// setTranslation/setLinvel WASM round-trips for existing ghosts (new
-// ghost creation + stale ghost destruction still runs — those are cheap
-// JS-map operations). Ghost position is at most √(POS_SQ) ≈ 0.5 px
-// stale, which is < 4 % of the smallest body radius (14 px). Contact
-// normal direction error is bounded at ~2 % — well below the solver's
-// already-tolerated residuals.
-const GHOST_SYNC_POS_DELTA_SQ = 0.25;   // (0.5 px)²
-const GHOST_SYNC_VEL_DELTA_SQ = 25.0;   // (5 px/s)²
 
 // Reusable Set for dedup'ing contact pairs in step()'s touching-count
 // loop. Module-scope to avoid per-step allocation.
@@ -453,8 +404,8 @@ function computeGravityCPU(entities, n, out) {
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+        dx = minImageDelta(dx, W);
+        dy = minImageDelta(dy, H);
       }
       const r2Raw = dx * dx + dy * dy;
       const minR = Math.max(a.radius + b.radius, eps);
@@ -494,7 +445,7 @@ function computeGravityCPU(entities, n, out) {
 // the only path that calls this with isRebuild = false (the default).
 function createBodyForEntity(e, isRebuild = false) {
   const initSpeed = Math.hypot(e.vx || 0, e.vy || 0);
-  const wantsCcd = initSpeed > state.overlapBulletThreshold;
+  const wantsCcd = initSpeed > Math.min(state.overlapBulletThreshold, e.radius / SIM_DT);
 
   let desc;
   if (e.pinned) {
@@ -759,11 +710,8 @@ function _createGhostBodyFor(e, sig, viewport) {
   const vel = realBody.linvel();
   const { dx, dy } = _ghostOffsetFor(sig, viewport.width, viewport.height);
 
-  // Dynamic — the ghost must be able to RECEIVE contact impulses so
-  // we can forward the resulting velocity delta back to the real body.
-  // Kinematic ghosts wouldn't pick up impulses and the forwarding
-  // mechanism would degenerate.
-  const desc = RAPIER.RigidBodyDesc.dynamic();
+  // Dynamic proxies receive impulses; pinned proxies retain infinite mass.
+  const desc = e.pinned ? RAPIER.RigidBodyDesc.kinematicPositionBased() : RAPIER.RigidBodyDesc.dynamic();
   desc.setTranslation(pos.x + dx, pos.y + dy);
   desc.setLinvel(vel.x, vel.y);
   // Ghosts must not sleep — their state is overwritten every substep
@@ -798,9 +746,10 @@ function _createGhostBodyFor(e, sig, viewport) {
     // Ghost — collides ONLY with REAL bodies, never with other ghosts.
     // (Ghost-vs-ghost contact would be a topological artifact since both
     // mirror the same underlying matter via different offsets.)
-    .setCollisionGroups(COLLISION_GROUP_GHOST);
+    .setCollisionGroups(COLLISION_GROUP_GHOST)
+    .setActiveHooks(RAPIER.ActiveHooks.FILTER_CONTACT_PAIRS);
   if (e.type === 'black_hole') cDesc = cDesc.setSensor(true);
-  world.createCollider(cDesc, ghost);
+  ghost._collider = world.createCollider(cDesc, ghost);
 
   return ghost;
 }
@@ -864,30 +813,6 @@ function syncGhosts(entities, viewport, boundaryMode) {
     }
     const realBody = bodyById.get(e.id);
     if (!realBody) continue;
-    // Sleeping-body skip: the real body's pos/vel haven't changed since
-    // last syncGhosts, so any existing ghosts already mirror the correct
-    // (frozen) state. Skip the translation/linvel reads + per-ghost
-    // setTranslation/setLinvel writes — one WASM call (isSleeping)
-    // avoids 2 reads + 2 writes per ghost. In dense piles where ~70 %
-    // of bodies are at rest this is a substantial win.
-    //
-    // Edge classification (_neededEdgeSigs) is also skipped: if the
-    // body wasn't moving last substep it isn't moving now → the same
-    // edges remain needed. Create/destroy decisions stay stable.
-    //
-    // The wake path (recordPostStep → next-substep impulse) re-runs
-    // this loop and takes the non-sleeping branch, re-syncing the
-    // ghosts the substep the body wakes.
-    if (realBody.isSleeping()) continue;
-    // Known limitation (Stage 5 reviewer HIGH, accepted as bounded):
-    // a body waking from sleep with vel ≈ pre-sleep vel may take the
-    // skip-sync branch below if its cumulative delta is under threshold.
-    // In that case, _preStepVx on its ghosts retains the pre-sleep
-    // baseline, and the next contact's forwarded impulse double-counts
-    // by at most (sleep_threshold + gravity_per_substep) ≈ 6 px/s × mass.
-    // At default mass=100 this is ≤ 600 momentum/event — well below
-    // visual threshold. forwardGhostImpulses' post-update logic (Stage
-    // 5c) prevents accumulation beyond one event.
     const pos = realBody.translation();
     const vel = realBody.linvel();
     const needed = _neededEdgeSigs(pos, e.radius, viewport, margin);
@@ -900,28 +825,8 @@ function syncGhosts(entities, viewport, boundaryMode) {
     }
     const neededSet = new Set(needed);
 
-    // Stage 5 skip-sync decision: if real body's cumulative drift since
-    // the last actual sync stays under both thresholds, existing ghosts'
-    // WASM-side state is still close enough — skip the per-ghost
-    // setTranslation/setLinvel round-trips. We still iterate to create/
-    // destroy ghosts whose needed-edge status changed (cheap JS work).
-    //
-    // _preStepVx/Vy is NOT updated here when skipping — that path is
-    // owned by forwardGhostImpulses, which sets it after each world.step
-    // so the next forward's delta computation has the correct baseline
-    // regardless of whether this substep re-synced or not.
-    let syncExistingGhosts = true;
-    if (realBody._lastSyncedX !== undefined) {
-      const dx  = pos.x - realBody._lastSyncedX;
-      const dy  = pos.y - realBody._lastSyncedY;
-      const dvx = vel.x - realBody._lastSyncedVx;
-      const dvy = vel.y - realBody._lastSyncedVy;
-      if (dx * dx + dy * dy <= GHOST_SYNC_POS_DELTA_SQ &&
-          dvx * dvx + dvy * dvy <= GHOST_SYNC_VEL_DELTA_SQ) {
-        syncExistingGhosts = false;
-      }
-    }
-
+    // Proxies must start every step from the current real pose/velocity.
+    // Reusing a post-collision ghost velocity can replay stale impulses.
     // Update or create ghosts for required offsets
     for (const sig of needed) {
       const off = _ghostOffsetFor(sig, W, H);
@@ -936,7 +841,7 @@ function syncGhosts(entities, viewport, boundaryMode) {
           ghost._preStepVx = vel.x;
           ghost._preStepVy = vel.y;
         }
-      } else if (syncExistingGhosts) {
+      } else {
         // Slave the ghost's pose + velocity to the real body. P1/P2
         // exception M6: ghost bodies are broadphase proxies, not
         // simulation participants — their state IS by construction
@@ -950,16 +855,6 @@ function syncGhosts(entities, viewport, boundaryMode) {
         ghost._preStepVx = vel.x;
         ghost._preStepVy = vel.y;
       }
-      // Else: existing ghost retains its post-impulse state from the
-      // previous substep. forwardGhostImpulses keeps _preStepVx in
-      // lockstep with the actual ghost.linvel.
-    }
-
-    if (syncExistingGhosts) {
-      realBody._lastSyncedX  = pos.x;
-      realBody._lastSyncedY  = pos.y;
-      realBody._lastSyncedVx = vel.x;
-      realBody._lastSyncedVy = vel.y;
     }
     // Destroy ghosts no longer needed (real body drifted away from an edge)
     for (const [sig, ghost] of myGhosts) {
@@ -1061,6 +956,7 @@ function syncWorldToEntities(entities) {
       const wantKinematic = !!e.pinned;
       const isKinematic = b.bodyType() === RAPIER.RigidBodyType.KinematicPositionBased;
       if (wantKinematic !== isKinematic) {
+        destroyAllGhostsOfRealId(e.id);
         b.setBodyType(
           wantKinematic ? RAPIER.RigidBodyType.KinematicPositionBased
                         : RAPIER.RigidBodyType.Dynamic,
@@ -1174,9 +1070,9 @@ function tickSpawnDamping(entities) {
 // In a typical orbital scene only ~5-10% of bodies cross the
 // threshold per reeval cycle, so writes are sparse.
 function reevalCcd(entities) {
-  const thr = state.overlapBulletThreshold;
-  const thr2 = thr * thr;
   for (const e of entities) {
+    const thr = Math.min(state.overlapBulletThreshold, e.radius / SIM_DT);
+    const thr2 = thr * thr;
     if (e.absorbing || e.pinned) continue;
     const b = bodyById.get(e.id);
     if (!b) continue;
@@ -1260,8 +1156,8 @@ function detectAndStartBHAbsorptions(entities) {
       if (!aBH && !bBH) continue;
       let dx = b.x - a.x, dy = b.y - a.y;
       if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+        dx = minImageDelta(dx, W);
+        dy = minImageDelta(dy, H);
       }
       const r2 = dx * dx + dy * dy;
       const rSum = a.radius + b.radius;
@@ -1321,10 +1217,8 @@ function applyBoundaryAndRebuildOnWrap(entities, viewport, boundaryMode) {
   for (const e of entities) {
     if (e.absorbing) continue;
     let wrapped = false;
-    if (e.x < 0)      { e.x += W; wrapped = true; }
-    else if (e.x > W) { e.x -= W; wrapped = true; }
-    if (e.y < 0)      { e.y += H; wrapped = true; }
-    else if (e.y > H) { e.y -= H; wrapped = true; }
+    if (e.x < 0 || e.x >= W) { e.x = wrapCoordinate(e.x, W); wrapped = true; }
+    if (e.y < 0 || e.y >= H) { e.y = wrapCoordinate(e.y, H); wrapped = true; }
     if (wrapped) wrappedIds.push(e.id);
   }
   // Atomic rebuild: destroy old body+collider, recreate at wrapped position.
@@ -1551,6 +1445,13 @@ export function makeRapierBackend() {
       // Stage 4: full sync runs ONCE per RAF here instead of twice per
       // substep inside step().
       syncWorldToEntities(entities);
+      if (lastRestitution !== state.elasticRestitution) {
+        for (const collider of colliderById.values()) collider.setRestitution(state.elasticRestitution);
+        for (const ghosts of ghostsByRealId.values()) {
+          for (const ghost of ghosts.values()) ghost._collider.setRestitution(state.elasticRestitution);
+        }
+        lastRestitution = state.elasticRestitution;
+      }
       // Conditional contact-stiffness gate (2026-05-25 semantic redesign).
       //
       // Goal: user's stiffness setting applies ONLY to bodies that are
@@ -1677,12 +1578,14 @@ export function makeRapierBackend() {
       // frame pipeline was removed (see GPU_THRESHOLD_SYNC block).
       perfMark('gravityCompute');
       let accels;
+      let dispatchedScene = null;
       {
         const n = entities.length;
         if (n < 2) {
           accels = new Float32Array(n * 2);
         } else if (gpuGravityHandle && !_gpuDisabled && n >= GPU_THRESHOLD_SYNC) {
           try {
+            dispatchedScene = entities.map(e => [e, e.mass, e.radius, e.charge, e.pinned, e.type]);
             accels = await computeGravityGPUSync(entities, n);
             _gpuConsecutiveFailures = 0;   // success → reset failure run
           } catch (e) {
@@ -1698,6 +1601,17 @@ export function makeRapierBackend() {
         } else {
           accels = computeGravityCPU(entities, n, new Float32Array(n * 2));
         }
+      }
+
+      // Input can edit/remove/reorder bodies while mapAsync yields. GPU
+      // slots refer to the dispatched scene, not the live array after await.
+      if (dispatchedScene && (entities.length !== dispatchedScene.length ||
+          dispatchedScene.some(([e, mass, radius, charge, pinned, type], i) =>
+            entities[i] !== e || e.mass !== mass || e.radius !== radius ||
+            e.charge !== charge || e.pinned !== pinned || e.type !== type))) {
+        syncWorldToEntities(entities);
+        syncGhosts(entities, state.viewport, state.boundaryMode);
+        accels = computeGravityCPU(entities, entities.length, new Float32Array(entities.length * 2));
       }
 
       // Per-entity gravity vector this substep. forceApplied starts false
@@ -1734,15 +1648,9 @@ export function makeRapierBackend() {
           // |a| > threshold — applyImpulse(..., wake=true) below
           // wakes the body atomically inside Rapier.
         }
-        // Use applyImpulse, NOT addForce. Empirically rapier2d-compat
-        // 0.19's `addForce` does NOT integrate over world.timestep the
-        // way its docs claim — observed Δv per substep matches F/m
-        // (impulse semantics) rather than F/m × dt (force semantics).
-        // Compensating by passing impulse = mass × acceleration × dt
-        // gives the correct Newtonian Δv = a × dt per substep. Using
-        // applyImpulse (whose impulse → Δv = impulse/mass semantics
-        // ARE deterministic per docs) is the cleanest way to express
-        // this without depending on addForce's empirical behavior.
+        // Gravity is sampled once per fixed step: impulse = m * a * dt.
+        // Rapier addForce is persistent until resetForces; applyImpulse
+        // expresses this kick without retaining a previous step's force.
         const mdt = e.mass * dt;
         _vec2A.x = mdt * ax;
         _vec2A.y = mdt * ay;
@@ -1770,7 +1678,7 @@ export function makeRapierBackend() {
       // query — which misses brief impacts that have already resolved
       // by the time we look.
       perfMark('rapierStep');
-      world.step(eventQueue);
+      world.step(eventQueue, wrapContactHooks);
 
       // Forward cross-wrap contact impulses from ghosts to real bodies.
       // Must run BEFORE pullBodyStateToEntities and BEFORE the contact-
@@ -1999,6 +1907,7 @@ export function makeRapierBackend() {
       // Reset CCD reeval cadence + viewport-change tracker + GPU
       // crossover probe state so a fresh init() starts deterministic.
       _ccdReevalCounter = 0;
+      lastRestitution = NaN;
       _lastSyncedViewportW = 0;
       _lastSyncedViewportH = 0;
       _gpuProbeSamples.length = 0;

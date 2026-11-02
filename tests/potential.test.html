@@ -18,10 +18,9 @@
   <h1>orbital-sandbox · potential.js fixtures</h1>
   <p>
     Hand-computed expected values for <code>computePotentialAt(x, y, entities, G, ε)</code>
-    in <code>../src/potential.js</code>. The GPU equipotential fragment shader
-    (<code>EQUIPOTENTIAL.FS</code> in <code>../src/shaders.js</code>) must produce
-    bit-identical results at the same query points. Open this file directly in a
-    browser — no build, no test runner. Output below; check the green/red summary.
+    in <code>../src/potential.js</code>. These are CPU reference fixtures,
+    not GPU readback tests or a check of finite-radius pair dynamics.
+    Open through the local HTTP server. Output below; check the summary.
   </p>
   <pre id="output"></pre>
 
@@ -38,7 +37,7 @@
       const ok = approxEq(actual, expected, tol);
       if (ok) {
         passed++;
-        log(`  ✓ ${name}  (= ${actual.toFixed(6)})`, 'pass');
+        log(`  ✓ ${name}  (= ${typeof actual === 'number' ? actual.toFixed(6) : actual})`, 'pass');
       } else {
         failed++;
         log(`  ✗ ${name}  expected ${expected}  got ${actual}`, 'fail');

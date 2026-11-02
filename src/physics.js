@@ -1,4 +1,5 @@
-// physics.js — Force computation, Velocity Verlet integration,
+import { minImageDelta, wrapCoordinate } from './boundary.js';
+// physics.js — Force computation, symplectic-Euler fallback,
 // collision handling, and placement-preview trajectory prediction.
 //
 // Force model (per spec):
@@ -37,13 +38,6 @@ export function prepareFrame(_entities) {
 // straight delta exceeds half the span, replace it with the wrap-around
 // delta. Equivalent to: delta - round(delta / span) * span.
 
-function minImageDelta(d, span) {
-  if (span <= 0) return d;
-  if (d > span * 0.5) return d - span;
-  if (d < -span * 0.5) return d + span;
-  return d;
-}
-
 // ─── Force / acceleration ─────────────────────────────────────────
 // Returns parallel arrays-of-zero accumulator filled in-place.
 // We allocate once per step to avoid GC pressure in the inner loop.
@@ -76,8 +70,8 @@ export function computeAccelerations(entities, accels) {
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+        dx = minImageDelta(dx, W);
+        dy = minImageDelta(dy, H);
       }
       const r2Raw = dx * dx + dy * dy;
       const minR = Math.max(a.radius + b.radius, EPSILON);
@@ -111,13 +105,8 @@ export function computeAccelerations(entities, accels) {
   }
 }
 
-// ─── Velocity Verlet ──────────────────────────────────────────────
-// Standard formulation:
-//   x(t+dt) = x + v·dt + 0.5·a·dt²
-//   a_new   = f(x_new) / m         (computed below)
-//   v(t+dt) = v + 0.5·(a + a_new)·dt
-// We cache the previous-step acceleration on each entity (`ax`,`ay`).
-
+// Scratch space for the local kick-drift solver. Only the frozen-source
+// placement prediction uses Velocity Verlet.
 const _scratch = [];   // reused acceleration accumulator
 
 // ─── PBD contact list (Build Step 2+) ─────────────────────────────
@@ -412,8 +401,8 @@ function _solvePositionConstraints(count, entities, dt) {
       let dx = bxEff - axEff;
       let dy = byEff - ayEff;
       if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+        dx = minImageDelta(dx, W);
+        dy = minImageDelta(dy, H);
       }
       const dist2 = dx * dx + dy * dy;
       if (dist2 < 1e-12) continue;
@@ -522,8 +511,8 @@ function _solvePositionConstraintsSimple(count, entities) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     if (wrap) {
-      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      dx = minImageDelta(dx, W);
+      dy = minImageDelta(dy, H);
     }
     const dist2 = dx * dx + dy * dy;
     if (dist2 < 1e-12) continue;
@@ -654,8 +643,8 @@ function _solveContactVelocities(count) {
       let dx = b.x - a.x;
       let dy = b.y - a.y;
       if (wrap) {
-        if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-        if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+        dx = minImageDelta(dx, W);
+        dy = minImageDelta(dy, H);
       }
       const dist2 = dx * dx + dy * dy;
       if (dist2 < 1e-12) continue;
@@ -983,8 +972,11 @@ export function updateAbsorptions(entities, dt) {
     abs.elapsedSim += dt;
     const t = Math.min(1, abs.elapsedSim / state.absorptionDuration);
 
-    e.x = abs.startX + (bh.x - abs.startX) * t;
-    e.y = abs.startY + (bh.y - abs.startY) * t;
+    const wrap = state.boundaryMode === 'wrap';
+    const { width: W, height: H } = state.viewport;
+    e.x = abs.startX + (wrap ? minImageDelta(bh.x - abs.startX, W) : bh.x - abs.startX) * t;
+    e.y = abs.startY + (wrap ? minImageDelta(bh.y - abs.startY, H) : bh.y - abs.startY) * t;
+    if (wrap) { e.x = wrapCoordinate(e.x, W); e.y = wrapCoordinate(e.y, H); }
     e.radius = abs.startRadius * (1 - t);
 
     if (t >= 1) entities.splice(i, 1);
@@ -1033,8 +1025,8 @@ export function predictTrajectory(ghost, others) {
     x += vx * PREDICT_DT + 0.5 * ax * PREDICT_DT * PREDICT_DT;
     y += vy * PREDICT_DT + 0.5 * ay * PREDICT_DT * PREDICT_DT;
     if (wrap) {
-      if (x < 0) x += W; else if (x > W) x -= W;
-      if (y < 0) y += H; else if (y > H) y -= H;
+      x = wrapCoordinate(x, W);
+      y = wrapCoordinate(y, H);
     }
     _predictBuf[s * 2]     = x;
     _predictBuf[s * 2 + 1] = y;
@@ -1068,8 +1060,8 @@ function ghostAccel(x, y, radius, others, out) {
     let dx = o.x - x;
     let dy = o.y - y;
     if (wrap) {
-      if (dx >  halfW) dx -= W; else if (dx < -halfW) dx += W;
-      if (dy >  halfH) dy -= H; else if (dy < -halfH) dy += H;
+      dx = minImageDelta(dx, W);
+      dy = minImageDelta(dy, H);
     }
     const r2Raw = dx * dx + dy * dy;
     const minR = Math.max(radius + o.radius, EPSILON);
@@ -1120,10 +1112,8 @@ export function applyBoundary(entities, viewport, mode) {
   if (mode === 'wrap') {
     for (const e of entities) {
       if (e.absorbing) continue;
-      if (e.x < 0)        e.x += w;
-      else if (e.x > w)   e.x -= w;
-      if (e.y < 0)        e.y += h;
-      else if (e.y > h)   e.y -= h;
+      e.x = wrapCoordinate(e.x, w);
+      e.y = wrapCoordinate(e.y, h);
     }
     return;
   }
