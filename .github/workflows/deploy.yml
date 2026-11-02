@@ -31,6 +31,13 @@ jobs:
         env:
           PLAYWRIGHT_MODULE: ${{ runner.temp }}/orbital-test-tools/node_modules/playwright/index.mjs
         run: node tests/browser.mjs
+      - name: Stage and verify the release import map
+        env:
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/orbital-test-tools/node_modules/playwright/index.mjs
+          SERVE_DIR: _site
+        run: |
+          python3 scripts/stage.py --commit "$GITHUB_SHA"
+          node tests/browser.mjs
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -49,11 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
       - name: Stage runtime assets and release identity
-        run: |
-          mkdir _site
-          cp index.html styles.css _site/
-          cp -R src _site/
-          python3 -c 'import json, os; json.dump({"commit": os.environ["GITHUB_SHA"]}, open("_site/version.json", "w"))'
+        run: python3 scripts/stage.py --commit "$GITHUB_SHA"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

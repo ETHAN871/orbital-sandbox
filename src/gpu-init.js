@@ -147,6 +147,7 @@ const _wgslCache = new Map();
 export async function loadKernel(relativePath) {
   if (_wgslCache.has(relativePath)) return _wgslCache.get(relativePath);
   const url = new URL(relativePath, import.meta.url);
+  url.search = new URL(import.meta.url).search;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`loadKernel(${relativePath}): HTTP ${res.status}`);
   const src = await res.text();

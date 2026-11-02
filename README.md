@@ -24,7 +24,7 @@ python3 -m http.server 8000
 
 ## 实现
 
-纯静态 HTML/CSS/ES modules，无构建步骤。WebGL 2 绘图；默认 [Rapier 2D 0.19.3](https://rapier.rs/) 处理接触，通过固定 `1/60 s` 步长的引力冲量推进。引力是带半径相关 Plummer 软化的直接全对计算。具备 WebGPU 时可使用 K1 引力内核，失败时回退 CPU。Rapier 从固定版本 CDN 加载；CDN 不可用时使用仓库内的 JS 求解器，碰撞响应与 Rapier 不完全相同。
+纯静态 HTML/CSS/ES modules，无打包编译。WebGL 2 绘图；默认 [Rapier 2D 0.19.3](https://rapier.rs/) 处理接触，通过固定 `1/60 s` 步长的引力冲量推进。引力是带半径相关 Plummer 软化的直接全对计算。具备 WebGPU 时可使用 K1 引力内核，失败时回退 CPU。Rapier 从固定版本 CDN 加载；CDN 不可用时使用仓库内的 JS 求解器，碰撞响应与 Rapier 不完全相同。
 
 - `src/main.js`、`simulation-clock.js`：固定步长循环及过载保护。
 - `src/physics-rapier.js`：默认物理、镜像接触、吞噬和 CCD。
@@ -55,7 +55,7 @@ PLAYWRIGHT_MODULE=/tmp/orbital-test-tools/node_modules/playwright/index.mjs node
 
 可设 `BROWSER_PATH` 使用本机 Chrome；截图和结果写到忽略的 `artifacts/`。GPU 不可用时 GPU 专项会明确标记跳过，不能将其视为硬件测试通过。
 
-GitHub Actions 在 PR 和 main 推送时执行测试。main 测试成功后，仅将 `index.html`、`styles.css`、`src/` 和版本标识部署到原有 GitHub Pages；文档、实验记录与测试不会进入网站目录。
+GitHub Actions 在 PR 和 main 推送时执行测试。main 测试成功后，仅将 `index.html`、`styles.css`、`src/` 和版本标识部署到原有 GitHub Pages；发布 import map 按 commit 统一刷新全部模块缓存；文档、实验记录与测试不会进入网站目录。
 
 ## 历史恢复
 

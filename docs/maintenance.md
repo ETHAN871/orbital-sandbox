@@ -56,4 +56,4 @@ Rapier 的力和冲量是不同 API：力持续存在直到 resetForces，冲量
 
 删除两份过时蓝图及无运行引用的效果图／生成器；缩短 CLAUDE.md，保留 README 与本报告。退役 Planck、Worker、K2–K8 碰撞实验及其核，保留仍使用的 overlap manager 并改为中性名称。原内容从 `9c6b894` 可恢复。没有删除用户数据或远端分支。
 
-发布流水线先运行测试，再只打包运行文件；部署产物含 `version.json` 的 Git SHA，便于验证页面确实来自当前提交。不要仅以 GitHub Actions 显示绿色代替线上交互复测。
+发布流水线先运行测试，再只打包运行文件；发布 import map 让入口与所有本地模块使用同一 Git SHA，防止刷新时混用新旧导出；暂存后的实际目录也运行浏览器测试。部署产物含 `version.json` 的 Git SHA，便于验证页面确实来自当前提交。不要仅以 GitHub Actions 显示绿色代替线上交互复测。

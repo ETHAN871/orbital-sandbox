@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const root = resolve('.');
+const root = resolve(process.env.SERVE_DIR || '.');
+const runtimeOnly = !!process.env.BASE_URL || !!process.env.SERVE_DIR;
 await mkdir('artifacts', { recursive: true });
 const server = createServer(async (req, res) => {
   try {
@@ -33,7 +34,7 @@ async function glProbe(p) { return p.evaluate(async()=>{
  return {error:gl.getError(),nonzero:pixels.some(v=>v>0),lost:gl.isContextLost()};
 }); }
 try {
- if(!process.env.BASE_URL) for(const file of ['potential.test.html','rapier-acceptance.test.html?engine=rapier&backend=force-cpu','physics-audit.test.html?engine=rapier&backend=force-cpu','gpu-mutation.test.html']) await check(file,async()=>{
+ if(!runtimeOnly) for(const file of ['potential.test.html','rapier-acceptance.test.html?engine=rapier&backend=force-cpu','physics-audit.test.html?engine=rapier&backend=force-cpu','gpu-mutation.test.html']) await check(file,async()=>{
   const p=await browser.newPage();const errors=[];p.on('pageerror',e=>errors.push(e.message));await p.goto(base+'tests/'+file);
   await p.waitForFunction(()=>{const e=document.querySelector('.summary');return e&&!e.textContent.includes('Running')},null,{timeout:30000});
   const s=await p.locator('.summary').innerText();const details=await p.locator('#output').innerText();assert.ok(await p.locator('.summary.ok').count(),s+'\n'+details);assert.deepEqual(errors,[]);await p.close();return {summary:s,details};
@@ -78,11 +79,11 @@ try {
   assert.equal(await m.evaluate(async()=>(await import('./src/state.js')).state.entities.length),1);
   assert.ok(await m.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));const x=await glProbe(m);assert.equal(x.error,0);assert.deepEqual(m.errors,[]);await m.screenshot({path:'artifacts/mobile.png'});await m.close();
  });
- if(!process.env.BASE_URL) await check('CDN failure falls back to functional local solver',async()=>{
+ if(!runtimeOnly) await check('CDN failure falls back to functional local solver',async()=>{
   const c=await browser.newContext();await c.route('https://esm.sh/**',r=>r.abort());const q=await c.newPage();await q.goto(base);await q.evaluate(async()=>{window.appState=(await import('./src/state.js')).state});await q.waitForFunction(()=>window.appState.backendName==='cpu');
   await q.mouse.click(200,200);await q.waitForTimeout(100);assert.equal(await q.evaluate(async()=>(await import('./src/state.js')).state.entities.length),1);assert.equal((await glProbe(q)).error,0);await c.close();
  });
- if(!process.env.BASE_URL) await check('GPU K1 parity with CPU, including partial workgroups',async()=>{
+ if(!runtimeOnly) await check('GPU K1 parity with CPU, including partial workgroups',async()=>{
   const q=await browser.newPage();await q.goto(base+'tests/potential.test.html');
   const x=await q.evaluate(async()=>{
    const {detectBackend,loadKernel}=await import('../src/gpu-init.js');const d=await detectBackend();if(d.backend!=='webgpu')return{skipped:d.reason};
@@ -96,4 +97,4 @@ try {
   });if(!x.skipped)assert.ok(x.maxError<5e-5,JSON.stringify(x));await q.close();return x;
  });
 } catch(error) { results.push({status:'failed',error:error.stack});process.exitCode=1;console.error(error); }
-finally {await writeFile('artifacts/browser-results.json',JSON.stringify(results,null,2));await browser.close();await new Promise(r=>server.close(r));}
+finally {await writeFile(runtimeOnly ? 'artifacts/release-results.json' : 'artifacts/browser-results.json',JSON.stringify(results,null,2));await browser.close();await new Promise(r=>server.close(r));}
